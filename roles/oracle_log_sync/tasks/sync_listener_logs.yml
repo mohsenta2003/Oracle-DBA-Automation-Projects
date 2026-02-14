@@ -1,0 +1,143 @@
+---
+# Sync logs for a specific Oracle listener
+# Variables: current_listener, _oracle_user, nfs_log_path, _adr_base (from main.yml)
+#
+# AIX Note: Listener names include port (e.g., mrptprs.1611, mafp1wp.1651)
+# Listener logs are in ADR location: <diagnostic_dest>/diag/tnslsnr/<hostname>/<listener_name>/trace/
+#
+# Example paths on dcup60:
+#   ADR Base: /u01/mod/backup
+#   Listener: hzarcmo.1682
+#   Log Path: /u01/mod/backup/diag/tnslsnr/dcup60/hzarcmo.1682/trace/
+#
+
+  # ============================================
+  # Build listener log path from ADR Base
+  # ============================================
+  - name: "{{ current_listener }} - Get hostname for ADR path"
+    ansible.builtin.shell:
+      cmd: "hostname | cut -d'.' -f1"
+    register: short_hostname
+    changed_when: false
+
+  - name: "{{ current_listener }} - Build ADR listener log path"
+    ansible.builtin.set_fact:
+      listener_log_dir: "{{ _adr_base }}/diag/tnslsnr/{{ short_hostname.stdout | trim }}/{{ current_listener }}/trace"
+    when: _adr_base | default('') != ''
+
+  - name: "{{ current_listener }} - Fallback: Find listener log via adrci"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ oracle_home_map.values() | first | default('/u01/app/oracle/product/19c/dbhome_1') }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        adrci exec="show homes" 2>/dev/null | grep -i "tnslsnr.*{{ current_listener }}" | head -1 | while read home; do
+          adrci exec="set home $home; show tracefile -l" 2>/dev/null | head -1 | xargs dirname 2>/dev/null
+        done
+    register: adrci_listener_path
+    changed_when: false
+    failed_when: false
+    when: _adr_base | default('') == ''
+
+  - name: "{{ current_listener }} - Set listener log dir from adrci fallback"
+    ansible.builtin.set_fact:
+      listener_log_dir: "{{ adrci_listener_path.stdout | trim }}"
+    when: 
+      - _adr_base | default('') == ''
+      - adrci_listener_path.stdout | default('') | trim != ''
+
+  - name: "{{ current_listener }} - Verify listener log directory exists"
+    ansible.builtin.shell:
+      cmd: |
+        if [ -n "{{ listener_log_dir | default('') }}" ] && [ -d "{{ listener_log_dir }}" ]; then
+          echo "EXISTS"
+          ls -la "{{ listener_log_dir }}"/*.log 2>/dev/null | head -3 || true
+        else
+          HOSTNAME_SHORT=$(hostname | cut -d'.' -f1)
+          find /u01 /opt /oracle 2>/dev/null -type d -path "*/diag/tnslsnr/${HOSTNAME_SHORT}/{{ current_listener }}/trace" 2>/dev/null | head -1
+        fi
+    register: listener_dir_check
+    changed_when: false
+    failed_when: false
+
+  - name: "{{ current_listener }} - Update listener log dir if found via find"
+    ansible.builtin.set_fact:
+      listener_log_dir: "{{ listener_dir_check.stdout_lines | select('match', '^/') | first }}"
+    when: 
+      - "'NOT_FOUND' in listener_dir_check.stdout"
+      - listener_dir_check.stdout_lines | select('match', '^/') | list | length > 0
+
+  - name: "{{ current_listener }} - Display listener log path"
+    ansible.builtin.debug:
+      msg: |
+        Listener: {{ current_listener }}
+        ADR Base: {{ _adr_base | default('not set') }}
+        Log Directory: {{ listener_log_dir | default('NOT FOUND') }}
+        Status: {{ 'EXISTS' if 'EXISTS' in listener_dir_check.stdout else 'NOT_FOUND' }}
+
+  - name: "{{ current_listener }} - Process listener logs"
+    when: listener_log_dir | default('') != ''
+    block:
+      # ============================================
+      # Create NFS directory for listener
+      # ============================================
+      - name: "{{ current_listener }} - Create NFS directory for listener"
+        ansible.builtin.file:
+          path: "{{ nfs_log_path }}/{{ inventory_hostname }}/listener/{{ current_listener }}"
+          state: directory
+          mode: '0755'
+        # become removed: already running as oracle
+
+      # ============================================
+      # Sync Listener Logs
+      # ============================================
+      - name: "{{ current_listener }} - Sync listener logs to NFS"
+        ansible.builtin.shell:
+          cmd: |
+            if [ -d "{{ listener_log_dir }}" ]; then
+              {% if sync_mode == 'incremental' %}
+              rsync {{ rsync_incremental_options }} \
+              {% else %}
+              rsync {{ rsync_options }} \
+              {% endif %}
+                --include='*.log' \
+                --include='*.xml' \
+                --include='*.trc' \
+                --exclude='*' \
+                "{{ listener_log_dir }}/" \
+                "{{ nfs_log_path }}/{{ inventory_hostname }}/listener/{{ current_listener }}/"
+              echo "SYNC_SUCCESS: Listener logs synced"
+            else
+              echo "SKIP: Listener log directory not found at {{ listener_log_dir }}"
+            fi
+        register: listener_sync_result
+        # become removed: already running as oracle
+        changed_when: "'SYNC_SUCCESS' in listener_sync_result.stdout"
+        failed_when: false
+
+      # ============================================
+      # Also sync listener alert directory if exists
+      # ============================================
+      - name: "{{ current_listener }} - Sync listener alert logs"
+        ansible.builtin.shell:
+          cmd: |
+            ALERT_DIR=$(echo "{{ listener_log_dir }}" | sed 's|/trace$|/alert|')
+            if [ -d "$ALERT_DIR" ]; then
+              rsync {{ rsync_options }} \
+                --include='*.xml' \
+                --include='*.log' \
+                --exclude='*' \
+                "$ALERT_DIR/" \
+                "{{ nfs_log_path }}/{{ inventory_hostname }}/listener/{{ current_listener }}/alert/"
+              echo "SYNC_SUCCESS: Listener alert logs synced"
+            fi
+        register: listener_alert_sync_result
+        # become removed: already running as oracle
+        changed_when: "'SYNC_SUCCESS' in listener_alert_sync_result.stdout"
+        failed_when: false
+
+      # ============================================
+      # Record sync status for report
+      # ============================================
+      - name: "{{ current_listener }} - Record listener sync status"
+        ansible.builtin.set_fact:
+          listener_sync_results: "{{ listener_sync_results | default([]) + [{'listener': current_listener, 'log_dir': listener_log_dir, 'sync_result': listener_sync_result.stdout | default('N/A')}] }}"

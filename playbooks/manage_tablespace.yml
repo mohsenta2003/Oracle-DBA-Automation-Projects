@@ -1,0 +1,29 @@
+---
+# Oracle Tablespace Management Playbook
+#
+# Supports MULTIPLE instances on same host!
+#
+# Usage Examples:
+#   # Monitor ALL instances on a host
+#   ansible-playbook playbooks/manage_tablespace.yml --limit crlnxd2201
+#
+#   # Monitor specific instance only
+#   ansible-playbook playbooks/manage_tablespace.yml --limit crlnxd2201 -e "db_sid=awdmld"
+#
+#   # Monitor group of hosts (all instances on each)
+#   ansible-playbook playbooks/manage_tablespace.yml --limit us_lnx_test
+#
+# Features:
+#   - Auto-detects ALL running instances
+#   - Shows sizes in GB/TB format
+#   - Highlights tablespaces >=85% used (WARNING/CRITICAL)
+#   - Saves CSV reports per instance
+#
+# Reports saved to: reports/YYYY-MM-DD/hostname/tablespace_SID.csv
+
+- name: Manage Oracle Tablespaces
+  hosts: all
+  become: no
+  gather_facts: no
+  roles:
+    - oracle_tablespace

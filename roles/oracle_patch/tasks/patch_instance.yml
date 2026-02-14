@@ -1,0 +1,161 @@
+---
+# Patch pre-check for a single instance
+# Called from main.yml with loop_var: current_sid
+
+  - name: "{{ current_sid }} - Get ORACLE_HOME"
+    ansible.builtin.set_fact:
+      _current_oracle_home: "{{ _oratab_map[current_sid] | default(_oratab_map.values() | first) }}"
+
+  - name: "{{ current_sid }} - Display instance info"
+    ansible.builtin.debug:
+      msg: "Checking patch status for: {{ current_sid }} | ORACLE_HOME: {{ _current_oracle_home }}"
+
+  # ============================================
+  # Check current patch level
+  # ============================================
+  - name: "{{ current_sid }} - Check OPatch version"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        $ORACLE_HOME/OPatch/opatch version 2>&1
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: opatch_version
+    failed_when: false
+
+  - name: "{{ current_sid }} - List installed patches"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        $ORACLE_HOME/OPatch/opatch lspatches 2>&1
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: installed_patches
+    failed_when: false
+
+  # ============================================
+  # Check database version
+  # ============================================
+  - name: "{{ current_sid }} - Check database version"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 200
+        SET HEADING ON
+        SET FEEDBACK OFF
+        SELECT banner_full FROM v$version WHERE ROWNUM = 1;
+        SELECT 'PSU/RU Applied: ' || comments FROM dba_registry_sqlpatch WHERE status = 'SUCCESS' ORDER BY action_time DESC FETCH FIRST 5 ROWS ONLY;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: db_version
+    failed_when: false
+
+  # ============================================
+  # Check for patch conflicts (if patch_id provided)
+  # ============================================
+  - name: "{{ current_sid }} - Check patch conflicts"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        $ORACLE_HOME/OPatch/opatch prereq CheckConflictAgainstOHWithDetail -ph {{ patch_dir }}/{{ patch_id }} 2>&1
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: patch_conflict
+    failed_when: false
+    when: patch_id | default('') != '' and patch_dir | default('') != ''
+
+  # ============================================
+  # Check disk space
+  # ============================================
+  - name: "{{ current_sid }} - Check disk space"
+    ansible.builtin.shell:
+      cmd: |
+        echo "=== ORACLE_HOME filesystem ==="
+        df -h {{ _current_oracle_home }}
+        echo ""
+        echo "=== /tmp filesystem ==="
+        df -h /tmp
+    become: yes
+    register: disk_space
+    failed_when: false
+
+  # ============================================
+  # Save Patch Report
+  # ============================================
+  - name: "{{ current_sid }} - Save patch report"
+    ansible.builtin.copy:
+      content: |
+        ================================================================================
+                         ORACLE PATCH PRE-CHECK REPORT
+        ================================================================================
+        Host:        {{ inventory_hostname }}
+        Database:    {{ current_sid }}
+        Oracle User: {{ _oracle_user }}
+        ORACLE_HOME: {{ _current_oracle_home }}
+        Generated:   {{ ansible_date_time.iso8601 }}
+        ================================================================================
+        
+        
+        ================================================================================
+        1. OPATCH VERSION
+        ================================================================================
+        {{ opatch_version.stdout | default('Unable to check OPatch version') }}
+        
+        
+        ================================================================================
+        2. CURRENTLY INSTALLED PATCHES
+        ================================================================================
+        {{ installed_patches.stdout | default('Unable to list patches') }}
+        
+        
+        ================================================================================
+        3. DATABASE VERSION & APPLIED PATCHES
+        ================================================================================
+        {{ db_version.stdout | default('Unable to query database version') }}
+        
+        
+        ================================================================================
+        4. DISK SPACE
+        ================================================================================
+        {{ disk_space.stdout | default('Unable to check disk space') }}
+        
+        {% if patch_id | default('') != '' %}
+        
+        ================================================================================
+        5. PATCH CONFLICT CHECK (Patch ID: {{ patch_id }})
+        ================================================================================
+        {{ patch_conflict.stdout | default('Patch conflict check not performed') }}
+        {% endif %}
+        
+        
+        ================================================================================
+        PATCHING NOTES
+        ================================================================================
+        Before applying patches:
+        1. Take a full RMAN backup
+        2. Verify OPatch is at required version
+        3. Stop all databases using this ORACLE_HOME
+        4. Stop the listener
+        5. Apply patch: $ORACLE_HOME/OPatch/opatch apply
+        6. Start listener and databases
+        7. Run datapatch: $ORACLE_HOME/OPatch/datapatch -verbose
+        
+        ================================================================================
+                                    END OF REPORT
+        ================================================================================
+      dest: "{{ _local_report_dir }}/patch_{{ current_sid }}.txt"
+    delegate_to: localhost
+    become: no
+
+  - name: "{{ current_sid }} - Display patch summary"
+    ansible.builtin.debug:
+      msg: |
+        
+        -------- {{ current_sid }} PATCH STATUS --------
+        OPatch: {{ opatch_version.stdout_lines[0] | default('Unknown') }}
+        📄 Report: patch_{{ current_sid }}.txt

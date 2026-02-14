@@ -1,0 +1,6 @@
+---
+# vars file for roles/oracle_monitor
+# These are internal variables - override in defaults or playbook level
+
+# Timestamp format for report files
+report_timestamp: "{{ ansible_date_time.date | replace('-', '') }}"

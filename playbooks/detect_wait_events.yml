@@ -1,0 +1,27 @@
+---
+# Oracle Wait Events Detection Playbook
+#
+# Usage Examples:
+#   # Analyze wait events on a specific host
+#   ansible-playbook playbooks/detect_wait_events.yml --limit crlnxd2201
+#   ansible-playbook playbooks/detect_wait_events.yml --limit us_lnx_test
+#
+#   # Analyze specific database
+#   ansible-playbook playbooks/detect_wait_events.yml --limit crlnxd2201 -e "db_sid=MYDB"
+#
+# Report includes:
+#   1. Current active wait events (sessions waiting now)
+#   2. Wait class summary (since instance startup)
+#   3. Top 20 wait events (most time spent)
+#   4. Blocking sessions analysis
+#   5. Lock wait analysis
+#   6. Common wait event explanations
+#
+# Reports saved to: reports/YYYY-MM-DD/hostname/wait_events_SID.txt
+
+- name: Detect Wait Events in Oracle Databases
+  hosts: all
+  become: no
+  gather_facts: no
+  roles:
+    - oracle_wait_events

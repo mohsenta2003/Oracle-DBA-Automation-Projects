@@ -1,0 +1,46 @@
+# Logs
+*.log
+ansible.log
+
+# Reports - keep folder, ignore contents
+reports/*
+!reports/.gitkeep
+
+# Temporary files
+tmp/
+ansible-tmp*
+*.retry
+
+# Backup files
+*.bak
+*.tar.gz
+*.zip
+
+# Sensitive files - NEVER commit these!
+.vault_pass
+*vault_pass*
+*.vault
+secrets.yml
+passwords.yml
+
+# SSH keys
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+
+# Deprecated inventory
+inv_pas.yml
+
+# Test files (optional - remove if you want to track)
+f.k
+f.p
+f.s
+s.file
+s.s
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

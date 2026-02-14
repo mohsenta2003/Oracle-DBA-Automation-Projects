@@ -1,0 +1,107 @@
+---
+# Generate sync summary report
+#
+
+  - name: Create local report directory
+    ansible.builtin.file:
+      path: "{{ local_report_dir }}/{{ report_timestamp }}/{{ inventory_hostname }}"
+      state: directory
+      mode: '0755'
+    delegate_to: localhost
+
+  - name: Generate sync summary report
+    ansible.builtin.copy:
+      dest: "{{ local_report_dir }}/{{ report_timestamp }}/{{ inventory_hostname }}/log_sync_summary.txt"
+      content: |
+        ================================================================================
+        ORACLE LOG SYNC REPORT
+        ================================================================================
+        Host: {{ inventory_hostname }}
+        OS: {{ os_type.stdout | default('Unknown') }}
+        Timestamp: {{ ansible_date_time.iso8601 }}
+        NFS Destination: {{ nfs_log_path }}
+        Sync Mode: {{ sync_mode }}
+        
+        ================================================================================
+        1. DISK SPACE STATUS
+        ================================================================================
+        {{ nfs_disk_check.stdout | default('Unable to check disk space') }}
+        
+        ================================================================================
+        2. DETECTED ORACLE CONFIGURATION
+        ================================================================================
+        Oracle User: {{ _oracle_user }}
+        Instances Found: {{ _all_instances | length }}
+        {% for sid in _all_instances %}
+          - {{ sid }}: ORACLE_HOME={{ oracle_home_map[sid] | default('NOT IN ORATAB') }}
+        {% endfor %}
+        
+        Listeners Found: {{ _all_listeners | length }}
+        {% for lsnr in _all_listeners %}
+          - {{ lsnr }}
+        {% endfor %}
+        
+        ================================================================================
+        3. INSTANCE LOG SYNC RESULTS
+        ================================================================================
+        {% for result in instance_sync_results | default([]) %}
+        Instance: {{ result.sid }}
+          Alert Log Dir: {{ result.alert_dir }}
+          Audit Log Dir: {{ result.audit_dir }}
+          Alert Sync: {{ result.alert_sync | truncate(60) }}
+          Audit Sync: {{ result.audit_sync | truncate(60) }}
+        
+        {% endfor %}
+        {% if instance_sync_results | default([]) | length == 0 %}
+        No instances processed.
+        {% endif %}
+        
+        ================================================================================
+        4. LISTENER LOG SYNC RESULTS
+        ================================================================================
+        {% for result in listener_sync_results | default([]) %}
+        Listener: {{ result.listener }}
+          Log Dir: {{ result.log_dir }}
+          Sync Result: {{ result.sync_result | truncate(60) }}
+        
+        {% endfor %}
+        {% if listener_sync_results | default([]) | length == 0 %}
+        No listeners processed.
+        {% endif %}
+        
+        ================================================================================
+        5. NFS DIRECTORY STRUCTURE
+        ================================================================================
+        {{ nfs_log_path }}/{{ inventory_hostname }}/
+        {% for sid in _all_instances %}
+        ├── {{ sid }}/
+        │   ├── alert/      (alert_*.log, *.xml)
+        │   ├── audit/      (*.aud, *.xml)
+        │   └── trace/      (*.trc - recent files)
+        {% endfor %}
+        {% for lsnr in _all_listeners %}
+        └── listener/
+            └── {{ lsnr }}/  (listener logs)
+        {% endfor %}
+        
+        ================================================================================
+        6. CRON STATUS
+        ================================================================================
+        {% if setup_cron %}
+        Cron job ENABLED:
+          Script: /usr/local/bin/oracle_log_sync.sh
+          Interval: Every {{ cron_interval }} minutes
+          Log retention: {{ log_retention_days }} days
+          Compression: {{ compress_logs | ternary('Enabled', 'Disabled') }}
+        {% else %}
+        Cron job NOT configured (run with -e "setup_cron=true" to enable)
+        {% endif %}
+        
+        ================================================================================
+        END OF REPORT
+        ================================================================================
+    delegate_to: localhost
+
+  - name: Display report location
+    ansible.builtin.debug:
+      msg: "Report saved to: {{ local_report_dir }}/{{ report_timestamp }}/{{ inventory_hostname }}/log_sync_summary.txt"

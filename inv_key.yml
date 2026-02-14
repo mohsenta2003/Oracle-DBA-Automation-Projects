@@ -1,0 +1,635 @@
+all:
+  children:
+    test:
+      hosts:
+        # EU NL
+        uklnxtnl1019:
+          ansible_ssh_user: "svcoradeu"
+        uklnxtnl1019g:
+          ansible_ssh_host: uklnxtnl1019
+          ansible_ssh_user: "svcgridt"
+        uklnxpnl1042:
+          ansible_ssh_user: "svcorapeu"
+        uklnxpnl1042g:
+          ansible_ssh_host: uklnxpnl1042
+          ansible_ssh_user: "svcgridp"
+
+        # EU UK
+        uklnxtuk0203:
+          ansible_ssh_user: "svcoradeu"
+        uklnxtuk0203g:
+          ansible_ssh_host: uklnxtuk0203
+          ansible_ssh_user: "svcgridt"
+        uklnxpuk1015:
+          ansible_ssh_user: "svcorapeu"
+        uklnxpuk1015g:
+          ansible_ssh_host: uklnxpuk1015
+          ansible_ssh_user: "svcgridp"
+
+        # EU AIX
+        ukaixtuk0004:
+          ansible_ssh_user: "oracle"
+          ansible_python_interpreter: /opt/freeware/bin/python3
+        ukaixpuk0001:
+          ansible_ssh_user: "oracle"
+          ansible_python_interpreter: /opt/freeware/bin/python3
+
+        # US 
+        crlnxp316:
+          ansible_ssh_user: "svcorap"
+        crlnxm1014:
+          ansible_ssh_user: "svcoram"
+        crlnxt209:
+          ansible_ssh_user: "svcorat"
+
+        # TLP
+        dcup60:
+          ansible_ssh_user: "oracle"
+          ansible_python_interpreter: /opt/freeware/bin/python3
+        dcup60g:
+          ansible_ssh_host: dcup60 
+          ansible_ssh_user: "grid"
+          ansible_python_interpreter: /opt/freeware/bin/python3
+        cranxp012:
+          ansible_ssh_user: "oracle"
+          ansible_python_interpreter: /opt/freeware/bin/python3
+        cranxp012g:
+          ansible_ssh_host: cranxp012 
+          ansible_ssh_user: "grid"
+          ansible_python_interpreter: /opt/freeware/bin/python3
+        dcunx136:
+          ansible_ssh_user: "oracle"
+          ansible_python_interpreter: /opt/freeware/bin/python3
+        dcunx136g:
+          ansible_ssh_host: dcunx136
+          ansible_ssh_user: "grid"
+          ansible_python_interpreter: /opt/freeware/bin/python3
+
+      vars: 
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'                
+
+    # EU NL     
+    eu_nl_lnx_nonprod:
+      hosts:
+        # uklnxtnl0161:
+        uklnxtnl0196:
+        uklnxtnl0197:
+        uklnxtnl0205:
+        uklnxtnl0206:
+        uklnxtnl0207:
+        uklnxtnl0208:
+        uklnxtnl0212:
+        uklnxtnl0220:
+        uklnxtnl0221:
+        uklnxtnl1011:
+        uklnxtnl1013:
+        # uklnxtnl1016:
+        # uklnxtnl1018: # decomm
+        uklnxtnl1019:
+        uklnxtnl1021:
+        uklnxtnl1027:
+      vars:
+        ansible_ssh_user: "svcoradeu"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'                
+
+    eu_nl_lnx_nonprod_g:
+      hosts:
+        # uklnxtnl0161g: 
+        #  ansible_ssh_host: uklnxtnl0161                                                                                                                       
+        uklnxtnl0196g: 
+          ansible_ssh_host: uklnxtnl0196                                                                                                                       
+        uklnxtnl0197g: 
+          ansible_ssh_host: uklnxtnl0197                                                                                                                       
+        uklnxtnl0205g: 
+          ansible_ssh_host: uklnxtnl0205                                                                                                                       
+        uklnxtnl0206g: 
+          ansible_ssh_host: uklnxtnl0206                                                                                                                       
+        uklnxtnl0207g: 
+          ansible_ssh_host: uklnxtnl0207                                                                                                                       
+        uklnxtnl0208g: 
+          ansible_ssh_host: uklnxtnl0208                                                                                                                       
+        uklnxtnl0212g: 
+          ansible_ssh_host: uklnxtnl0212                                                                                                                       
+        uklnxtnl0220g: 
+          ansible_ssh_host: uklnxtnl0220                                                                                                                       
+        uklnxtnl0221g: 
+          ansible_ssh_host: uklnxtnl0221                                                                                                                       
+        uklnxtnl1011g: 
+          ansible_ssh_host: uklnxtnl1011                                                                                                                       
+        uklnxtnl1013g: 
+          ansible_ssh_host: uklnxtnl1013                                                                                                                       
+        # uklnxtnl1016g: 
+        #  ansible_ssh_host: uklnxtnl1016                                                                                                                       
+        #uklnxtnl1018g: # decomm
+        #  ansible_ssh_host: uklnxtnl1018                                                                                                                       
+        uklnxtnl1019g: 
+          ansible_ssh_host: uklnxtnl1019                                                                                                                       
+        uklnxtnl1021g: 
+          ansible_ssh_host: uklnxtnl1021                                                                                                                       
+        uklnxtnl1027g: 
+          ansible_ssh_host: uklnxtnl1027    
+      vars:
+        ansible_ssh_user: "svcgridt"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'                
+    
+    eu_nl_lnx_prod:
+      hosts:
+        uklnxpnl0159:                                                                                        
+        # uklnxpnl0180:                                                                                        
+        uklnxpnl0183:                                                                                        
+        uklnxpnl0184:                                                                                        
+        uklnxpnl0202:                                                                                        
+        uklnxpnl0203:                                                                                        
+        uklnxpnl0204:                                                                                        
+        uklnxpnl0205:                                                                                        
+        uklnxpnl0206:                                                                                        
+        uklnxpnl0207:                                                                                        
+        uklnxpnl0208:                                                                                        
+        uklnxpnl1018:                                                                                        
+        uklnxpnl1019:                                                                                        
+        uklnxpnl1021:                                                                                        
+        uklnxpnl1022:                                                                                        
+        uklnxpnl1023:                                                                                        
+        uklnxpnl1024:                                                                                        
+        # uklnxpnl1033 # decomm:                                                                                        
+        uklnxpnl1034:                                                                                        
+        uklnxpnl1035:                                                                                        
+        uklnxpnl1036:                                                                                        
+        uklnxpnl1039:                                                                                        
+        uklnxpnl1040:                                                                                        
+        uklnxpnl1041:                                                                                        
+        uklnxpnl1042:                                                                                        
+      vars:
+        ansible_ssh_user: "svcorapeu"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'   
+    
+    eu_nl_lnx_prod_g:
+      hosts:
+        uklnxpnl0159g:
+          ansible_ssh_host: uklnxpnl0159                                                                                                                      
+        # uklnxpnl0180g:
+        #  ansible_ssh_host: uklnxpnl0180                                                                                                                      
+        uklnxpnl0183g:
+          ansible_ssh_host: uklnxpnl0183                                                                                                                      
+        uklnxpnl0184g:
+          ansible_ssh_host: uklnxpnl0184                                                                                                                      
+        uklnxpnl0202g:
+          ansible_ssh_host: uklnxpnl0202                                                                                                                      
+        uklnxpnl0203g:
+          ansible_ssh_host: uklnxpnl0203                                                                                                                      
+        uklnxpnl0204g:
+          ansible_ssh_host: uklnxpnl0204                                                                                                                      
+        uklnxpnl0205g:
+          ansible_ssh_host: uklnxpnl0205                                                                                                                      
+        uklnxpnl0206g:
+          ansible_ssh_host: uklnxpnl0206                                                                                                                      
+        uklnxpnl0207g:
+          ansible_ssh_host: uklnxpnl0207                                                                                                                      
+        uklnxpnl0208g:
+          ansible_ssh_host: uklnxpnl0208                                                                                                                      
+        uklnxpnl1018g:
+          ansible_ssh_host: uklnxpnl1018                                                                                                                      
+        uklnxpnl1019g:
+          ansible_ssh_host: uklnxpnl1019                                                                                                                      
+        uklnxpnl1021g:
+          ansible_ssh_host: uklnxpnl1021                                                                                                                      
+        uklnxpnl1022g:
+          ansible_ssh_host: uklnxpnl1022                                                                                                                      
+        uklnxpnl1023g:
+          ansible_ssh_host: uklnxpnl1023                                                                                                                      
+        uklnxpnl1024g:
+          ansible_ssh_host: uklnxpnl1024                                                                                                                      
+        # uklnxpnl1033g:
+        #  ansible_ssh_host: uklnxpnl1033  # decomm                                                                                                                      
+        uklnxpnl1034g:
+          ansible_ssh_host: uklnxpnl1034                                                                                                                      
+        uklnxpnl1035g:
+          ansible_ssh_host: uklnxpnl1035                                                                                                                      
+        uklnxpnl1036g:
+          ansible_ssh_host: uklnxpnl1036                                                                                                                      
+        #uklnxpnl1039g: # No ASM 
+        #  ansible_ssh_host: uklnxpnl1039                                                                                                                    
+        uklnxpnl1040g:
+          ansible_ssh_host: uklnxpnl1040                                                                                                                      
+        uklnxpnl1041g:
+          ansible_ssh_host: uklnxpnl1041                                                                                                                      
+        uklnxpnl1042g:
+          ansible_ssh_host: uklnxpnl1042                                                                                                                      
+      vars:
+        ansible_ssh_user: "svcgridp"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'       
+
+    # EU UK
+    eu_uk_lnx_nonprod:
+      hosts:
+        uklnxduk1006:
+        uklnxduk1012:
+        uklnxduk1021:
+        uklnxduk1023:
+        uklnxtuk0203:
+        uklnxtuk1009:
+        uklnxtuk1014:
+        uklnxtuk1017:
+        uklnxtuk1024:
+        uklnxtuk1043:
+        uklnxtuk1074:
+        uklnxtuk1076:
+        uklnxtuk2463:
+      vars:
+        ansible_ssh_user: "svcoradeu"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'                
+    
+    eu_uk_lnx_nonprod_g:
+      hosts:
+        uklnxduk1006g:
+          ansible_ssh_host: uklnxduk1006                                                                                                                      
+        uklnxduk1012g:
+          ansible_ssh_host: uklnxduk1012                                                                                                                      
+        uklnxduk1021g:
+          ansible_ssh_host: uklnxduk1021                                                                                                                      
+        uklnxduk1023g:
+          ansible_ssh_host: uklnxduk1023                                                                                                                      
+        uklnxtuk0203g:
+          ansible_ssh_host: uklnxtuk0203                                                                                                                      
+        uklnxtuk1009g:
+          ansible_ssh_host: uklnxtuk1009                                                                                                                      
+        uklnxtuk1014g:
+          ansible_ssh_host: uklnxtuk1014                                                                                                                      
+        uklnxtuk1017g:
+          ansible_ssh_host: uklnxtuk1017                                                                                                                      
+        uklnxtuk1024g:
+          ansible_ssh_host: uklnxtuk1024                                                                                                                      
+        uklnxtuk1043g:
+          ansible_ssh_host: uklnxtuk1043                                                                                                                      
+        uklnxtuk1074g:
+          ansible_ssh_host: uklnxtuk1074                                                                                                                      
+        uklnxtuk1076g:
+          ansible_ssh_host: uklnxtuk1076  
+        uklnxtuk2463g:  
+          ansible_ssh_host: uklnxtuk2463  
+      vars:
+        ansible_ssh_user: "svcgridt"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'                
+
+    eu_uk_lnx_prod:
+      hosts:
+        uklnxagt0107:
+        uklnxpuk1015:
+        uklnxpuk1027:
+        uklnxpuk1035:
+        uklnxpuk1111:
+        uklnxpuk1118:
+        uklnxpuk1119:
+        uklnxpuk1125:
+        uklnxpuk1126:
+        uklnxpuk2393:
+      vars:
+        ansible_ssh_user: "svcorapeu"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'                
+
+    eu_uk_lnx_prod_g:
+      hosts:
+        uklnxagt0107g:
+          ansible_ssh_host: uklnxagt0107                                                                                                                      
+        uklnxpuk1015g:
+          ansible_ssh_host: uklnxpuk1015                                                                                                                      
+        uklnxpuk1027g:
+          ansible_ssh_host: uklnxpuk1027                                                                                                                      
+        uklnxpuk1035g:
+          ansible_ssh_host: uklnxpuk1035                                                                                                                      
+        # uklnxpuk1111g: # No ASM
+        #   ansible_ssh_host: uklnxpuk1111                                                                                                                       
+        uklnxpuk1118g:
+          ansible_ssh_host: uklnxpuk1118                                                                                                                      
+        uklnxpuk1119g:
+          ansible_ssh_host: uklnxpuk1119                                                                                                                      
+        uklnxpuk1125g:
+          ansible_ssh_host: uklnxpuk1125                                                                                                                      
+        uklnxpuk1126g:
+          ansible_ssh_host: uklnxpuk1126                                                                                                                      
+        uklnxpuk2393g:
+          ansible_ssh_host: uklnxpuk2393                                                                                                                      
+      vars:
+        ansible_ssh_user: "svcgridp"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'                
+
+    # EU AIX
+    eu_aix_nonprod:
+      hosts:
+        rs6tdb03:
+        rs6tdb04:      
+        ukaixtuk0004: 
+        # ukaixtuk0005: 
+      vars:
+        ansible_python_interpreter: /opt/freeware/bin/python3
+        ansible_ssh_user: "oracle"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'                
+
+    eu_aix_prod:
+      hosts:
+        rs6pdb03:
+        rs6pdb04:
+        ukaixpuk0001: 
+        # ukaixpuk0002: # decomm
+      vars:
+        ansible_python_interpreter: /opt/freeware/bin/python3
+        ansible_ssh_user: "oracle"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'                
+
+    # US  
+    us_lnx_prod:
+      hosts:
+        crlnxp083:
+          ansible_python_interpreter: "/home/svcorap/bin/python"
+          environment:
+            PYTHONHOME: "/home/svcorap/bin"        
+        crlnxp1015:
+        crlnxp1033:
+        crlnxp1039:
+        crlnxp1083:
+        crlnxp1084:
+        crlnxp1085:
+        crlnxp1086:
+        crlnxp1088:
+        crlnxp1097:
+        crlnxp1098:
+        # crlnxp1099: #decomm
+        crlnxp1124:
+        crlnxp1125:
+        # crlnxp1126: #decomm
+        crlnxp1127:
+        crlnxp1128:
+        crlnxp1134:
+        crlnxp1135:
+        crlnxp1137:
+        crlnxp1142:
+        crlnxp1143:
+        crlnxp1146:
+        crlnxp1154:
+        crlnxp140:
+          ansible_python_interpreter: "/home/svcorap/bin/python"
+          environment:
+            PYTHONHOME: "/home/svcorap/bin"
+        # crlnxp2075: # decomm
+        # crlnxp2076: # decomm
+        crlnxp2124:
+        crlnxp2175:
+        crlnxp2183:
+        # crlnxp2193: # not SysDBA server
+        # crlnxp272: # decomm
+        crlnxp274:
+        crlnxp316:
+        ip-10-116-233-152:
+        ip-10-116-233-226:
+        crlnxp2257:
+        crlnxp2258:
+        crlnxp2305:
+        crlnxp2314:
+      vars:
+        ansible_ssh_user: "svcorap"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'
+        ansible_ssh_common_args: '-o ProxyCommand="ssh -p 22 -W %h:%p -q svcorap@crlnxp1086"'                
+
+    us_lnx_model:
+      hosts:
+        crlnxm1014:
+        crlnxm1016:
+        crlnxm1022:
+        crlnxm1024:
+        crlnxm1026:
+        crlnxm1027:
+        crlnxm1032:
+        crlnxm1034:
+        crlnxm1035:
+        # crlnxm123: # decomm
+        crlnxm145:
+        crlnxm157:
+        crlnxm2116:
+        crlnxm2139:
+        crlnxm2179:
+        ip-10-46-97-189:
+        crlnxm2351:
+      vars:
+        ansible_ssh_user: "svcoram"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'                
+
+    us_lnx_test:
+      hosts:
+        crlnxd2201:
+        crlnxt1008:
+        crlnxt1015:
+        crlnxt1035:
+        crlnxt1036:
+        crlnxt1049:
+        crlnxt1050:
+        crlnxt1053:
+        crlnxt1054:
+        crlnxt1056:
+        crlnxt1057:
+        crlnxt1058:
+        crlnxt1068:
+        # crlnxt1069: # decomm
+        crlnxt1072:
+        crlnxt209:
+        crlnxt214:
+        crlnxt222:
+        crlnxt234:
+        crlnxd2352:
+      vars:
+        ansible_ssh_user: "svcorat"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'                
+    
+    # TLP
+    tlp_lnx_prod:
+      hosts:
+        crlnxp1145: # US OMS prod
+      vars:
+        ansible_ssh_user: "svcorap"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'
+
+    tlp_lnx_nonprod:
+      hosts:
+        crlnxd1046: # US OMS dev
+      vars:
+        ansible_ssh_user: "svcorat"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'
+
+    tlp_aix_prod:
+      hosts:
+        dcup60:
+        dcup61:
+        dcunx216:
+        dcunx217:
+        cranxp016: 
+      vars:
+        ansible_python_interpreter: /opt/freeware/bin/python3
+        ansible_ssh_user: "oracle"
+        ansible_ssh_pass: "0nce@gin"
+        ansible_ssh_pipelining: false
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no'
+
+    tlp_aix_prod_g:
+      hosts:
+        dcup60g:
+          ansible_ssh_host: dcup60
+        dcup61g:
+          ansible_ssh_host: dcup61
+        dcunx216g:
+          ansible_ssh_host: dcunx216
+        dcunx217g:
+          ansible_ssh_host: dcunx217
+        cranxp016g: 
+          ansible_ssh_host: cranxp016
+      vars:
+        ansible_python_interpreter: /opt/freeware/bin/python3
+        ansible_ssh_user: "grid"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'
+
+    tlp_aix_prod2:
+      hosts:
+        cranxp014: 
+      vars:
+        ansible_python_interpreter: /opt/freeware/bin/python3
+        ansible_ssh_user: "oracle"
+        ansible_ssh_pass: "LawnM0w#r"
+        ansible_ssh_pipelining: false
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no'
+
+    tlp_aix_prod2_g:
+      hosts:
+        cranxp014g: 
+          ansible_ssh_host: cranxp014
+      vars:
+        ansible_python_interpreter: /opt/freeware/bin/python3
+        ansible_ssh_user: "grid"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'
+
+    tlp_aix_nonprod:
+      hosts:
+        dcup62:
+          ansible_ssh_pass: "0nce@gin"
+        dcup63:
+          ansible_ssh_pass: "0nce@gin"
+        dcunx218:
+        dcunx219:
+        dcunx135:
+        dcunx136:
+        cranxm006: 
+      vars:
+        ansible_python_interpreter: /opt/freeware/bin/python3
+        ansible_ssh_user: "oracle"
+        ansible_ssh_pass: "0nce@gin"
+        ansible_ssh_pipelining: false
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no'
+
+    tlp_aix_nonprod_g:
+      hosts:
+        dcup62g:
+          ansible_ssh_host: dcup62
+        dcup63g:
+          ansible_ssh_host: dcup63
+        dcunx218g:
+          ansible_ssh_host: dcunx218
+        dcunx219g:
+          ansible_ssh_host: dcunx219
+        dcunx135g:
+          ansible_ssh_host: dcunx135
+        dcunx136g:
+          ansible_ssh_host: dcunx136
+        #cranxm006g: # no ASM only forms server
+        #  ansible_ssh_host: cranxm006
+      vars:
+        ansible_python_interpreter: /opt/freeware/bin/python3
+        ansible_ssh_user: "grid"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'
+
+    tlp_aix_nonprod2:
+      hosts:
+        cranxp012: 
+      vars:
+        ansible_python_interpreter: /opt/freeware/bin/python3
+        ansible_ssh_user: "oracle"
+        ansible_ssh_pass: "LawnM0w#r"
+        ansible_ssh_pipelining: false
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no'
+
+    tlp_aix_nonprod2_g:
+      hosts:
+        cranxp012g: 
+          ansible_ssh_host: cranxp012
+      vars:
+        ansible_python_interpreter: /opt/freeware/bin/python3
+        ansible_ssh_user: "grid"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'
+    
+    # Groups
+    all_uk:
+      children:
+        eu_uk_lnx_prod:
+        eu_uk_lnx_nonprod:
+        eu_aix_prod:
+        eu_aix_nonprod:
+
+    all_nl:
+      children:
+        eu_nl_lnx_prod:
+        eu_nl_lnx_nonprod:
+
+    all_us:
+      children:
+        us_lnx_prod:
+        us_lnx_model:
+        us_lnx_test:
+
+    all_tlp:
+      children:
+        tlp_lnx_prod:
+        tlp_lnx_nonprod:
+        tlp_aix_prod:
+        tlp_aix_prod2:
+        tlp_aix_nonprod:
+        tlp_aix_nonprod2:
+
+    all_eu_linux:
+      children:
+        eu_nl_lnx_prod:
+        eu_uk_lnx_prod:
+        eu_nl_lnx_nonprod:
+        eu_uk_lnx_nonprod:
+
+    all_us_linux:
+      children:
+        us_lnx_prod:
+        us_lnx_model:
+        us_lnx_test:
+
+    all_nonprod_linux:
+      children:
+        eu_nl_lnx_nonprod:
+        eu_uk_lnx_nonprod:
+        us_lnx_model:
+        us_lnx_test:
+        tlp_lnx_non_prod:
+
+    all_prod_linux:
+      children:
+        eu_nl_lnx_prod:
+        eu_uk_lnx_prod:
+        us_lnx_prod:
+        tlp_lnx_prod:
+
+    all_aix_prod:
+      children:
+        eu_aix_prod:
+        tlp_aix_prod:
+        tlp_aix_prod2:
+    
+    all_aix_nonprod:
+      children:
+        eu_aix_nonprod:
+        tlp_aix_nonprod:
+
+    all_us_tlp:
+      children:
+        all_us:
+        all_tlp:

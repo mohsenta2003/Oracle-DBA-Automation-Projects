@@ -1,0 +1,9 @@
+---
+# vars file for oracle_tablespace
+# All values are auto-detected from the target system
+# Override with -e "variable=value" if needed
+#
+# Example overrides:
+#   -e "oracle_user=svcorat"
+#   -e "oracle_home=/oracle/product/19c"
+#   -e "db_sid=MYDB"

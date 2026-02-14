@@ -1,0 +1,57 @@
+---
+# defaults file for oracle_log_sync
+
+# ============================================
+# NFS Configuration
+# ============================================
+# NFS destination path - change this to your shared path
+nfs_log_path: "/local/utils/AIX_ORA_LOGS"
+
+# Optional: Mount NFS if not already mounted
+mount_nfs: false
+nfs_server: ""
+nfs_export: ""
+nfs_mount_options: "bg,hard,intr,rsize=32768,wsize=32768"
+
+# ============================================
+# Sync Configuration
+# ============================================
+# Sync mode: initial (full) or incremental (changes only)
+sync_mode: "initial"
+
+# Setup cron job for continuous sync
+setup_cron: false
+cron_interval: 15  # minutes
+
+# Log retention on NFS (days) - 0 to disable cleanup
+log_retention_days: 30
+
+# Compress logs older than 1 day
+compress_logs: true
+
+# ============================================
+# Log Types to Sync
+# ============================================
+sync_alert_logs: true
+sync_listener_logs: true
+sync_audit_logs: true
+
+# ============================================
+# Oracle Environment (auto-detected if empty)
+# ============================================
+oracle_user: ""
+oracle_group: ""
+oracle_home: ""
+oracle_base: ""
+
+# ============================================
+# Rsync Options
+# ============================================
+# AIX rsync options (adjust if using different rsync version)
+rsync_options: "-avz --progress"
+rsync_incremental_options: "-avz --progress --update"
+
+# ============================================
+# Reporting
+# ============================================
+local_report_dir: "{{ playbook_dir }}/../reports"

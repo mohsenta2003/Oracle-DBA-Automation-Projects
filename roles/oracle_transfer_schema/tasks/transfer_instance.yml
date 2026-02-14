@@ -1,0 +1,291 @@
+---
+# Schema transfer for a single instance
+# Called from main.yml with loop_var: current_sid
+#
+# Required variables:
+#   -e "schema_name=MYSCHEMA"
+#   -e "target_db=TARGET_SID" (for import)
+#   -e "target_host=targethost" (for import)
+#
+# Optional:
+#   -e "action=export|import|both" (default: export)
+#   -e "directory_name=DATA_PUMP_DIR"
+#   -e "parallel=4"
+#
+
+  - name: "{{ current_sid }} - Get ORACLE_HOME"
+    ansible.builtin.set_fact:
+      _current_oracle_home: "{{ _oratab_map[current_sid] | default(_oratab_map.values() | first) }}"
+
+  - name: "{{ current_sid }} - Get ORACLE_BASE"
+    ansible.builtin.shell:
+      cmd: |
+        echo "{{ _current_oracle_home }}" | sed 's|/product/.*||'
+    become: no
+    register: current_oracle_base
+    changed_when: false
+
+  - name: "{{ current_sid }} - Set ORACLE_BASE fact"
+    ansible.builtin.set_fact:
+      _current_oracle_base: "{{ current_oracle_base.stdout | trim }}"
+
+  - name: "{{ current_sid }} - Display instance info"
+    ansible.builtin.debug:
+      msg: "Processing: {{ current_sid }} | ORACLE_HOME: {{ _current_oracle_home }}"
+
+  # ============================================
+  # Validate required parameters
+  # ============================================
+  - name: "{{ current_sid }} - Validate schema_name is provided"
+    ansible.builtin.fail:
+      msg: "schema_name is required. Use: -e 'schema_name=MYSCHEMA'"
+    when: schema_name | default('') == ''
+
+  - name: "{{ current_sid }} - Set action default"
+    ansible.builtin.set_fact:
+      _action: "{{ action | default('export') }}"
+
+  # ============================================
+  # Get Data Pump directory info
+  # ============================================
+  - name: "{{ current_sid }} - Get Data Pump directory"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET HEADING OFF
+        SET FEEDBACK OFF
+        SET PAGESIZE 0
+        SELECT directory_path FROM dba_directories WHERE directory_name = '{{ directory_name | default('DATA_PUMP_DIR') }}';
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: dp_directory
+    failed_when: false
+
+  - name: "{{ current_sid }} - Set Data Pump directory fact"
+    ansible.builtin.set_fact:
+      _dp_dir_name: "{{ directory_name | default('DATA_PUMP_DIR') }}"
+      _dp_dir_path: "{{ dp_directory.stdout | trim }}"
+
+  - name: "{{ current_sid }} - Validate Data Pump directory exists"
+    ansible.builtin.debug:
+      msg: "WARNING: Data Pump directory {{ _dp_dir_name }} not found or empty"
+    when: _dp_dir_path == ''
+
+  # ============================================
+  # Check if schema exists
+  # ============================================
+  - name: "{{ current_sid }} - Check if schema exists"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET HEADING OFF
+        SET FEEDBACK OFF
+        SET PAGESIZE 0
+        SELECT COUNT(*) FROM dba_users WHERE username = UPPER('{{ schema_name }}');
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: schema_exists
+    failed_when: false
+
+  - name: "{{ current_sid }} - Schema existence status"
+    ansible.builtin.debug:
+      msg: "Schema {{ schema_name | upper }} {{ 'EXISTS' if (schema_exists.stdout | trim | int > 0) else 'NOT FOUND' }} in {{ current_sid }}"
+
+  # ============================================
+  # Get schema information
+  # ============================================
+  - name: "{{ current_sid }} - Get schema details"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 200
+        SET PAGESIZE 1000
+        SET HEADING ON
+        SET FEEDBACK OFF
+        
+        PROMPT === SCHEMA INFORMATION ===
+        SELECT username, account_status, default_tablespace, temporary_tablespace,
+               created, expiry_date
+        FROM dba_users WHERE username = UPPER('{{ schema_name }}');
+        
+        PROMPT
+        PROMPT === SCHEMA SIZE (GB) ===
+        SELECT owner, 
+               ROUND(SUM(bytes)/1024/1024/1024, 2) as size_gb,
+               COUNT(*) as segment_count
+        FROM dba_segments WHERE owner = UPPER('{{ schema_name }}')
+        GROUP BY owner;
+        
+        PROMPT
+        PROMPT === OBJECTS BY TYPE ===
+        SELECT object_type, COUNT(*) as cnt
+        FROM dba_objects WHERE owner = UPPER('{{ schema_name }}')
+        GROUP BY object_type ORDER BY cnt DESC;
+        
+        PROMPT
+        PROMPT === TABLESPACE USAGE ===
+        SELECT tablespace_name, 
+               ROUND(SUM(bytes)/1024/1024/1024, 2) as size_gb
+        FROM dba_segments WHERE owner = UPPER('{{ schema_name }}')
+        GROUP BY tablespace_name ORDER BY size_gb DESC;
+        
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: schema_details
+    failed_when: false
+    when: schema_exists.stdout | trim | int > 0
+
+  # ============================================
+  # Generate Export command (dry-run)
+  # ============================================
+  - name: "{{ current_sid }} - Generate expdp command"
+    ansible.builtin.set_fact:
+      _expdp_cmd: |
+        expdp '/ as sysdba' \
+          schemas={{ schema_name | upper }} \
+          directory={{ _dp_dir_name }} \
+          dumpfile={{ schema_name | lower }}_{{ current_sid }}_{{ transfer_timestamp }}.dmp \
+          logfile={{ schema_name | lower }}_{{ current_sid }}_{{ transfer_timestamp }}_exp.log \
+          parallel={{ parallel | default(4) }} \
+          compression=ALL \
+          flashback_time=systimestamp
+
+  - name: "{{ current_sid }} - Generate impdp command"
+    ansible.builtin.set_fact:
+      _impdp_cmd: |
+        impdp '/ as sysdba' \
+          schemas={{ schema_name | upper }} \
+          directory={{ _dp_dir_name }} \
+          dumpfile={{ schema_name | lower }}_{{ current_sid }}_{{ transfer_timestamp }}.dmp \
+          logfile={{ schema_name | lower }}_{{ current_sid }}_{{ transfer_timestamp }}_imp.log \
+          parallel={{ parallel | default(4) }} \
+          {% if remap_tablespace | default('') != '' %}remap_tablespace={{ remap_tablespace }}{% endif %}
+
+  # ============================================
+  # Perform Export (if action is export or both)
+  # ============================================
+  - name: "{{ current_sid }} - Run Export (dry-run mode)"
+    ansible.builtin.debug:
+      msg: |
+        DRY-RUN MODE: Would execute export:
+        {{ _expdp_cmd }}
+        
+        To actually run, use: -e 'execute_transfer=true'
+    when:
+      - _action in ['export', 'both']
+      - not (execute_transfer | default(false) | bool)
+
+  - name: "{{ current_sid }} - Execute Export"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        {{ _expdp_cmd }}
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: export_result
+    failed_when: false
+    when:
+      - _action in ['export', 'both']
+      - execute_transfer | default(false) | bool
+      - schema_exists.stdout | trim | int > 0
+
+  # ============================================
+  # Save Transfer Report
+  # ============================================
+  - name: "{{ current_sid }} - Save transfer report"
+    ansible.builtin.copy:
+      content: |
+        ================================================================================
+                         ORACLE SCHEMA TRANSFER REPORT
+        ================================================================================
+        Host:        {{ inventory_hostname }}
+        Database:    {{ current_sid }}
+        Oracle User: {{ _oracle_user }}
+        ORACLE_HOME: {{ _current_oracle_home }}
+        Generated:   {{ ansible_date_time.iso8601 }}
+        ================================================================================
+        
+        TRANSFER PARAMETERS
+        ================================================================================
+        Schema Name:     {{ schema_name | upper }}
+        Action:          {{ _action }}
+        DP Directory:    {{ _dp_dir_name }}
+        DP Path:         {{ _dp_dir_path | default('Not configured') }}
+        Parallel:        {{ parallel | default(4) }}
+        Execute Mode:    {{ 'LIVE' if (execute_transfer | default(false) | bool) else 'DRY-RUN' }}
+        
+        
+        {{ schema_details.stdout | default('Schema not found or unable to query') }}
+        
+        
+        ================================================================================
+        EXPORT COMMAND (Data Pump)
+        ================================================================================
+        {{ _expdp_cmd }}
+        
+        {% if execute_transfer | default(false) | bool and export_result is defined %}
+        
+        ================================================================================
+        EXPORT RESULT
+        ================================================================================
+        {{ export_result.stdout | default('No output') }}
+        {{ export_result.stderr | default('') }}
+        {% endif %}
+        
+        
+        ================================================================================
+        IMPORT COMMAND (To run on target)
+        ================================================================================
+        {{ _impdp_cmd }}
+        
+        
+        ================================================================================
+        TRANSFER STEPS
+        ================================================================================
+        1. Review schema details and size above
+        2. Verify Data Pump directory exists and has sufficient space
+        3. Run export on source: 
+           cd {{ _dp_dir_path | default('/u01/datapump') }}
+           {{ _expdp_cmd | replace('\n', ' ') | trim }}
+        
+        4. Copy dump file to target server:
+           scp {{ _dp_dir_path | default('/u01/datapump') }}/{{ schema_name | lower }}_{{ current_sid }}_{{ transfer_timestamp }}.dmp \
+               {{ target_host | default('target_host') }}:{{ _dp_dir_path | default('/u01/datapump') }}/
+        
+        5. Run import on target:
+           {{ _impdp_cmd | replace('\n', ' ') | trim }}
+        
+        6. Verify import and grant privileges as needed
+        
+        ================================================================================
+                                    END OF REPORT
+        ================================================================================
+      dest: "{{ _local_report_dir }}/transfer_{{ schema_name | lower }}_{{ current_sid }}.txt"
+    delegate_to: localhost
+    become: no
+
+  - name: "{{ current_sid }} - Display transfer summary"
+    ansible.builtin.debug:
+      msg: |
+        
+        -------- {{ current_sid }} SCHEMA TRANSFER --------
+        Schema: {{ schema_name | upper }} {{ 'EXISTS' if (schema_exists.stdout | trim | int > 0) else 'NOT FOUND' }}
+        Mode: {{ 'LIVE EXECUTION' if (execute_transfer | default(false) | bool) else 'DRY-RUN (report only)' }}
+        📄 Report: transfer_{{ schema_name | lower }}_{{ current_sid }}.txt

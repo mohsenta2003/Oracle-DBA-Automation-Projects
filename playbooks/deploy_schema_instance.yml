@@ -1,0 +1,251 @@
+---
+# ================================================================================
+# Deploy Schema Instance Tasks - Called for each Oracle instance
+# ================================================================================
+
+- name: "{{ current_sid }} - Set instance ORACLE_HOME"
+  ansible.builtin.set_fact:
+    current_oracle_home: "{{ oracle_home_map[current_sid] | default(oracle_home_map.values() | list | first | default('/u01/app/oracle/product/19.0.0/dbhome_1')) }}"
+
+- name: "{{ current_sid }} - Set environment"
+  ansible.builtin.set_fact:
+    oracle_env:
+      ORACLE_HOME: "{{ current_oracle_home }}"
+      ORACLE_SID: "{{ current_sid }}"
+      LD_LIBRARY_PATH: "{{ current_oracle_home }}/lib"
+      PATH: "{{ current_oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+
+- name: "{{ current_sid }} - Set report timestamp"
+  ansible.builtin.set_fact:
+    report_timestamp: "{{ ansible_date_time.iso8601 }}"
+
+- name: "{{ current_sid }} - Set schema names"
+  ansible.builtin.set_fact:
+    schema_user: "{{ app_name | upper }}"
+    data_tablespace: "{{ app_name | upper }}_DATA"
+    index_tablespace: "{{ app_name | upper }}_IDX"
+
+# ============================================
+# Check Current State
+# ============================================
+- name: "{{ current_sid }} - Check if user exists"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT COUNT(*) FROM dba_users WHERE username = '{{ schema_user }}';
+    EXIT;
+    EOF
+  register: user_exists
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+
+- name: "{{ current_sid }} - Check if data tablespace exists"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT COUNT(*) FROM dba_tablespaces WHERE tablespace_name = '{{ data_tablespace }}';
+    EXIT;
+    EOF
+  register: data_ts_exists
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+
+- name: "{{ current_sid }} - Check if index tablespace exists"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT COUNT(*) FROM dba_tablespaces WHERE tablespace_name = '{{ index_tablespace }}';
+    EXIT;
+    EOF
+  register: idx_ts_exists
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+
+- name: "{{ current_sid }} - Get default datafile path"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT REGEXP_REPLACE(file_name, '/[^/]+$', '') 
+    FROM dba_data_files WHERE ROWNUM = 1;
+    EXIT;
+    EOF
+  register: datafile_path
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+
+# ============================================
+# Build Deployment Plan
+# ============================================
+- name: "{{ current_sid }} - Build deployment plan"
+  ansible.builtin.set_fact:
+    deployment_plan: |
+      ╔═══════════════════════════════════════════════════════════════════════════════════╗
+      ║                      APPLICATION SCHEMA DEPLOYMENT PLAN                           ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ Report Time: {{ report_timestamp }}
+      ║ Host:        {{ inventory_hostname }}
+      ║ Instance:    {{ current_sid }}
+      ║ ORACLE_HOME: {{ current_oracle_home }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ APPLICATION DETAILS:                                                              ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ App Name:        {{ app_name | upper }}
+      ║ Schema User:     {{ schema_user }}
+      ║ Data Tablespace: {{ data_tablespace }} ({{ data_tablespace_size }})
+      ║ Index Tablespace:{{ index_tablespace }} ({{ index_tablespace_size }})
+      ║ Datafile Path:   {{ datafile_path.stdout | trim }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ CURRENT STATE:                                                                    ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ User Exists:           {{ 'YES' if user_exists.stdout | trim | int > 0 else 'NO' }}
+      ║ Data TS Exists:        {{ 'YES' if data_ts_exists.stdout | trim | int > 0 else 'NO' }}
+      ║ Index TS Exists:       {{ 'YES' if idx_ts_exists.stdout | trim | int > 0 else 'NO' }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ ACTIONS TO PERFORM:                                                               ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if data_ts_exists.stdout | trim | int == 0 %}
+      ║ 1. CREATE TABLESPACE {{ data_tablespace }} SIZE {{ data_tablespace_size }}
+      {% else %}
+      ║ 1. SKIP: Data tablespace already exists
+      {% endif %}
+      {% if idx_ts_exists.stdout | trim | int == 0 %}
+      ║ 2. CREATE TABLESPACE {{ index_tablespace }} SIZE {{ index_tablespace_size }}
+      {% else %}
+      ║ 2. SKIP: Index tablespace already exists
+      {% endif %}
+      {% if user_exists.stdout | trim | int == 0 %}
+      ║ 3. CREATE USER {{ schema_user }}
+      ║ 4. GRANT {{ default_grants | join(', ') }}
+      ║ 5. ALTER USER {{ schema_user }} QUOTA UNLIMITED ON {{ data_tablespace }}
+      ║ 6. ALTER USER {{ schema_user }} QUOTA UNLIMITED ON {{ index_tablespace }}
+      {% else %}
+      ║ 3-6. SKIP: User already exists
+      {% endif %}
+      {% if ddl_script != '' %}
+      ║ 7. EXECUTE DDL SCRIPT: {{ ddl_script }}
+      {% endif %}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if not execute | bool %}
+      ║ ⚠️  DRY-RUN MODE: Add -e "execute=true" to actually deploy                        ║
+      {% else %}
+      ║ 🚀 EXECUTE MODE: Changes will be applied                                          ║
+      {% endif %}
+      ╚═══════════════════════════════════════════════════════════════════════════════════╝
+
+- name: "{{ current_sid }} - Display deployment plan"
+  ansible.builtin.debug:
+    msg: "{{ deployment_plan }}"
+
+# ============================================
+# Execute Deployment (if enabled)
+# ============================================
+- name: "{{ current_sid }} - Create data tablespace"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    CREATE BIGFILE TABLESPACE {{ data_tablespace }}
+    DATAFILE '{{ datafile_path.stdout | trim }}/{{ data_tablespace | lower }}.dbf'
+    SIZE {{ data_tablespace_size }}
+    AUTOEXTEND ON NEXT 1G MAXSIZE UNLIMITED;
+    EXIT;
+    EOF
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  register: create_data_ts
+  when: execute | bool and data_ts_exists.stdout | trim | int == 0
+
+- name: "{{ current_sid }} - Create index tablespace"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    CREATE BIGFILE TABLESPACE {{ index_tablespace }}
+    DATAFILE '{{ datafile_path.stdout | trim }}/{{ index_tablespace | lower }}.dbf'
+    SIZE {{ index_tablespace_size }}
+    AUTOEXTEND ON NEXT 512M MAXSIZE UNLIMITED;
+    EXIT;
+    EOF
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  register: create_idx_ts
+  when: execute | bool and idx_ts_exists.stdout | trim | int == 0
+
+- name: "{{ current_sid }} - Create application user"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    CREATE USER {{ schema_user }} IDENTIFIED BY "{{ app_password }}"
+    DEFAULT TABLESPACE {{ data_tablespace }}
+    TEMPORARY TABLESPACE TEMP;
+    EXIT;
+    EOF
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  register: create_user
+  no_log: true
+  when: execute | bool and user_exists.stdout | trim | int == 0
+
+- name: "{{ current_sid }} - Grant privileges"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    {% for grant in default_grants %}
+    GRANT {{ grant }} TO {{ schema_user }};
+    {% endfor %}
+    ALTER USER {{ schema_user }} QUOTA UNLIMITED ON {{ data_tablespace }};
+    ALTER USER {{ schema_user }} QUOTA UNLIMITED ON {{ index_tablespace }};
+    EXIT;
+    EOF
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  register: grant_privs
+  when: execute | bool and user_exists.stdout | trim | int == 0
+
+# ============================================
+# Build Final Report
+# ============================================
+- name: "{{ current_sid }} - Build final report"
+  ansible.builtin.set_fact:
+    final_report: |
+      {{ deployment_plan }}
+      
+      {% if execute | bool %}
+      ═══════════════════════════════════════════════════════════════════════════════════
+      EXECUTION RESULTS:
+      ═══════════════════════════════════════════════════════════════════════════════════
+      {% if create_data_ts is defined and create_data_ts is not skipped %}
+      Data Tablespace: {{ 'SUCCESS' if create_data_ts is not failed else 'FAILED' }}
+      {% endif %}
+      {% if create_idx_ts is defined and create_idx_ts is not skipped %}
+      Index Tablespace: {{ 'SUCCESS' if create_idx_ts is not failed else 'FAILED' }}
+      {% endif %}
+      {% if create_user is defined and create_user is not skipped %}
+      User Creation: {{ 'SUCCESS' if create_user is not failed else 'FAILED' }}
+      {% endif %}
+      {% if grant_privs is defined and grant_privs is not skipped %}
+      Grants: {{ 'SUCCESS' if grant_privs is not failed else 'FAILED' }}
+      {% endif %}
+      {% endif %}
+
+- name: "{{ current_sid }} - Save deployment report"
+  ansible.builtin.copy:
+    content: "{{ final_report }}"
+    dest: "{{ report_base_dir }}/{{ report_date }}/{{ inventory_hostname }}/deploy_schema_{{ app_name | upper }}_{{ current_sid }}.txt"
+    mode: '0644'
+  delegate_to: localhost
+  become: no

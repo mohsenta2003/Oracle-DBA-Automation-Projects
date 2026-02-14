@@ -1,0 +1,342 @@
+---
+# ================================================================================
+# Provision Users Instance Tasks - Called for each Oracle instance
+# ================================================================================
+
+- name: "{{ current_sid }} - Set instance ORACLE_HOME"
+  ansible.builtin.set_fact:
+    current_oracle_home: "{{ oracle_home_map[current_sid] | default(oracle_home_map.values() | list | first | default('/u01/app/oracle/product/19.0.0/dbhome_1')) }}"
+
+- name: "{{ current_sid }} - Set environment"
+  ansible.builtin.set_fact:
+    oracle_env:
+      ORACLE_HOME: "{{ current_oracle_home }}"
+      ORACLE_SID: "{{ current_sid }}"
+      LD_LIBRARY_PATH: "{{ current_oracle_home }}/lib"
+      PATH: "{{ current_oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+
+- name: "{{ current_sid }} - Set report timestamp"
+  ansible.builtin.set_fact:
+    report_timestamp: "{{ ansible_date_time.iso8601 }}"
+
+# ============================================
+# Get existing users status
+# ============================================
+- name: "{{ current_sid }} - Get existing user status for all requested users"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING ON FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    COL username FORMAT A25
+    COL account_status FORMAT A20
+    COL default_tablespace FORMAT A20
+    COL profile FORMAT A15
+    COL created FORMAT A12
+    
+    SELECT username, account_status, default_tablespace, 
+           profile, TO_CHAR(created, 'YYYY-MM-DD') as created
+    FROM dba_users
+    WHERE username IN ({% for user in users %}'{{ user.username | upper }}'{% if not loop.last %},{% endif %}{% endfor %})
+    ORDER BY username;
+    EXIT;
+    EOF
+  register: existing_users
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: users | length > 0
+
+- name: "{{ current_sid }} - Get list of existing usernames"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT username FROM dba_users
+    WHERE username IN ({% for user in users %}'{{ user.username | upper }}'{% if not loop.last %},{% endif %}{% endfor %});
+    EXIT;
+    EOF
+  register: existing_usernames
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: users | length > 0
+
+- name: "{{ current_sid }} - Parse existing usernames"
+  ansible.builtin.set_fact:
+    existing_user_list: "{{ existing_usernames.stdout_lines | map('trim') | list }}"
+  when: users | length > 0
+
+# ============================================
+# VALIDATE - Validate users definition
+# ============================================
+- name: "{{ current_sid }} - Validate tablespaces exist"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT tablespace_name FROM dba_tablespaces
+    WHERE tablespace_name IN ({% for user in users %}'{{ user.default_tablespace | default(default_tablespace) | upper }}'{% if not loop.last %},{% endif %}{% endfor %});
+    EXIT;
+    EOF
+  register: valid_tablespaces
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'validate' and users | length > 0
+
+- name: "{{ current_sid }} - Validate profiles exist"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT DISTINCT profile FROM dba_profiles
+    WHERE profile IN ({% for user in users %}'{{ user.profile | default(default_profile) | upper }}'{% if not loop.last %},{% endif %}{% endfor %});
+    EXIT;
+    EOF
+  register: valid_profiles
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'validate' and users | length > 0
+
+# ============================================
+# CREATE - Create users
+# ============================================
+- name: "{{ current_sid }} - Create users"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET ECHO OFF FEEDBACK ON
+    
+    -- Create user {{ item.username }}
+    {% if item.username | upper not in existing_user_list %}
+    CREATE USER {{ item.username | upper }}
+    IDENTIFIED BY "{{ item.password }}"
+    DEFAULT TABLESPACE {{ item.default_tablespace | default(default_tablespace) }}
+    TEMPORARY TABLESPACE {{ item.temp_tablespace | default(default_temp_tablespace) }}
+    PROFILE {{ item.profile | default(default_profile) }}
+    {% if item.quota_mb | default(default_quota_mb) | int == -1 %}
+    QUOTA UNLIMITED ON {{ item.default_tablespace | default(default_tablespace) }};
+    {% else %}
+    QUOTA {{ item.quota_mb | default(default_quota_mb) }}M ON {{ item.default_tablespace | default(default_tablespace) }};
+    {% endif %}
+    {% else %}
+    -- User already exists, altering password and settings
+    ALTER USER {{ item.username | upper }} IDENTIFIED BY "{{ item.password }}";
+    ALTER USER {{ item.username | upper }} DEFAULT TABLESPACE {{ item.default_tablespace | default(default_tablespace) }};
+    ALTER USER {{ item.username | upper }} PROFILE {{ item.profile | default(default_profile) }};
+    {% if item.quota_mb | default(default_quota_mb) | int == -1 %}
+    ALTER USER {{ item.username | upper }} QUOTA UNLIMITED ON {{ item.default_tablespace | default(default_tablespace) }};
+    {% else %}
+    ALTER USER {{ item.username | upper }} QUOTA {{ item.quota_mb | default(default_quota_mb) }}M ON {{ item.default_tablespace | default(default_tablespace) }};
+    {% endif %}
+    {% endif %}
+    
+    -- Grant roles
+    {% for role in item.roles | default(default_roles) %}
+    GRANT {{ role }} TO {{ item.username | upper }};
+    {% endfor %}
+    
+    -- Set account status
+    {% if item.account_status | default('UNLOCK') | upper == 'LOCK' %}
+    ALTER USER {{ item.username | upper }} ACCOUNT LOCK;
+    {% else %}
+    ALTER USER {{ item.username | upper }} ACCOUNT UNLOCK;
+    {% endif %}
+    
+    EXIT;
+    EOF
+  register: create_result_{{ item.username | replace(' ', '_') }}
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  loop: "{{ users }}"
+  when: action == 'create' and users | length > 0
+  no_log: true
+  failed_when: false
+
+- name: "{{ current_sid }} - Collect create results"
+  ansible.builtin.set_fact:
+    create_results: "{{ create_results | default([]) + [{'username': item.username, 'status': 'created/updated'}] }}"
+  loop: "{{ users }}"
+  when: action == 'create' and users | length > 0
+
+# ============================================
+# REMOVE - Drop users
+# ============================================
+- name: "{{ current_sid }} - Drop users"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET ECHO OFF FEEDBACK ON
+    DROP USER {{ item.username | upper }}{% if cascade_on_drop | bool %} CASCADE{% endif %};
+    EXIT;
+    EOF
+  register: drop_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  loop: "{{ users }}"
+  when: action == 'remove' and item.username | upper in existing_user_list
+  failed_when: false
+
+# ============================================
+# Get final user status
+# ============================================
+- name: "{{ current_sid }} - Get final user status"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING ON FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    COL username FORMAT A25
+    COL account_status FORMAT A20
+    COL default_tablespace FORMAT A20
+    COL temp_tablespace FORMAT A15
+    COL profile FORMAT A15
+    
+    SELECT username, account_status, default_tablespace, 
+           temporary_tablespace as temp_tablespace, profile
+    FROM dba_users
+    WHERE username IN ({% for user in users %}'{{ user.username | upper }}'{% if not loop.last %},{% endif %}{% endfor %})
+    ORDER BY username;
+    EXIT;
+    EOF
+  register: final_users
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: users | length > 0
+
+- name: "{{ current_sid }} - Get user roles"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING ON FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    COL grantee FORMAT A25
+    COL granted_role FORMAT A30
+    
+    SELECT grantee, granted_role, admin_option
+    FROM dba_role_privs
+    WHERE grantee IN ({% for user in users %}'{{ user.username | upper }}'{% if not loop.last %},{% endif %}{% endfor %})
+    ORDER BY grantee, granted_role;
+    EXIT;
+    EOF
+  register: user_roles
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: users | length > 0 and action != 'remove'
+
+- name: "{{ current_sid }} - Get user quotas"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING ON FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    COL username FORMAT A25
+    COL tablespace_name FORMAT A20
+    COL max_bytes_display FORMAT A15
+    
+    SELECT username, tablespace_name,
+           CASE 
+             WHEN max_bytes = -1 THEN 'UNLIMITED'
+             ELSE TO_CHAR(ROUND(max_bytes/1024/1024)) || ' MB'
+           END as max_bytes_display
+    FROM dba_ts_quotas
+    WHERE username IN ({% for user in users %}'{{ user.username | upper }}'{% if not loop.last %},{% endif %}{% endfor %})
+    ORDER BY username, tablespace_name;
+    EXIT;
+    EOF
+  register: user_quotas
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: users | length > 0 and action != 'remove'
+
+# ============================================
+# Build Provisioning Report
+# ============================================
+- name: "{{ current_sid }} - Build user provisioning report"
+  ansible.builtin.set_fact:
+    provision_report: |
+      ╔═══════════════════════════════════════════════════════════════════════════════════╗
+      ║                          USER PROVISIONING REPORT                                 ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ Report Time: {{ report_timestamp }}
+      ║ Host:        {{ inventory_hostname }}
+      ║ Instance:    {{ current_sid }}
+      ║ ORACLE_HOME: {{ current_oracle_home }}
+      ║ Action:      {{ action | upper }}
+      ║ Users Count: {{ users | length }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ USERS REQUESTED:                                                                  ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% for user in users %}
+      ║ {{ loop.index }}. {{ user.username | upper }}
+      ║    Tablespace: {{ user.default_tablespace | default(default_tablespace) }}
+      ║    Profile:    {{ user.profile | default(default_profile) }}
+      ║    Quota:      {{ 'UNLIMITED' if user.quota_mb | default(default_quota_mb) | int == -1 else (user.quota_mb | default(default_quota_mb) | string + ' MB') }}
+      ║    Roles:      {{ user.roles | default(default_roles) | join(', ') }}
+      ║    Status:     {{ 'EXISTED' if user.username | upper in existing_user_list else 'NEW' }}
+      {% endfor %}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if action == 'validate' %}
+      ║ VALIDATION RESULTS:                                                               ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ Valid Tablespaces:
+      {{ valid_tablespaces.stdout | default('None found') }}
+      ║ Valid Profiles:
+      {{ valid_profiles.stdout | default('None found') }}
+      {% elif action in ['create', 'report'] %}
+      ║ CURRENT USER STATUS:                                                              ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ final_users.stdout | default('No users found') }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ USER ROLES:                                                                       ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ user_roles.stdout | default('No roles assigned') }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ USER QUOTAS:                                                                      ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ user_quotas.stdout | default('No quotas set') }}
+      {% elif action == 'remove' %}
+      ║ REMOVAL RESULTS:                                                                  ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% for user in users %}
+      ║ {{ user.username | upper }}: {{ '✅ Dropped' if user.username | upper in existing_user_list else '⚠️ Did not exist' }}
+      {% endfor %}
+      {% endif %}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ SUMMARY:                                                                          ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ Total Requested: {{ users | length }}
+      ║ Previously Existed: {{ existing_user_list | length }}
+      ║ New Users: {{ users | length - existing_user_list | length }}
+      {% if action == 'create' %}
+      ║ Action Taken: Created/Updated all requested users
+      {% elif action == 'remove' %}
+      ║ Action Taken: Dropped {{ existing_user_list | length }} user(s)
+      {% elif action == 'report' %}
+      ║ Action Taken: Report only, no changes made
+      {% elif action == 'validate' %}
+      ║ Action Taken: Validation only, no changes made
+      {% endif %}
+      ╚═══════════════════════════════════════════════════════════════════════════════════╝
+
+- name: "{{ current_sid }} - Display user provisioning report"
+  ansible.builtin.debug:
+    msg: "{{ provision_report }}"
+
+- name: "{{ current_sid }} - Save user provisioning report"
+  ansible.builtin.copy:
+    content: "{{ provision_report }}"
+    dest: "{{ report_base_dir }}/{{ report_date }}/{{ inventory_hostname }}/provision_users_{{ current_sid }}.txt"
+    mode: '0644'
+  delegate_to: localhost
+  become: no

@@ -1,0 +1,18 @@
+---
+# Oracle Installation Playbook
+# Usage: ansible-playbook playbooks/install_oracle.yml --limit newserver
+#
+# Required variables:
+#   -e 'db_name=mydb.domain db_sid=MYDB sys_password=SecurePass123'
+
+- name: Install Oracle 19c and Create Database
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    # Override these with -e or in inventory
+    db_name: "{{ inventory_hostname }}.localdomain"
+    db_sid: "ORCL"
+    # sys_password should be provided securely
+  roles:
+    - oracle_install

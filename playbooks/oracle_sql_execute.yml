@@ -1,0 +1,100 @@
+---
+# ================================================================================
+# Oracle SQL Execution with cx_Oracle Modules
+# ================================================================================
+#
+# This playbook uses the ansible-oracle-modules (cx_Oracle based) to execute
+# arbitrary SQL statements or scripts.
+#
+# PREREQUISITES:
+#   - cx_Oracle Python library installed
+#   - Network connectivity to Oracle listener
+#   - Appropriate database credentials
+#
+# USAGE:
+#   # Execute a SELECT query
+#   ansible-playbook playbooks/oracle_sql_execute.yml --limit crlnxd2201 \
+#     -e "db_service=ORCL" \
+#     -e "sql='SELECT username, account_status FROM dba_users WHERE ROWNUM <= 10'"
+#
+#   # Execute DML statement
+#   ansible-playbook playbooks/oracle_sql_execute.yml --limit crlnxd2201 \
+#     -e "db_service=ORCL" \
+#     -e "sql='UPDATE my_table SET status = ''ACTIVE'' WHERE id = 123'"
+#
+#   # Execute a SQL script file
+#   ansible-playbook playbooks/oracle_sql_execute.yml --limit crlnxd2201 \
+#     -e "db_service=ORCL" \
+#     -e "script=/u01/scripts/setup_schema.sql"
+#
+#   # Execute as SYSDBA
+#   ansible-playbook playbooks/oracle_sql_execute.yml --limit crlnxd2201 \
+#     -e "db_service=ORCL" \
+#     -e "db_mode=sysdba" \
+#     -e "db_user=sys" \
+#     -e "sql='SELECT instance_name, status FROM v\$instance'"
+# ================================================================================
+
+- name: Oracle SQL Execution (cx_Oracle Module)
+  hosts: all
+  become: no
+  gather_facts: no
+  
+  vars:
+    # Connection defaults
+    db_hostname: "{{ inventory_hostname }}"
+    db_port: 1521
+    db_service: "{{ db_sid | default('ORCL') }}"
+    db_user: "{{ oracle_dba_user | default('system') }}"
+    db_password: "{{ oracle_dba_password | default('') }}"
+    db_mode: normal
+
+  environment:
+    ORACLE_HOME: "{{ oracle_home | default('/u01/app/oracle/product/19.0.0/dbhome_1') }}"
+    LD_LIBRARY_PATH: "{{ oracle_home | default('/u01/app/oracle/product/19.0.0/dbhome_1') }}/lib"
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.fail:
+        msg: "Either 'sql' or 'script' variable must be provided"
+      when: 
+        - sql | default('') == ''
+        - script | default('') == ''
+
+    # ============================================
+    # Execute SQL Statement
+    # ============================================
+    - name: Execute SQL statement
+      oracle_sql:
+        hostname: "{{ db_hostname }}"
+        port: "{{ db_port }}"
+        service_name: "{{ db_service }}"
+        username: "{{ db_user }}"
+        password: "{{ db_password }}"
+        sql: "{{ sql }}"
+      when: sql | default('') != ''
+      register: sql_result
+
+    - name: Display SQL result
+      ansible.builtin.debug:
+        var: sql_result
+      when: sql | default('') != ''
+
+    # ============================================
+    # Execute SQL Script
+    # ============================================
+    - name: Execute SQL script
+      oracle_sql:
+        hostname: "{{ db_hostname }}"
+        port: "{{ db_port }}"
+        service_name: "{{ db_service }}"
+        username: "{{ db_user }}"
+        password: "{{ db_password }}"
+        script: "{{ script }}"
+      when: script | default('') != ''
+      register: script_result
+
+    - name: Display script result
+      ansible.builtin.debug:
+        var: script_result
+      when: script | default('') != ''

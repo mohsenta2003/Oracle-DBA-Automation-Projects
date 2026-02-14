@@ -1,0 +1,465 @@
+---
+# tasks file for oracle_monitor
+#
+# NOTE: This role is READ-ONLY / REPORTING ONLY
+# - Auto-detects Oracle user, ORACLE_HOME
+# - Supports MULTIPLE instances on same host
+# - Saves reports locally per instance
+#
+
+  # ============================================
+  # Gather minimal facts
+  # ============================================
+  - name: Gather minimal facts
+    ansible.builtin.setup:
+      gather_subset:
+        - '!all'
+        - '!min'
+        - date_time
+    become: no
+
+  - name: Set report timestamp
+    ansible.builtin.set_fact:
+      _report_date: "{{ ansible_date_time.date }}"
+      _report_timestamp: "{{ ansible_date_time.time | replace(':', '') }}"
+      _report_iso: "{{ ansible_date_time.iso8601 }}"
+
+  - name: Initialize result lists
+    ansible.builtin.set_fact:
+      _mon_instance_results: []
+      _skip_host: false
+
+  # ============================================
+  # Auto-detect Oracle user from PMON process
+  # ============================================
+  - name: Detect Oracle user from PMON process
+    ansible.builtin.shell:
+      cmd: "ps -eo user,comm | grep ora_pmon | grep -v grep | head -1 | awk '{print $1}'"
+    register: detected_oracle_user
+    changed_when: false
+    become: no
+    failed_when: false
+    when: oracle_user | default('') == ''
+
+  - name: Set detected oracle user
+    ansible.builtin.set_fact:
+      _oracle_user: "{{ oracle_user | default('') or (detected_oracle_user.stdout | default('') | trim) }}"
+
+  - name: Validate Oracle user is detected
+    ansible.builtin.fail:
+      msg: "Could not detect Oracle user. Set oracle_user variable: -e 'oracle_user=myuser'"
+    when: _oracle_user == ''
+
+  - name: Display detected Oracle user
+    ansible.builtin.debug:
+      msg: "Detected Oracle owner: {{ _oracle_user }}"
+
+  - name: Copy advanced KPI script to remote
+    ansible.builtin.copy:
+      src: advanced_kpi.sql
+      dest: /tmp/advanced_kpi.sql
+      mode: '0644'
+    become: no
+
+  # ============================================
+  # Detect ALL instances from PMON processes
+  # ============================================
+  - name: Detect all database instances from PMON
+    ansible.builtin.shell:
+      cmd: "ps -eo args | grep -v grep | grep ora_pmon_ | sed 's/.*ora_pmon_//' | awk '{print $1}' | grep -E '^[a-zA-Z0-9$#_-]+$' | grep -v '^+ASM' | sort -u"
+    register: detected_instances
+    changed_when: false
+    failed_when: false
+
+  - name: Set instances list
+    ansible.builtin.set_fact:
+      _all_instances: "{{ db_sid | default('') | ternary([db_sid], detected_instances.stdout_lines | default([]) | map('trim') | reject('equalto', '') | list) }}"
+
+  - name: Validate instances found
+    ansible.builtin.fail:
+      msg: "No Oracle instances detected on this host"
+    when: _all_instances | length == 0
+
+  - name: Display detected instances
+    ansible.builtin.debug:
+      msg: "Found {{ _all_instances | length }} instance(s): {{ _all_instances | join(', ') }}"
+
+  # ============================================
+  # Get ORACLE_HOME mapping from oratab
+  # ============================================
+  - name: Get oratab contents
+    ansible.builtin.shell:
+      cmd: "cat /etc/oratab | grep -v '^#' | grep -v '^$' | grep ':'"
+    register: oratab_contents
+    changed_when: false
+    failed_when: false
+
+  - name: Parse oratab into dictionary
+    ansible.builtin.set_fact:
+      _oratab_map: "{{ _oratab_map | default({}) | combine({item.split(':')[0]: item.split(':')[1]}) }}"
+    loop: "{{ oratab_contents.stdout_lines | default([]) }}"
+    when: item | regex_search('^[^:]+:[^:]+')
+
+  # ============================================
+  # Setup local report directory
+  # ============================================
+  - name: Set report base directory
+    ansible.builtin.set_fact:
+      _report_base_dir: "{{ playbook_dir | dirname }}/reports/{{ ansible_date_time.date }}/monitoring"
+
+  - name: Set local report path
+    ansible.builtin.set_fact:
+      _local_report_dir: "{{ _report_base_dir }}/{{ inventory_hostname }}"
+
+  - name: Create local reports directory
+    ansible.builtin.file:
+      path: "{{ _local_report_dir }}"
+      state: directory
+      mode: '0755'
+    delegate_to: localhost
+    become: no
+
+  # ============================================
+  # Detect and save listener status (once per host)
+  # ============================================
+  - name: Detect running listeners
+    ansible.builtin.shell:
+      cmd: "ps -ef | grep tnslsnr | grep -v grep | awk '{for(i=1;i<=NF;i++) if($i ~ /LISTENER/) print $i}' | sort -u"
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: listener_names_raw
+    failed_when: false
+
+  - name: Set detected listener names
+    ansible.builtin.set_fact:
+      _listener_names: "{{ listener_names_raw.stdout_lines | default(['LISTENER']) }}"
+
+  - name: Display detected listeners
+    ansible.builtin.debug:
+      msg: "Detected listeners: {{ _listener_names }}"
+
+  - name: Get first ORACLE_HOME for listener check
+    ansible.builtin.set_fact:
+      _first_oracle_home: "{{ _oratab_map.values() | first }}"
+
+  - name: Check listener status
+    ansible.builtin.shell:
+      cmd: "export ORACLE_HOME={{ _first_oracle_home }}; export PATH=$ORACLE_HOME/bin:$PATH; lsnrctl status {{ item }} 2>&1 || echo 'Listener {{ item }} not accessible'"
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: listener_status_results
+    failed_when: false
+    loop: "{{ _listener_names }}"
+
+  - name: Combine listener status
+    ansible.builtin.set_fact:
+      _listener_combined: "{{ listener_status_results.results | map(attribute='stdout') | join('\n\n') }}"
+
+  - name: Extract Listener Log Paths
+    ansible.builtin.set_fact:
+      _listener_log_paths: "{{ _listener_combined | regex_findall('Listener Log File\\s+(.*)') | map('trim') | list }}"
+
+  - name: Audit Listener Logs for Connection Issues
+    ansible.builtin.shell:
+      cmd: |
+        LOG_FILE="{{ item }}"
+        if [ -f "$LOG_FILE" ]; then
+          # Broaden date pattern to match various formats (e.g., 13-FEB, Feb 13, 2026-02-13)
+          # We'll capture the last 200 lines and filter for issues, including the timestamp lines
+          tail -n 200 "$LOG_FILE" | grep -Ei "TNS-|refuse|reject|fail|cancel|error" || echo "No critical issues detected in the last 200 lines of $LOG_FILE"
+        else
+          echo "Log file $LOG_FILE not found"
+        fi
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: listener_log_issues
+    loop: "{{ _listener_log_paths }}"
+    failed_when: false
+    when: _listener_log_paths | length > 0
+
+  - name: Combine Listener Alerts
+    ansible.builtin.set_fact:
+      _listener_alerts_combined: >-
+        {% set alerts = [] %}
+        {% if listener_log_issues.results is defined %}
+          {% for res in listener_log_issues.results %}
+            {% if res.stdout is defined and res.stdout | trim != '' and 'No issues found' not in res.stdout and 'Log file' not in res.stdout %}
+              {% set _ = alerts.append('--- Log: ' + (res.item | basename) + ' ---\n' + res.stdout) %}
+            {% endif %}
+          {% endfor %}
+        {% endif %}
+        {{ alerts | join('\n') }}
+
+  - name: Save listener status
+    ansible.builtin.copy:
+      content: |
+        ================================================================================
+        LISTENER STATUS - {{ inventory_hostname }} - {{ report_timestamp }}
+        ================================================================================
+        Detected Listeners: {{ _listener_names | join(', ') }}
+        
+        {{ _listener_combined }}
+      dest: "{{ _local_report_dir }}/listener_status.txt"
+    delegate_to: localhost
+    become: no
+
+  # ============================================
+  # Process each instance
+  # ============================================
+  - name: Monitor each instance
+    ansible.builtin.include_tasks: monitor_instance.yml
+    loop: "{{ _all_instances }}"
+    loop_control:
+      loop_var: current_sid
+
+  # ============================================
+  # Final summary
+  # ============================================
+  # ============================================
+  # Generate Consolidated Reports (Run Once)
+  # ============================================
+  - name: Set consolidated report paths
+    ansible.builtin.set_fact:
+      _csv_report_path: "{{ _report_base_dir }}/monitoring_results_{{ _report_timestamp }}.csv"
+      _txt_report_path: "{{ _report_base_dir }}/monitoring_consolidated_{{ _report_timestamp }}.txt"
+      _html_report_path: "{{ _report_base_dir }}/monitoring_dashboard_{{ _report_timestamp }}.html"
+    run_once: true
+
+  - name: Generate CSV Monitoring Report
+    ansible.builtin.copy:
+      content: |
+        Host,SID,Status,Version,Max TBS Usage %,Alert Errors,Blocking Count,Wait Count,Invalid Count,Startup,Last Patch,Consolidation Candidate,Report File
+        {% for host in ansible_play_hosts %}
+        {% set host_vars = hostvars[host] %}
+        {% for result in host_vars._mon_instance_results | default([]) %}
+        {{ host }},{{ result.sid }},{{ result.status }},{{ result.version }},{{ result.max_tbs_pct }},{{ result.has_alert_errors }},{{ result.blocking_count }},{{ result.wait_count }},{{ result.invalid_count }},{{ result.startup_time }},{{ result.last_patch }},{{ 'YES' if (result.max_tbs_pct | float < 20 and result.blocking_count | int == 0) else 'NO' }},{{ host }}/{{ result.report_file }}
+        {% endfor %}
+        {% endfor %}
+      dest: "{{ _csv_report_path }}"
+    delegate_to: localhost
+    become: no
+    run_once: true
+
+  - name: Generate Text Monitoring Report
+    ansible.builtin.copy:
+      content: |
+        ================================================================================
+                    ORACLE DATABASE MONITORING - CONSOLIDATED REPORT
+        ================================================================================
+        Generated: {{ _report_iso }}
+        Report Path: reports/{{ _report_date }}/monitoring/
+        
+        --------------------------------------------------------------------------------
+        SUMMARY TABLE
+        --------------------------------------------------------------------------------
+        Host                SID       Status    Version       TBS%  Alerts  Blocks  Waits Startup(UTC)        Last Patch
+        ------------------ --------- --------- ------------- ---- ------- ------- ----- ------------------- ------------------
+        {% for host in ansible_play_hosts %}
+        {% set host_vars = hostvars[host] %}
+        {% for result in host_vars._mon_instance_results | default([]) %}
+        {{ '%-18s' | format(host) }} {{ '%-9s' | format(result.sid) }} {{ '%-9s' | format(result.status) }} {{ '%-13s' | format(result.version) }} {{ '%-4s' | format(result.max_tbs_pct | string + '%') }} {{ '%-7s' | format('ERR' if result.has_alert_errors | bool else 'OK') }} {{ '%-7s' | format(result.blocking_count) }} {{ '%-5s' | format(result.wait_count) }} {{ '%-19s' | format(result.startup_time) }} {{ result.last_patch | truncate(20) }}
+        {% endfor %}
+        {% endfor %}
+        
+        --------------------------------------------------------------------------------
+        ACTION NEEDED (Instances with issues)
+        --------------------------------------------------------------------------------
+        {% set issues_found = false %}
+        {% for host in ansible_play_hosts %}
+        {% set host_vars = hostvars[host] %}
+        
+        {# -- Instance Issues -- #}
+        {% for result in host_vars._mon_instance_results | default([]) %}
+        {% set tbs_val = result.max_tbs_pct | default(0) | float %}
+        {% set blk_val = result.blocking_count | default(0) | int %}
+        {% set inv_val = result.invalid_count | default(0) | int %}
+        {% set has_err = result.has_alert_errors | default(false) | bool %}
+        {% if result.status != 'OPEN' or tbs_val > 80 or has_err or blk_val > 0 or inv_val > 0 %}
+        {% set issues_found = true %}
+        - {{ host }}: Instance {{ result.sid }}
+          * Status: {{ result.status }}, Max TBS: {{ tbs_val }}%
+          * Issues: {{ 'ALERTS' if has_err else '' }} {{ 'BLOCKING' if blk_val > 0 else '' }} {{ 'INVALID OBJECTS: ' + inv_val | string if inv_val > 0 else '' }}
+          {% if result.advisor_tips | trim != '' %}
+          * Advisor Hints:
+            {{ result.advisor_tips | trim | indent(12) }}
+          {% endif %}
+        {% endif %}
+        {% endfor %}
+
+        {# -- Listener Issues -- #}
+        {% if host_vars._listener_alerts_combined | default('') | trim != '' %}
+        {% set issues_found = true %}
+        - {{ host }}: LISTENER CONNECTIVITY ISSUES
+          {{ host_vars._listener_alerts_combined | trim | indent(10) }}
+        {% endif %}
+        
+        {% endfor %}
+        {% if not issues_found %}
+        ✅ No critical health issues detected across all monitored instances.
+        {% endif %}
+        ================================================================================
+      dest: "{{ _txt_report_path }}"
+    delegate_to: localhost
+    become: no
+    run_once: true
+
+  - name: Generate HTML Monitoring Dashboard
+    ansible.builtin.copy:
+      content: |
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Oracle Monitoring Dashboard</title>
+            <style>
+                :root {
+                    --primary: #2563eb; --primary-hover: #1d4ed8; --bg: #f8fafc; --card-bg: #ffffff;
+                    --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0;
+                    --success: #22c55e; --warning: #f59e0b; --danger: #ef4444; --info: #3b82f6;
+                }
+                body { font-family: 'Inter', -apple-system, system-ui, sans-serif; background-color: var(--bg); margin: 0; padding: 40px; color: var(--text-main); }
+                .container { max-width: 1280px; margin: auto; }
+                .header { text-align: center; margin-bottom: 40px; }
+                .header h1 { font-size: 2.5rem; margin-bottom: 8px; color: var(--text-main); letter-spacing: -0.025em; }
+                .header p { color: var(--text-muted); font-size: 1.1rem; }
+                
+                .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; margin-bottom: 40px; }
+                .card { background: var(--card-bg); padding: 24px; border-radius: 12px; border: 1px solid var(--border); box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+                .card-title { font-weight: 600; font-size: 0.875rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
+                .critical-issues { border-left: 4px solid var(--danger); }
+                
+                table { width: 100%; border-collapse: separate; border-spacing: 0; border-radius: 12px; overflow: hidden; border: 1px solid var(--border); background: var(--card-bg); }
+                th { background-color: #f1f5f9; color: var(--text-muted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 16px; text-align: left; }
+                td { padding: 16px; border-bottom: 1px solid var(--border); font-size: 0.875rem; }
+                tr:last-child td { border-bottom: none; }
+                .status-badge { display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }
+                .bg-success { background-color: #dcfce7; color: #166534; }
+                .bg-warning { background-color: #fef3c7; color: #92400e; }
+                .bg-danger { background-color: #fee2e2; color: #991b1b; }
+                a { color: var(--primary); text-decoration: none; font-weight: 500; }
+                a:hover { text-decoration: underline; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>🚀 Database Health Dashboard</h1>
+                    <p>Cross-Estate Monitoring Status | {{ _report_iso }}</p>
+                </div>
+
+                <div class="grid">
+                    <div class="card">
+                        <div class="card-title">Total Instances</div>
+                        <div style="font-size: 2rem; font-weight: 700;">{{ ansible_play_hosts | length }}</div>
+                    </div>
+                    {% set critical_count = 0 %}
+                    {% set headroom_count = 0 %}
+                    {% set listener_alert_count = 0 %}
+                    {% for host in ansible_play_hosts %}
+                      {% set host_vars = hostvars[host] %}
+                      {% if host_vars._listener_alerts_combined | default('') | trim != '' %}
+                        {% set listener_alert_count = listener_alert_count + 1 %}
+                      {% endif %}
+                      {% for result in host_vars._mon_instance_results | default([]) %}
+                        {% set tbs_val = result.max_tbs_pct | default(0) | float %}
+                        {% set blk_val = result.blocking_count | default(0) | int %}
+                        {% set has_err = result.has_alert_errors | default(false) | bool %}
+                        {% if result.status != 'OPEN' or tbs_val > 90 or has_err or blk_val > 0 %}
+                          {% set critical_count = critical_count + 1 %}
+                        {% elif tbs_val < 20 and blk_val == 0 %}
+                          {% set headroom_count = headroom_count + 1 %}
+                        {% endif %}
+                      {% endfor %}
+                    {% endfor %}
+                    <div class="card {{ 'critical-issues' if critical_count > 0 }}">
+                        <div class="card-title">Critical Issues</div>
+                        <div style="font-size: 2rem; font-weight: 700; color: {{ 'var(--danger)' if critical_count > 0 else 'var(--success)' }}">{{ critical_count }}</div>
+                    </div>
+                    <div class="card {{ 'critical-issues' if listener_alert_count > 0 }}">
+                        <div class="card-title">Listener Alerts</div>
+                        <div style="font-size: 2rem; font-weight: 700; color: {{ 'var(--danger)' if listener_alert_count > 0 else 'var(--success)' }}">{{ listener_alert_count }}</div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Headroom (Consolidation)</div>
+                        <div style="font-size: 2rem; font-weight: 700; color: var(--info);">{{ headroom_count }}</div>
+                    </div>
+                </div>
+
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Server</th>
+                            <th>Instance</th>
+                            <th>Status/Startup</th>
+                            <th>Storage</th>
+                            <th>Alerts/Patching</th>
+                            <th>Performance</th>
+                            <th>Advisor Recommendations</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for host in ansible_play_hosts %}
+                        {% set host_vars = hostvars[host] %}
+                        {% for result in host_vars._mon_instance_results | default([]) %}
+                        {% set tbs_val = result.max_tbs_pct | default(0) | float %}
+                        {% set blk_val = result.blocking_count | default(0) | int %}
+                        {% set inv_val = result.invalid_count | default(0) | int %}
+                        {% set wait_val = result.wait_count | default(0) | int %}
+                        {% set has_err = result.has_alert_errors | default(false) | bool %}
+                        <tr>
+                            <td><strong>{{ host }}</strong></td>
+                            <td><a href="{{ host }}/{{ result.report_file }}" target="_blank">{{ result.sid }}</a></td>
+                            <td>
+                                <span class="status-badge {{ 'bg-success' if result.status == 'OPEN' else 'bg-warning' }}">{{ result.status }}</span><br>
+                                <span style="font-size: 0.75rem; color: var(--text-muted);">Since: {{ result.startup_time }}</span>
+                            </td>
+                            <td>
+                                <span class="status-badge {{ 'bg-danger' if tbs_val > 90 else 'bg-warning' if tbs_val > 80 else 'bg-success' if tbs_val > 20 else 'bg-info' }}">
+                                    {{ tbs_val }}% {{ '(Headroom)' if tbs_val < 20 else '' }}
+                                </span>
+                            </td>
+                            <td>
+                                {% if has_err %}<span class="status-badge bg-danger">ALERTS</span>{% endif %}
+                                {% if inv_val > 0 %}<span class="status-badge bg-warning">{{ inv_val }} INVALIDS</span>{% endif %}
+                                {% if not has_err and inv_val == 0 %}✅ No Errors{% endif %}
+                                <div style="font-size: 0.7rem; color: var(--text-muted); margin-top: 5px;">Patch: {{ result.last_patch | truncate(35) }}</div>
+                            </td>
+                            <td>
+                                {% if blk_val > 0 %}<span class="status-badge bg-danger">{{ blk_val }} BLOCKED</span>
+                                {% elif wait_val > 10 %}<span class="status-badge bg-warning">HIGH WAITS</span>
+                                {% else %}✅ Healthy{% endif %}
+                            </td>
+                            <td style="font-size: 0.8rem; max-width: 300px;">
+                                {% if result.advisor_tips | trim != '' %}
+                                <div style="background: #f8fafc; padding: 8px; border-radius: 6px; border: 1px dashed var(--border);">
+                                    {{ result.advisor_tips | trim | truncate(350) }}
+                                </div>
+                                {% else %}
+                                <span style="color: var(--text-muted);">No specific recommendations</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </body>
+        </html>
+      dest: "{{ _html_report_path }}"
+    delegate_to: localhost
+    become: no
+    run_once: true
+
+  - name: Display report locations
+    ansible.builtin.debug:
+      msg: |
+        
+        ========================================
+        CONSOLIDATED MONITORING REPORTS
+        ========================================
+        HTML Dashboard: {{ _html_report_path }}
+        CSV Report:      {{ _csv_report_path }}
+        
+        Check each host's reports for details.
+        ========================================
+    run_once: true

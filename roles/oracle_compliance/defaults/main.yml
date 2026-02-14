@@ -1,0 +1,12 @@
+---
+# defaults file for oracle_compliance
+
+# Oracle environment - auto-detected if empty
+oracle_home: ""
+oracle_base: ""
+oracle_user: ""
+oracle_group: ""
+
+# Compliance report directory - auto-derived from oracle_base if empty
+compliance_dir: ""
+compliance_subdir: "compliance_reports"

@@ -1,0 +1,282 @@
+---
+# ================================================================================
+# Manage Scheduler Jobs Instance Tasks - Called for each Oracle instance
+# ================================================================================
+
+- name: "{{ current_sid }} - Set instance ORACLE_HOME"
+  ansible.builtin.set_fact:
+    current_oracle_home: "{{ oracle_home_map[current_sid] | default(oracle_home_map.values() | list | first | default('/u01/app/oracle/product/19.0.0/dbhome_1')) }}"
+
+- name: "{{ current_sid }} - Set environment"
+  ansible.builtin.set_fact:
+    oracle_env:
+      ORACLE_HOME: "{{ current_oracle_home }}"
+      ORACLE_SID: "{{ current_sid }}"
+      LD_LIBRARY_PATH: "{{ current_oracle_home }}/lib"
+      PATH: "{{ current_oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+
+- name: "{{ current_sid }} - Set report timestamp"
+  ansible.builtin.set_fact:
+    report_timestamp: "{{ ansible_date_time.iso8601 }}"
+
+# ============================================
+# LIST - List all scheduler jobs
+# ============================================
+- name: "{{ current_sid }} - List all scheduler jobs"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    SELECT RPAD(owner || '.' || job_name, 50) || ' | ' || 
+           RPAD(state, 12) || ' | Next: ' || 
+           NVL(TO_CHAR(next_run_date, 'YYYY-MM-DD HH24:MI'), 'N/A')
+    FROM dba_scheduler_jobs
+    WHERE owner NOT IN ('SYS', 'ORACLE_OCM', 'EXFSYS')
+    ORDER BY owner, job_name;
+    EXIT;
+    EOF
+  register: jobs_list
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'list'
+
+- name: "{{ current_sid }} - Get running jobs"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    SELECT RPAD(owner || '.' || job_name, 50) || ' | Started: ' || 
+           TO_CHAR(elapsed_time)
+    FROM dba_scheduler_running_jobs
+    ORDER BY elapsed_time DESC;
+    EXIT;
+    EOF
+  register: running_jobs
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'list'
+
+# ============================================
+# HISTORY - View job run history
+# ============================================
+- name: "{{ current_sid }} - Get job run history"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    SELECT TO_CHAR(log_date, 'YYYY-MM-DD HH24:MI:SS') || ' | ' ||
+           RPAD(owner || '.' || job_name, 40) || ' | ' || 
+           RPAD(status, 10)
+    FROM dba_scheduler_job_run_details
+    WHERE {% if job_name != '' %}job_name = UPPER('{{ job_name }}') AND {% endif %}
+          log_date > SYSDATE - 7
+    ORDER BY log_date DESC
+    FETCH FIRST 50 ROWS ONLY;
+    EXIT;
+    EOF
+  register: job_history
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'history'
+
+# ============================================
+# CREATE - Create new scheduler job
+# ============================================
+- name: "{{ current_sid }} - Create scheduler job"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    BEGIN
+      DBMS_SCHEDULER.CREATE_JOB(
+        job_name        => '{{ job_name }}',
+        job_type        => '{{ job_type }}',
+        job_action      => '{{ job_action }}',
+        start_date      => SYSTIMESTAMP,
+        {% if repeat_interval != '' %}
+        repeat_interval => '{{ repeat_interval }}',
+        {% endif %}
+        enabled         => {{ enabled }}
+      );
+    END;
+    /
+    EXIT;
+    EOF
+  register: create_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'create' and job_name != '' and job_action != ''
+  failed_when: false
+
+# ============================================
+# ENABLE - Enable job
+# ============================================
+- name: "{{ current_sid }} - Enable job"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    BEGIN
+      DBMS_SCHEDULER.ENABLE('{{ job_owner | default('') }}{% if job_owner | default('') != '' %}.{% endif %}{{ job_name }}');
+    END;
+    /
+    EXIT;
+    EOF
+  register: enable_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'enable' and job_name != ''
+  failed_when: false
+
+# ============================================
+# DISABLE - Disable job
+# ============================================
+- name: "{{ current_sid }} - Disable job"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    BEGIN
+      DBMS_SCHEDULER.DISABLE('{{ job_owner | default('') }}{% if job_owner | default('') != '' %}.{% endif %}{{ job_name }}', TRUE);
+    END;
+    /
+    EXIT;
+    EOF
+  register: disable_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'disable' and job_name != ''
+  failed_when: false
+
+# ============================================
+# RUN - Run job immediately
+# ============================================
+- name: "{{ current_sid }} - Run job immediately"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    BEGIN
+      DBMS_SCHEDULER.RUN_JOB('{{ job_owner | default('') }}{% if job_owner | default('') != '' %}.{% endif %}{{ job_name }}', FALSE);
+    END;
+    /
+    EXIT;
+    EOF
+  register: run_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'run' and job_name != ''
+  failed_when: false
+
+# ============================================
+# DROP - Drop job
+# ============================================
+- name: "{{ current_sid }} - Drop job"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    BEGIN
+      DBMS_SCHEDULER.DROP_JOB('{{ job_owner | default('') }}{% if job_owner | default('') != '' %}.{% endif %}{{ job_name }}', TRUE);
+    END;
+    /
+    EXIT;
+    EOF
+  register: drop_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'drop' and job_name != ''
+  failed_when: false
+
+# ============================================
+# Build Scheduler Jobs Report
+# ============================================
+- name: "{{ current_sid }} - Build scheduler jobs report"
+  ansible.builtin.set_fact:
+    scheduler_report: |
+      ╔═══════════════════════════════════════════════════════════════════════════════════╗
+      ║                        SCHEDULER JOB MANAGEMENT REPORT                            ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ Report Time: {{ report_timestamp }}
+      ║ Host:        {{ inventory_hostname }}
+      ║ Instance:    {{ current_sid }}
+      ║ ORACLE_HOME: {{ current_oracle_home }}
+      ║ Action:      {{ action | upper }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if action == 'list' %}
+      ║ ALL SCHEDULER JOBS:                                                               ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ jobs_list.stdout | default('No jobs found') }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ CURRENTLY RUNNING JOBS:                                                           ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ running_jobs.stdout | default('No jobs currently running') }}
+      {% elif action == 'history' %}
+      ║ JOB RUN HISTORY (Last 7 days):                                                    ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ job_history.stdout | default('No history found') }}
+      {% elif action == 'create' %}
+      ║ CREATE JOB: {{ job_name }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if create_result is defined and create_result.rc == 0 %}
+      ║ ✅ Job {{ job_name }} created successfully
+      ║ Type:            {{ job_type }}
+      ║ Repeat Interval: {{ repeat_interval | default('One-time') }}
+      ║ Enabled:         {{ enabled }}
+      {% else %}
+      ║ ❌ Failed to create job
+      ║ {{ create_result.stdout | default('') }}
+      {% endif %}
+      {% elif action == 'enable' %}
+      ║ ENABLE JOB: {{ job_name }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if enable_result is defined and enable_result.rc == 0 %}
+      ║ ✅ Job {{ job_name }} enabled successfully
+      {% else %}
+      ║ ❌ Failed to enable job
+      {% endif %}
+      {% elif action == 'disable' %}
+      ║ DISABLE JOB: {{ job_name }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if disable_result is defined and disable_result.rc == 0 %}
+      ║ ✅ Job {{ job_name }} disabled successfully
+      {% else %}
+      ║ ❌ Failed to disable job
+      {% endif %}
+      {% elif action == 'run' %}
+      ║ RUN JOB: {{ job_name }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if run_result is defined and run_result.rc == 0 %}
+      ║ ✅ Job {{ job_name }} started successfully
+      {% else %}
+      ║ ❌ Failed to run job
+      ║ {{ run_result.stdout | default('') }}
+      {% endif %}
+      {% elif action == 'drop' %}
+      ║ DROP JOB: {{ job_name }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if drop_result is defined and drop_result.rc == 0 %}
+      ║ ✅ Job {{ job_name }} dropped successfully
+      {% else %}
+      ║ ❌ Failed to drop job
+      {% endif %}
+      {% endif %}
+      ╚═══════════════════════════════════════════════════════════════════════════════════╝
+
+- name: "{{ current_sid }} - Display scheduler report"
+  ansible.builtin.debug:
+    msg: "{{ scheduler_report }}"
+
+- name: "{{ current_sid }} - Save scheduler report"
+  ansible.builtin.copy:
+    content: "{{ scheduler_report }}"
+    dest: "{{ report_base_dir }}/{{ report_date }}/{{ inventory_hostname }}/scheduler_jobs_{{ current_sid }}.txt"
+    mode: '0644'
+  delegate_to: localhost
+  become: no

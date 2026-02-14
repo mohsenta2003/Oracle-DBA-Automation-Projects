@@ -1,0 +1,41 @@
+---
+# ================================================================================
+# Oracle Patching Playbook - MULTI-INSTANCE SUPPORT
+# ================================================================================
+#
+# This playbook automatically detects and checks patch status for ALL database
+# instances running on each target host.
+#
+# BASIC USAGE (Pre-check only - reports current patch level):
+#   ansible-playbook playbooks/patch_oracle.yml --limit us_lnx_test
+#   ansible-playbook playbooks/patch_oracle.yml --limit crlnxd2201
+#
+# SPECIFIC INSTANCE:
+#   ansible-playbook playbooks/patch_oracle.yml --limit crlnxd2201 -e "db_sid=ORCL1"
+#
+# PATCH OPTIONS:
+#   -e "patch_id=32545008"          # Patch ID to check conflicts
+#   -e "patch_dir=/u01/patches"     # Location of patch files
+#
+# PRE-CHECK INFORMATION:
+#   - OPatch version
+#   - Currently installed patches (lspatches)
+#   - Database version and PSU/RU history
+#   - Disk space availability
+#   - Patch conflict analysis (if patch_id provided)
+#
+# AUTO-DETECTION:
+#   - Oracle user detected from PMON process owner
+#   - ORACLE_HOME resolved from /etc/oratab for each instance
+#   - All running instances processed automatically
+#
+# REPORTS:
+#   Saved to: reports/YYYY-MM-DD/hostname/patch_<SID>.txt
+# ================================================================================
+
+- name: Apply Oracle Patches
+  hosts: all
+  become: no
+  gather_facts: no
+  roles:
+    - oracle_patch

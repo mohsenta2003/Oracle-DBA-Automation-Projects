@@ -1,0 +1,120 @@
+---
+# tasks file for oracle_wait_events
+#
+# NOTE: This role provides detailed wait event analysis
+# - Auto-detects Oracle user, ORACLE_HOME
+# - Supports MULTIPLE instances on same host
+# - Creates clear, readable wait event reports per instance
+#
+
+  # ============================================
+  # Gather minimal facts
+  # ============================================
+  - name: Gather minimal facts
+    ansible.builtin.setup:
+      gather_subset:
+        - '!all'
+        - '!min'
+        - date_time
+    become: no
+
+  # ============================================
+  # Auto-detect Oracle user from PMON process
+  # ============================================
+  - name: Detect Oracle user from PMON process
+    ansible.builtin.shell:
+      cmd: "ps -eo user,comm | grep ora_pmon | grep -v grep | head -1 | awk '{print $1}'"
+    register: detected_oracle_user
+    changed_when: false
+    become: no
+    failed_when: false
+    when: oracle_user | default('') == ''
+
+  - name: Set detected oracle user
+    ansible.builtin.set_fact:
+      _oracle_user: "{{ oracle_user | default('') or (detected_oracle_user.stdout | default('') | trim) }}"
+
+  - name: Validate Oracle user is detected
+    ansible.builtin.fail:
+      msg: "Could not detect Oracle user. Set oracle_user variable: -e 'oracle_user=myuser'"
+    when: _oracle_user == ''
+
+  # ============================================
+  # Detect ALL instances from PMON processes
+  # ============================================
+  - name: Detect all database instances from PMON
+    ansible.builtin.shell:
+      cmd: "ps -ef | grep ora_pmon | grep -v grep | awk -F'_' '{print $NF}' | sort -u"
+    register: detected_instances
+    changed_when: false
+    failed_when: false
+
+  - name: Set instances list
+    ansible.builtin.set_fact:
+      _all_instances: "{{ db_sid | default('') | ternary([db_sid], detected_instances.stdout_lines | default([])) }}"
+
+  - name: Validate instances found
+    ansible.builtin.fail:
+      msg: "No Oracle instances detected on this host"
+    when: _all_instances | length == 0
+
+  - name: Display detected instances
+    ansible.builtin.debug:
+      msg: "Found {{ _all_instances | length }} instance(s): {{ _all_instances | join(', ') }}"
+
+  # ============================================
+  # Get ORACLE_HOME mapping from oratab
+  # ============================================
+  - name: Get oratab contents
+    ansible.builtin.shell:
+      cmd: "cat /etc/oratab | grep -v '^#' | grep -v '^$' | grep ':'"
+    register: oratab_contents
+    changed_when: false
+    failed_when: false
+
+  - name: Parse oratab into dictionary
+    ansible.builtin.set_fact:
+      _oratab_map: "{{ _oratab_map | default({}) | combine({item.split(':')[0]: item.split(':')[1]}) }}"
+    loop: "{{ oratab_contents.stdout_lines | default([]) }}"
+    when: item | regex_search('^[^:]+:[^:]+')
+
+  # ============================================
+  # Setup local report directory
+  # ============================================
+  - name: Set local report path
+    ansible.builtin.set_fact:
+      _local_report_dir: "{{ playbook_dir }}/../reports/{{ ansible_date_time.date }}/{{ inventory_hostname }}"
+
+  - name: Create local reports directory
+    ansible.builtin.file:
+      path: "{{ _local_report_dir }}"
+      state: directory
+      mode: '0755'
+    delegate_to: localhost
+    become: no
+
+  # ============================================
+  # Process each instance
+  # ============================================
+  - name: Analyze wait events for each instance
+    ansible.builtin.include_tasks: analyze_instance.yml
+    loop: "{{ _all_instances }}"
+    loop_control:
+      loop_var: current_sid
+
+  # ============================================
+  # Final summary
+  # ============================================
+  - name: Display final summary
+    ansible.builtin.debug:
+      msg: |
+        
+        ========================================
+        WAIT EVENTS ANALYSIS COMPLETE
+        ========================================
+        Host: {{ inventory_hostname }}
+        Instances analyzed: {{ _all_instances | length }}
+        {% for sid in _all_instances %}
+        - {{ sid }}: reports/{{ ansible_date_time.date }}/{{ inventory_hostname }}/wait_events_{{ sid }}.txt
+        {% endfor %}
+        ========================================

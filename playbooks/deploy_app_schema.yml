@@ -1,0 +1,139 @@
+---
+# ================================================================================
+# Deploy Application Schema - Complete application deployment
+# ================================================================================
+#
+# MULTI-INSTANCE SUPPORT:
+#   Automatically detects ALL running instances on each host
+#   Can target specific instance with db_sid parameter
+#
+# USAGE:
+#   # Deploy to all instances on a host
+#   ansible-playbook playbooks/deploy_app_schema.yml --limit crlnxd2201 \
+#     -e "app_name=MYAPP" \
+#     -e "app_password=SecurePass123!"
+#
+#   # Deploy to specific instance only
+#   ansible-playbook playbooks/deploy_app_schema.yml --limit crlnxd2201 \
+#     -e "db_sid=ORCL1" \
+#     -e "app_name=MYAPP" \
+#     -e "app_password=SecurePass123!"
+#
+#   # Dry-run mode (default - report only)
+#   ansible-playbook playbooks/deploy_app_schema.yml --limit crlnxd2201 \
+#     -e "app_name=MYAPP" \
+#     -e "app_password=SecurePass123!"
+#
+#   # Execute deployment
+#   ansible-playbook playbooks/deploy_app_schema.yml --limit crlnxd2201 \
+#     -e "app_name=MYAPP" \
+#     -e "app_password=SecurePass123!" \
+#     -e "execute=true"
+#
+# REPORTS:
+#   Saved to: reports/YYYY-MM-DD/hostname/deploy_schema_<APP>_<SID>.txt
+# ================================================================================
+
+- name: Deploy Oracle Application Schema
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  vars:
+    # Application settings
+    app_name: ""
+    app_password: ""
+    data_tablespace_size: "10G"
+    index_tablespace_size: "5G"
+    default_grants:
+      - CONNECT
+      - RESOURCE
+      - CREATE VIEW
+      - CREATE SYNONYM
+    ddl_script: ""
+    execute: false
+    # Report settings
+    report_base_dir: "{{ playbook_dir }}/../reports"
+    report_date: "{{ ansible_date_time.date }}"
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.fail:
+        msg: "Required: app_name, app_password"
+      when: app_name == '' or app_password == ''
+
+    # ============================================
+    # Auto-detect Oracle Environment
+    # ============================================
+    - name: Detect Oracle service accounts
+      ansible.builtin.shell: |
+        grep -E '^svcorat|^svcorap|^oracle' /etc/passwd | head -1 | cut -d: -f1
+      register: detected_oracle_user
+      changed_when: false
+      failed_when: false
+
+    - name: Set Oracle user
+      ansible.builtin.set_fact:
+        oracle_user: "{{ oracle_user | default(detected_oracle_user.stdout | default('oracle')) }}"
+
+    - name: Detect all running database instances from PMON
+      ansible.builtin.shell: |
+        ps -ef | grep ora_pmon | grep -v grep | awk -F'_' '{print $NF}' | sort -u
+      register: detected_instances
+      changed_when: false
+      become_user: "{{ oracle_user }}"
+
+    - name: Read oratab entries for ORACLE_HOME mapping
+      ansible.builtin.shell: |
+        grep -v '^#' /etc/oratab 2>/dev/null | grep ':' || echo ""
+      register: oratab_content
+      changed_when: false
+
+    - name: Build ORACLE_HOME map from oratab
+      ansible.builtin.set_fact:
+        oracle_home_map: >-
+          {%- set home_map = {} -%}
+          {%- for line in oratab_content.stdout_lines -%}
+            {%- set parts = line.split(':') -%}
+            {%- if parts | length >= 2 -%}
+              {%- set _ = home_map.update({parts[0]: parts[1]}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ home_map }}
+
+    - name: Determine instances to process
+      ansible.builtin.set_fact:
+        instances_to_process: >-
+          {%- if db_sid is defined and db_sid != '' -%}
+            {{ [db_sid] }}
+          {%- else -%}
+            {{ detected_instances.stdout_lines | default([]) }}
+          {%- endif -%}
+
+    - name: Display detected instances
+      ansible.builtin.debug:
+        msg: |
+          Host: {{ inventory_hostname }}
+          Oracle User: {{ oracle_user }}
+          Detected Instances: {{ detected_instances.stdout_lines | join(', ') }}
+          Processing: {{ instances_to_process | join(', ') }}
+          Execute Mode: {{ execute }}
+
+    - name: Fail if no instances found
+      ansible.builtin.fail:
+        msg: "No Oracle instances detected on {{ inventory_hostname }}"
+      when: instances_to_process | length == 0
+
+    - name: Create local report directory
+      ansible.builtin.file:
+        path: "{{ report_base_dir }}/{{ report_date }}/{{ inventory_hostname }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: no
+
+    - name: Deploy schema to each instance
+      ansible.builtin.include_tasks: deploy_schema_instance.yml
+      loop: "{{ instances_to_process }}"
+      loop_control:
+        loop_var: current_sid

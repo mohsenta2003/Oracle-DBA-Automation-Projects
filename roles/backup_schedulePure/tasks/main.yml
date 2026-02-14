@@ -1,0 +1,150 @@
+---
+# tasks file for backup_schedulePure
+#
+# Multi-instance RMAN backup scheduling role
+# Auto-detects ALL instances on the host and schedules cron jobs
+#
+# Usage:
+#   ansible-playbook playbooks/schedule_backup.yml --limit hostname \
+#     [-e "backup_type=full|incremental"] \
+#     [-e "schedule_hour=22"] \
+#     [-e "schedule_minute=0"] \
+#     [-e "db_sid=SPECIFIC_SID"]  # Optional: schedule for specific instance only
+#
+
+  # ============================================
+  # Gather minimal facts
+  # ============================================
+  - name: Gather minimal facts
+    ansible.builtin.setup:
+      gather_subset:
+        - '!all'
+        - '!min'
+        - date_time
+    become: no
+
+  # ============================================
+  # Auto-detect Oracle user from PMON process
+  # ============================================
+  - name: Detect Oracle user from PMON process
+    ansible.builtin.shell:
+      cmd: "ps -eo user,comm | grep ora_pmon | grep -v grep | head -1 | awk '{print $1}'"
+    register: detected_oracle_user
+    changed_when: false
+    become: no
+    failed_when: false
+    when: oracle_user | default('') == ''
+
+  - name: Detect Oracle group from oracle user
+    ansible.builtin.shell:
+      cmd: "id -gn {{ detected_oracle_user.stdout | default('oracle') | trim }}"
+    register: detected_oracle_group
+    changed_when: false
+    become: no
+    failed_when: false
+
+  - name: Set detected oracle user
+    ansible.builtin.set_fact:
+      _oracle_user: "{{ oracle_user | default('') or (detected_oracle_user.stdout | default('') | trim) }}"
+      _oracle_group: "{{ oracle_group | default('') or (detected_oracle_group.stdout | default('') | trim) }}"
+
+  - name: Validate Oracle user is detected
+    ansible.builtin.fail:
+      msg: "Could not detect Oracle user. Set oracle_user variable: -e 'oracle_user=myuser'"
+    when: _oracle_user == ''
+
+  # ============================================
+  # Detect ALL database instances
+  # ============================================
+  - name: Detect all database instances from PMON
+    ansible.builtin.shell:
+      cmd: "ps -ef | grep ora_pmon | grep -v grep | awk -F'_' '{print $NF}' | sort -u"
+    register: detected_instances
+    changed_when: false
+    failed_when: false
+
+  - name: Build instance list
+    ansible.builtin.set_fact:
+      _all_instances: "{{ detected_instances.stdout_lines | default([]) | select('ne', '') | list }}"
+
+  - name: Display detected instances
+    ansible.builtin.debug:
+      msg: "Found {{ _all_instances | length }} instance(s): {{ _all_instances | join(', ') }}"
+
+  - name: Fail if no instances found
+    ansible.builtin.fail:
+      msg: "No Oracle instances detected on {{ inventory_hostname }}"
+    when: _all_instances | length == 0
+
+  # ============================================
+  # Build ORACLE_HOME map from oratab
+  # ============================================
+  - name: Read oratab entries
+    ansible.builtin.shell:
+      cmd: "grep -v '^#' /etc/oratab 2>/dev/null | grep -v '^$' | grep ':'"
+    register: oratab_entries
+    changed_when: false
+    failed_when: false
+
+  - name: Build oratab dictionary
+    ansible.builtin.set_fact:
+      _oratab_map: "{{ _oratab_map | default({}) | combine({ (item.split(':')[0]): (item.split(':')[1]) }) }}"
+    loop: "{{ oratab_entries.stdout_lines | default([]) }}"
+    when: item | length > 0 and ':' in item
+
+  - name: Display oratab map
+    ansible.builtin.debug:
+      msg: "ORATAB map: {{ _oratab_map | default({}) }}"
+
+  # ============================================
+  # Setup local report directory
+  # ============================================
+  - name: Set date folder format
+    ansible.builtin.set_fact:
+      _date_folder: "{{ ansible_date_time.date }}"
+
+  - name: Create local report directory
+    ansible.builtin.file:
+      path: "{{ local_report_path | default('reports') }}/{{ _date_folder }}/{{ inventory_hostname }}"
+      state: directory
+      mode: '0755'
+    delegate_to: localhost
+    become: no
+
+  - name: Set local report directory fact
+    ansible.builtin.set_fact:
+      _local_report_dir: "{{ local_report_path | default('reports') }}/{{ _date_folder }}/{{ inventory_hostname }}"
+
+  # ============================================
+  # Filter to specific instance if db_sid provided
+  # ============================================
+  - name: Filter to specific instance if db_sid provided
+    ansible.builtin.set_fact:
+      _all_instances: "{{ [db_sid] }}"
+    when: db_sid | default('') != ''
+
+  # ============================================
+  # Process each instance
+  # ============================================
+  - name: Process each database instance
+    ansible.builtin.include_tasks: schedule_instance.yml
+    loop: "{{ _all_instances }}"
+    loop_control:
+      loop_var: current_sid
+    when: _all_instances | length > 0
+
+  # ============================================
+  # Final Summary
+  # ============================================
+  - name: Display summary
+    ansible.builtin.debug:
+      msg: |
+        
+        ╔═══════════════════════════════════════════════════════════════════════════╗
+        ║                    BACKUP SCHEDULE COMPLETE                               ║
+        ╠═══════════════════════════════════════════════════════════════════════════╣
+        ║ Host:        {{ inventory_hostname | default('unknown') }}
+        ║ Instances:   {{ _all_instances | length }}
+        ║ Oracle User: {{ _oracle_user }}
+        ║ Reports:     {{ _local_report_dir }}/
+        ╚═══════════════════════════════════════════════════════════════════════════╝

@@ -1,0 +1,209 @@
+---
+# roles/oracle_security_check/tasks/security_check_instance.yml
+# Check Advanced Security features for a single instance
+# Called from main.yml with loop_var: current_sid
+
+  - name: "{{ current_sid }} - Get ORACLE_HOME"
+    ansible.builtin.set_fact:
+      _current_oracle_home: "{{ _oratab_map[current_sid] | default(_oratab_map.values() | first) }}"
+
+  - name: "{{ current_sid }} - Display instance info"
+    ansible.builtin.debug:
+      msg: "Checking security features: {{ current_sid }} | ORACLE_HOME: {{ _current_oracle_home }}"
+
+  # ============================================
+  # Check Database Status and Role
+  # ============================================
+  - name: "{{ current_sid }} - Check database status and role"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET HEADING OFF
+        SET FEEDBACK OFF
+        SET PAGESIZE 0
+        SELECT status || '|' || database_role || '|' || open_mode FROM v$instance, v$database;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: db_status_check
+    failed_when: false
+
+  - name: "{{ current_sid }} - Parse database status"
+    ansible.builtin.set_fact:
+      _db_status: "{{ (db_status_check.stdout | default('UNKNOWN|UNKNOWN|UNKNOWN') | trim).split('|')[0] | default('UNKNOWN') }}"
+      _db_role: "{{ (db_status_check.stdout | default('UNKNOWN|UNKNOWN|UNKNOWN') | trim).split('|')[1] | default('UNKNOWN') }}"
+      _db_open_mode: "{{ (db_status_check.stdout | default('UNKNOWN|UNKNOWN|UNKNOWN') | trim).split('|')[2] | default('UNKNOWN') }}"
+
+  - name: "{{ current_sid }} - Debug database connection failure"
+    ansible.builtin.debug:
+      msg: 
+        - "WARNING: Connection to {{ current_sid }} failed or returned empty status."
+        - "Return Code: {{ db_status_check.rc | default('N/A') }}"
+        - "Stdout: {{ db_status_check.stdout | default('N/A') }}"
+        - "Stderr: {{ db_status_check.stderr | default('N/A') }}"
+    when: db_status_check.rc | default(0) != 0 or db_status_check.stdout | trim == ""
+
+  - name: "{{ current_sid }} - Display database status"
+    ansible.builtin.debug:
+      msg: "Database {{ current_sid }}: Status={{ _db_status }}, Role={{ _db_role }}, Open Mode={{ _db_open_mode }}"
+
+  # ============================================
+  # Check Advanced Security Features (Only for OPEN databases)
+  # ============================================
+  - name: "{{ current_sid }} - Check Advanced Security Features"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 250
+        SET PAGESIZE 100
+        SET HEADING ON
+        SET FEEDBACK OFF
+        COL hostname FORMAT A30
+        COL instance_name FORMAT A15
+        COL feature_name FORMAT A35
+        COL currently_used FORMAT A15
+        COL detected_usages FORMAT 999999999
+        COL first_usage_date FORMAT A20
+        COL last_usage_date FORMAT A20
+        SELECT
+            i.host_name AS hostname,
+            i.instance_name AS instance_name,
+            fs.name AS feature_name,
+            fs.currently_used,
+            fs.detected_usages,
+            TO_CHAR(fs.first_usage_date, 'YYYY-MM-DD HH24:MI:SS') AS first_usage_date,
+            TO_CHAR(fs.last_usage_date, 'YYYY-MM-DD HH24:MI:SS') AS last_usage_date
+        FROM
+            (SELECT DISTINCT name, currently_used, detected_usages, first_usage_date, last_usage_date
+             FROM dba_feature_usage_statistics
+             WHERE UPPER(name) IN ('TRANSPARENT DATA ENCRYPTION', 'DATA REDACTION')) fs,
+            v$instance i
+        ORDER BY
+            fs.name;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: security_features_output
+    failed_when: false
+    when: _db_open_mode is search('READ') or _db_status == 'OPEN'
+
+  - name: "{{ current_sid }} - Set output for standby/mounted database"
+    ansible.builtin.set_fact:
+      security_features_output:
+        stdout: "DATABASE IS IN {{ _db_open_mode }} MODE (Role: {{ _db_role }}) - Cannot query dba_feature_usage_statistics"
+    when: _db_open_mode is not search('READ') and _db_status != 'OPEN'
+
+  - name: "{{ current_sid }} - Check TDE status"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET HEADING OFF
+        SET FEEDBACK OFF
+        SET PAGESIZE 0
+        SELECT MAX(currently_used) FROM dba_feature_usage_statistics WHERE UPPER(name) = 'TRANSPARENT DATA ENCRYPTION';
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: tde_status
+    failed_when: false
+    when: _db_open_mode is search('READ') or _db_status == 'OPEN'
+
+  - name: "{{ current_sid }} - Check Data Redaction status"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET HEADING OFF
+        SET FEEDBACK OFF
+        SET PAGESIZE 0
+        SELECT MAX(currently_used) FROM dba_feature_usage_statistics WHERE UPPER(name) = 'DATA REDACTION';
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: redaction_status
+    failed_when: false
+    when: _db_open_mode is search('READ') or _db_status == 'OPEN'
+
+  # ============================================
+  # Save Instance Report
+  # ============================================
+  - name: "{{ current_sid }} - Save security check report"
+    ansible.builtin.copy:
+      content: |
+        ================================================================================
+                    ORACLE ADVANCED SECURITY FEATURES REPORT
+        ================================================================================
+        Host:        {{ inventory_hostname }}
+        Database:    {{ current_sid }}
+        Oracle User: {{ _oracle_user }}
+        ORACLE_HOME: {{ _current_oracle_home }}
+        DB Status:   {{ _db_status }}
+        DB Role:     {{ _db_role }}
+        Open Mode:   {{ _db_open_mode }}
+        Generated:   {{ ansible_date_time.iso8601 }}
+        ================================================================================
+        
+        Features Checked:
+        - Transparent Data Encryption (TDE)
+        - Data Redaction
+        
+        ================================================================================
+        FEATURE USAGE STATUS
+        ================================================================================
+        {{ security_features_output.stdout | default('Unable to retrieve feature usage data') }}
+        
+        ================================================================================
+        LEGEND
+        ================================================================================
+        CURRENTLY_USED = TRUE  : Feature is actively in use
+        CURRENTLY_USED = FALSE : Feature is not currently in use
+        DETECTED_USAGES        : Number of times feature usage was detected
+        FIRST_USAGE_DATE       : When the feature was first used
+        LAST_USAGE_DATE        : When the feature was last used
+        
+        ================================================================================
+                                    END OF REPORT
+        ================================================================================
+      dest: "{{ _local_report_dir }}/security_check_{{ current_sid }}_{{ _report_timestamp }}.txt"
+    delegate_to: localhost
+    become: no
+
+  - name: "{{ current_sid }} - Store result for consolidated report"
+    ansible.builtin.set_fact:
+      _instance_results: >-
+        {{ _instance_results | default([]) + [{
+          'sid': current_sid,
+          'host': inventory_hostname,
+          'oracle_home': _current_oracle_home | default(''),
+          'db_role': _db_role | default('UNKNOWN'),
+          'db_status': _db_status | default('UNKNOWN'),
+          'open_mode': _db_open_mode | default('UNKNOWN'),
+          'output': (security_features_output | default({})).get('stdout', 'Unable to retrieve data'),
+          'tde_used': 'TRUE' in (((tde_status | default({})).get('stdout', '')) | upper),
+          'redaction_used': 'TRUE' in (((redaction_status | default({})).get('stdout', '')) | upper),
+          'is_standby': 'STANDBY' in ((_db_role | default('')) | upper)
+        }] }}
+
+  - name: "{{ current_sid }} - Display instance summary"
+    ansible.builtin.debug:
+      msg: |
+        
+        -------- {{ current_sid }} SECURITY CHECK --------
+        Role: {{ _db_role | default('UNKNOWN') }} | Open Mode: {{ _db_open_mode | default('UNKNOWN') }}
+        {{ (security_features_output | default({})).get('stdout', 'Unable to connect') }}
+        Report: security_check_{{ current_sid }}_{{ _report_timestamp }}.txt

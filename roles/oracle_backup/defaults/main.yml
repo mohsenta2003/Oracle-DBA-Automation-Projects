@@ -1,0 +1,12 @@
+---
+# defaults file for oracle_backup
+
+# Oracle environment - auto-detected if empty
+oracle_home: ""
+oracle_base: ""
+oracle_user: ""
+oracle_group: ""
+
+# Backup directory - auto-derived from oracle_base if empty
+backup_dir: ""
+backup_subdir: "backup/rman"

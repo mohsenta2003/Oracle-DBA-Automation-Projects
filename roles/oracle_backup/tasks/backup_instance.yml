@@ -1,0 +1,113 @@
+---
+# Backup a single instance
+# Called from main.yml with loop_var: current_sid
+
+  - name: "{{ current_sid }} - Get ORACLE_HOME"
+    ansible.builtin.set_fact:
+      _current_oracle_home: "{{ _oratab_map[current_sid] | default(_oratab_map.values() | first) }}"
+
+  - name: "{{ current_sid }} - Get ORACLE_BASE"
+    ansible.builtin.set_fact:
+      _current_oracle_base: "{{ _current_oracle_home | regex_replace('/product/.*', '') }}"
+
+  - name: "{{ current_sid }} - Display instance info"
+    ansible.builtin.debug:
+      msg: "Backing up: {{ current_sid }} | ORACLE_HOME: {{ _current_oracle_home }}"
+
+  # ============================================
+  # Create backup directory on remote
+  # ============================================
+  - name: "{{ current_sid }} - Create backup directory"
+    ansible.builtin.file:
+      path: "{{ _current_oracle_base }}/backup/{{ current_sid }}/{{ backup_timestamp }}"
+      state: directory
+      owner: "{{ _oracle_user }}"
+      mode: '0750'
+    become: yes
+
+  # ============================================
+  # RMAN Level 0 Backup
+  # ============================================
+  - name: "{{ current_sid }} - Run RMAN Level 0 backup"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export ORACLE_SID={{ current_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        
+        rman target / << 'EORMAN'
+        RUN {
+          ALLOCATE CHANNEL ch1 DEVICE TYPE DISK;
+          BACKUP AS COMPRESSED BACKUPSET 
+            INCREMENTAL LEVEL 0 
+            DATABASE 
+            FORMAT '{{ _current_oracle_base }}/backup/{{ current_sid }}/{{ backup_timestamp }}/db_%d_%T_%s_%p.bkp'
+            TAG 'LEVEL0_{{ backup_timestamp }}';
+          BACKUP CURRENT CONTROLFILE 
+            FORMAT '{{ _current_oracle_base }}/backup/{{ current_sid }}/{{ backup_timestamp }}/ctl_%d_%T_%s_%p.bkp';
+          BACKUP SPFILE 
+            FORMAT '{{ _current_oracle_base }}/backup/{{ current_sid }}/{{ backup_timestamp }}/spf_%d_%T_%s_%p.bkp';
+          RELEASE CHANNEL ch1;
+        }
+        EXIT;
+        EORMAN
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: rman_backup
+    failed_when: "'RMAN-' in rman_backup.stdout or rman_backup.rc != 0"
+    when: run_backup | default(false) | bool
+
+  - name: "{{ current_sid }} - Display backup status"
+    ansible.builtin.debug:
+      msg: |
+        
+        ========== BACKUP STATUS ({{ current_sid }}) ==========
+        {% if run_backup | default(false) | bool %}
+        ✅ RMAN backup completed
+        Location: {{ _current_oracle_base }}/backup/{{ current_sid }}/{{ backup_timestamp }}/
+        {% else %}
+        ℹ️  DRY RUN - No backup performed
+        To run actual backup, use: -e "run_backup=true"
+        {% endif %}
+        =====================================================
+
+  # ============================================
+  # Verify backup (list recent backups)
+  # ============================================
+  - name: "{{ current_sid }} - List recent backups"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export ORACLE_SID={{ current_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        
+        rman target / << 'EORMAN'
+        LIST BACKUP SUMMARY;
+        EXIT;
+        EORMAN
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: backup_list
+    failed_when: false
+
+  - name: "{{ current_sid }} - Save backup report"
+    ansible.builtin.copy:
+      content: |
+        ================================================================================
+        ORACLE BACKUP REPORT
+        ================================================================================
+        Host:        {{ inventory_hostname }}
+        Database:    {{ current_sid }}
+        Oracle User: {{ _oracle_user }}
+        ORACLE_HOME: {{ _current_oracle_home }}
+        Timestamp:   {{ backup_timestamp }}
+        Generated:   {{ ansible_date_time.iso8601 }}
+        ================================================================================
+        
+        RECENT BACKUPS:
+        {{ backup_list.stdout | default('No backup information available') }}
+        
+        ================================================================================
+      dest: "{{ _local_report_dir }}/backup_{{ current_sid }}.txt"
+    delegate_to: localhost
+    become: no

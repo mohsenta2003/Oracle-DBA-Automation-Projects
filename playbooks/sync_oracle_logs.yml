@@ -1,0 +1,56 @@
+---
+# ================================================================================
+# Oracle Log Sync Playbook - AIX Servers
+# ================================================================================
+#
+# This playbook discovers and continuously syncs Oracle logs to an NFS share:
+#   - Alert logs (ADR diagnostic dest)
+#   - Listener logs
+#   - Audit logs (adump)
+#
+# TARGET PLATFORM: AIX
+#
+# BASIC USAGE:
+#   ansible-playbook playbooks/sync_oracle_logs.yml --limit aix_servers
+#   ansible-playbook playbooks/sync_oracle_logs.yml --limit aix_prod
+#
+# SPECIFIC INSTANCE:
+#   ansible-playbook playbooks/sync_oracle_logs.yml --limit myhost -e "db_sid=ORCL1"
+#
+# OPTIONS:
+#   -e "nfs_log_path=/nfs/oracle_logs"     # NFS destination path (required)
+#   -e "sync_mode=initial"                  # Initial full sync (default)
+#   -e "sync_mode=incremental"              # Sync only new/changed files
+#   -e "setup_cron=true"                    # Setup cron for continuous sync
+#   -e "cron_interval=15"                   # Sync interval in minutes (default: 15)
+#   -e "log_retention_days=30"              # Keep logs for N days on NFS
+#   -e "compress_logs=true"                 # Compress logs older than 1 day
+#
+# NFS MOUNT:
+#   The NFS path must be pre-mounted on target hosts or specify:
+#   -e "nfs_server=nfsserver.domain.com"
+#   -e "nfs_export=/export/oracle_logs"
+#   -e "mount_nfs=true"
+#
+# AUTO-DETECTION:
+#   - Oracle user detected from PMON process owner
+#   - ORACLE_BASE/ORACLE_HOME from /etc/oratab
+#   - Alert log path from v$diag_info
+#   - Listener log paths from listener.ora and lsnrctl status
+#   - Audit dest from audit_file_dest parameter
+#
+# LOG STRUCTURE ON NFS:
+#   <nfs_log_path>/<hostname>/<SID>/alert/
+#   <nfs_log_path>/<hostname>/<SID>/audit/
+#   <nfs_log_path>/<hostname>/listener/<listener_name>/
+#
+# REPORTS:
+#   Saved to: reports/YYYY-MM-DD/hostname/log_sync_<SID>.txt
+# ================================================================================
+
+- name: Sync Oracle Logs to NFS (AIX)
+  hosts: all
+  become: no
+  gather_facts: no
+  roles:
+    - oracle_log_sync

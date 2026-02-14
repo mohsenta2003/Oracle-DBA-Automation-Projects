@@ -1,0 +1,164 @@
+---
+# Analyze tablespaces for a single instance
+# Called from main.yml with loop_var: current_sid
+
+  - name: "{{ current_sid }} - Get ORACLE_HOME"
+    ansible.builtin.set_fact:
+      _current_oracle_home: "{{ _oratab_map[current_sid] | default(_oratab_map.values() | first) }}"
+
+  - name: "{{ current_sid }} - Display instance info"
+    ansible.builtin.debug:
+      msg: "Analyzing tablespaces for: {{ current_sid }} | ORACLE_HOME: {{ _current_oracle_home }}"
+
+  # ============================================
+  # Tablespace monitoring (GB/TB format)
+  # ============================================
+  - name: "{{ current_sid }} - Monitor tablespace usage (GB/TB)"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 300
+        SET PAGESIZE 200
+        SET HEADING ON
+        SET FEEDBACK OFF
+        COL tablespace_name FORMAT A30
+        COL used_size FORMAT A12
+        COL max_size FORMAT A12
+        COL free_size FORMAT A12
+        COL pct_used FORMAT 999.99
+        SELECT 
+          tablespace_name,
+          CASE 
+            WHEN SUM(bytes)/1024/1024/1024/1024 >= 1 THEN TO_CHAR(ROUND(SUM(bytes)/1024/1024/1024/1024,2)) || ' TB'
+            ELSE TO_CHAR(ROUND(SUM(bytes)/1024/1024/1024,2)) || ' GB'
+          END AS used_size,
+          CASE 
+            WHEN SUM(maxbytes)/1024/1024/1024/1024 >= 1 THEN TO_CHAR(ROUND(SUM(maxbytes)/1024/1024/1024/1024,2)) || ' TB'
+            ELSE TO_CHAR(ROUND(SUM(maxbytes)/1024/1024/1024,2)) || ' GB'
+          END AS max_size,
+          CASE 
+            WHEN (SUM(maxbytes)-SUM(bytes))/1024/1024/1024/1024 >= 1 THEN TO_CHAR(ROUND((SUM(maxbytes)-SUM(bytes))/1024/1024/1024/1024,2)) || ' TB'
+            ELSE TO_CHAR(ROUND((SUM(maxbytes)-SUM(bytes))/1024/1024/1024,2)) || ' GB'
+          END AS free_size,
+          ROUND(SUM(bytes)/SUM(maxbytes)*100,2) AS pct_used
+        FROM dba_data_files 
+        WHERE maxbytes > 0 
+        GROUP BY tablespace_name
+        ORDER BY pct_used DESC;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: ts_usage
+    failed_when: false
+
+  - name: "{{ current_sid }} - Display tablespace usage"
+    ansible.builtin.debug:
+      msg: |
+        
+        ========== TABLESPACE USAGE ({{ current_sid }}) ==========
+        {{ ts_usage.stdout }}
+        =====================================================
+
+  # ============================================
+  # Tablespace detail report (CSV for local save)
+  # ============================================
+  - name: "{{ current_sid }} - Get tablespace detail for report"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 500
+        SET PAGESIZE 0
+        SET HEADING OFF
+        SET FEEDBACK OFF
+        SET TRIMSPOOL ON
+        SELECT 
+          tablespace_name || ',' ||
+          ROUND(SUM(bytes)/1024/1024/1024,2) || ',' ||
+          ROUND(SUM(maxbytes)/1024/1024/1024,2) || ',' ||
+          ROUND((SUM(maxbytes)-SUM(bytes))/1024/1024/1024,2) || ',' ||
+          ROUND(SUM(bytes)/SUM(maxbytes)*100,2)
+        FROM dba_data_files 
+        WHERE maxbytes > 0 
+        GROUP BY tablespace_name
+        ORDER BY ROUND(SUM(bytes)/SUM(maxbytes)*100,2) DESC;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: ts_detail
+    failed_when: false
+
+  # ============================================
+  # Save tablespace report locally
+  # ============================================
+  - name: "{{ current_sid }} - Save tablespace report locally"
+    ansible.builtin.copy:
+      content: |
+        ================================================================================
+        ORACLE TABLESPACE USAGE REPORT
+        ================================================================================
+        Host:        {{ inventory_hostname }}
+        Database:    {{ current_sid }}
+        Oracle User: {{ _oracle_user }}
+        ORACLE_HOME: {{ _current_oracle_home }}
+        Generated:   {{ ansible_date_time.iso8601 }}
+        ================================================================================
+        
+        TABLESPACE_NAME,USED_GB,MAX_GB,FREE_GB,PCT_USED
+        {{ ts_detail.stdout | trim }}
+      dest: "{{ _local_report_dir }}/tablespace_{{ current_sid }}.csv"
+    delegate_to: localhost
+    become: no
+
+  # ============================================
+  # Check for critical tablespaces (>85% used)
+  # ============================================
+  - name: "{{ current_sid }} - Check for critical tablespaces"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 200
+        SET PAGESIZE 100
+        SET HEADING ON
+        SET FEEDBACK OFF
+        COL tablespace_name FORMAT A30
+        COL pct_used FORMAT 999.99
+        COL status FORMAT A10
+        SELECT 
+          tablespace_name,
+          ROUND(SUM(bytes)/SUM(maxbytes)*100,2) AS pct_used,
+          CASE 
+            WHEN ROUND(SUM(bytes)/SUM(maxbytes)*100,2) >= 95 THEN 'CRITICAL'
+            WHEN ROUND(SUM(bytes)/SUM(maxbytes)*100,2) >= 90 THEN 'WARNING'
+            ELSE 'ATTENTION'
+          END AS status
+        FROM dba_data_files 
+        WHERE maxbytes > 0 
+        GROUP BY tablespace_name
+        HAVING ROUND(SUM(bytes)/SUM(maxbytes)*100,2) >= 85
+        ORDER BY pct_used DESC;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: ts_critical
+    failed_when: false
+
+  - name: "{{ current_sid }} - Display critical tablespaces"
+    ansible.builtin.debug:
+      msg: |
+        
+        ⚠️  ========== {{ current_sid }}: TABLESPACES >= 85% ==========
+        {{ ts_critical.stdout | default('None - all tablespaces OK') }}
+        ==============================================================
+    when: ts_critical.stdout | default('') | trim != '' and 'no rows selected' not in ts_critical.stdout | lower

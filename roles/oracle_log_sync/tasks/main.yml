@@ -1,0 +1,274 @@
+---
+# tasks file for oracle_log_sync
+#
+# Discovers and syncs Oracle alert, listener, and audit logs to NFS
+# Target Platform: AIX
+#
+
+  # ============================================
+  # Validate required variables
+  # ============================================
+  - name: Validate NFS path is provided
+    ansible.builtin.fail:
+      msg: |
+        NFS destination path is required!
+        Usage: ansible-playbook playbooks/sync_oracle_logs.yml --limit <host> -e "nfs_log_path=/nfs/oracle_logs"
+    when: nfs_log_path | default('') == ''
+
+  # ============================================
+  # Gather minimal facts (AIX compatible)
+  # ============================================
+  - name: Gather minimal facts
+    ansible.builtin.setup:
+      gather_subset:
+        - '!all'
+        - '!min'
+        - date_time
+    # become removed: already running as oracle
+
+  - name: Set report timestamp
+    ansible.builtin.set_fact:
+      report_timestamp: "{{ ansible_date_time.date }}"
+
+  # ============================================
+  # Check AIX platform
+  # ============================================
+  - name: Get OS type
+    ansible.builtin.shell:
+      cmd: "uname -s"
+    register: os_type
+    changed_when: false
+
+  - name: Display OS type
+    ansible.builtin.debug:
+      msg: "Operating System: {{ os_type.stdout }}"
+
+  # ============================================
+  # Check disk space (df -h on AIX)
+  # ============================================
+  - name: Check disk space on NFS path
+    ansible.builtin.shell:
+      cmd: "df -g {{ nfs_log_path }} 2>/dev/null || echo 'PATH_NOT_MOUNTED'"
+    register: nfs_disk_check
+    changed_when: false
+    failed_when: false
+
+  - name: Display NFS disk status
+    ansible.builtin.debug:
+      msg: "{{ nfs_disk_check.stdout_lines }}"
+
+  # ============================================
+  # Optional: Mount NFS if requested
+  # ============================================
+  - name: Mount NFS share (if requested)
+    ansible.builtin.shell:
+      cmd: |
+        if ! mount | grep -q "{{ nfs_log_path }}"; then
+          mkdir -p {{ nfs_log_path }}
+          mount -o {{ nfs_mount_options }} {{ nfs_server }}:{{ nfs_export }} {{ nfs_log_path }}
+          echo "NFS_MOUNTED"
+        else
+          echo "ALREADY_MOUNTED"
+        fi
+    register: nfs_mount_result
+    when: 
+      - mount_nfs | bool
+      - nfs_server | default('') != ''
+      - nfs_export | default('') != ''
+    # become removed: already running as oracle
+
+  # ============================================
+  # Auto-detect Oracle user from PMON process
+  # ============================================
+  - name: Detect Oracle user from PMON process (AIX)
+    ansible.builtin.shell:
+      cmd: "ps -eo user,args | grep ora_pmon | grep -v grep | head -1 | awk '{print $1}'"
+    register: detected_oracle_user
+    changed_when: false
+    failed_when: false
+    when: oracle_user | default('') == ''
+
+  - name: Set detected oracle user
+    ansible.builtin.set_fact:
+      _oracle_user: "{{ oracle_user | default('') or (detected_oracle_user.stdout | default('') | trim) }}"
+
+  - name: Validate Oracle user is detected
+    ansible.builtin.fail:
+      msg: "Could not detect Oracle user. Set oracle_user variable: -e 'oracle_user=myuser'"
+    when: _oracle_user == ''
+
+  - name: Display detected Oracle user
+    ansible.builtin.debug:
+      msg: "Detected Oracle owner: {{ _oracle_user }}"
+
+  # ============================================
+  # Detect ALL instances from PMON processes
+  # ============================================
+  - name: Detect all database instances from PMON (AIX)
+    ansible.builtin.shell:
+      cmd: |
+        ps -ef | grep 'ora_pmon_' | grep -v grep | while read line; do
+          echo "$line" | sed 's/.*ora_pmon_//'
+        done | sort -u
+    register: detected_instances
+    changed_when: false
+    failed_when: false
+
+  - name: Set instances list
+    ansible.builtin.set_fact:
+      _all_instances: "{{ db_sid | default('') | ternary([db_sid], detected_instances.stdout_lines | default([])) }}"
+
+  - name: Display detected instances
+    ansible.builtin.debug:
+      msg: "Found {{ _all_instances | length }} instance(s): {{ _all_instances | join(', ') }}"
+    when: _all_instances | length > 0
+
+  # ============================================
+  # Get ORACLE_HOME mapping from oratab
+  # ============================================
+  - name: Get oratab contents
+    ansible.builtin.shell:
+      cmd: "cat /etc/oratab 2>/dev/null | grep -v '^#' | grep -v '^$' | grep ':' || echo ''"
+    register: oratab_contents
+    changed_when: false
+
+  - name: Build ORACLE_HOME map from oratab
+    ansible.builtin.set_fact:
+      oracle_home_map: "{{ oracle_home_map | default({}) | combine({item.split(':')[0]: item.split(':')[1]}) }}"
+    loop: "{{ oratab_contents.stdout_lines }}"
+    when: 
+      - (item | trim) != ''
+      - (':' in item)
+
+  - name: Display ORACLE_HOME mapping
+    ansible.builtin.debug:
+      msg: "ORACLE_HOME map: {{ oracle_home_map | default({}) }}"
+
+  # ============================================
+  # Get ADR Base (diagnostic_dest) from database
+  # This is the root for all diagnostic logs including listener logs
+  # Example: /u01/mod/backup
+  # Listener logs: <adr_base>/diag/tnslsnr/<hostname>/<listener_name>/trace/
+  # ============================================
+  - name: Get ADR Base (diagnostic_dest) from any running instance
+    ansible.builtin.shell:
+      cmd: |
+        # Get the first running instance to query diagnostic_dest
+        FIRST_SID=$(ps -ef | grep 'ora_pmon_' | grep -v grep | head -1 | sed 's/.*ora_pmon_//')
+        if [ -n "$FIRST_SID" ]; then
+          # Get ORACLE_HOME for this SID from oratab
+          ORACLE_HOME=$(grep "^${FIRST_SID}:" /etc/oratab 2>/dev/null | cut -d':' -f2)
+          if [ -n "$ORACLE_HOME" ]; then
+            export ORACLE_HOME
+            export ORACLE_SID=$FIRST_SID
+            export PATH=$ORACLE_HOME/bin:$PATH
+            $ORACLE_HOME/bin/sqlplus -s / as sysdba <<EOF
+SET HEADING OFF
+SET FEEDBACK OFF
+SELECT value FROM v$parameter WHERE name = 'diagnostic_dest';
+EXIT;
+EOF
+          fi
+        fi
+    register: adr_base_result
+    changed_when: false
+    failed_when: false
+    # become removed: already running as oracle
+
+  - name: Set ADR Base fact
+    ansible.builtin.set_fact:
+      _adr_base: "{{ adr_base_result.stdout | trim }}"
+    when: adr_base_result.stdout | trim != ''
+
+  - name: Display ADR Base (diagnostic_dest)
+    ansible.builtin.debug:
+      msg: "ADR Base (diagnostic_dest): {{ _adr_base | default('NOT DETECTED - will use fallback discovery') }}"
+
+  # ============================================
+  # Detect Listeners
+  # ============================================
+  # Listener names include port: mrptprs.1611, mafp1wp.1651, hzmo.1681
+  # Grid infrastructure listeners (LISTENER, MGMTLSNR) are excluded
+  # Only listeners owned by the Oracle user are included
+  - name: Detect running listeners (AIX)
+    ansible.builtin.shell:
+      cmd: |
+        ps -ef | grep tnslsnr | grep -v grep | grep -v MGMTLSNR | while read line; do
+          # Get the owner of this process
+          owner=$(echo "$line" | awk '{print $1}')
+          # Only process listeners owned by oracle user (not grid)
+          if [ "$owner" = "{{ _oracle_user }}" ]; then
+            # Extract the full listener name (e.g., mrptprs.1611, mafp1wp.1651)
+            lsnr_name=$(echo "$line" | sed 's/.*tnslsnr //' | awk '{print $1}')
+            # Skip generic LISTENER name (usually grid infrastructure)
+            if [ "$lsnr_name" != "LISTENER" ]; then
+              echo "$lsnr_name"
+            fi
+          fi
+        done | sort -u
+    register: detected_listeners
+    changed_when: false
+    failed_when: false
+
+  - name: Set listeners list
+    ansible.builtin.set_fact:
+      _all_listeners: "{{ detected_listeners.stdout_lines | default([]) }}"
+
+  - name: Display detected listeners
+    ansible.builtin.debug:
+      msg: "Found {{ _all_listeners | length }} listener(s): {{ _all_listeners | join(', ') }}"
+
+  # ============================================
+  # Create log directory (NFS or local)
+  # ============================================
+  - name: Create log directory (NFS or local)
+    ansible.builtin.file:
+      path: "{{ nfs_log_path }}/{{ inventory_hostname }}"
+      state: directory
+      mode: '0755'
+    # become removed: already running as oracle
+
+  # ============================================
+  # Process each instance
+  # ============================================
+  - name: Process each Oracle instance
+    ansible.builtin.include_tasks: sync_instance_logs.yml
+    loop: "{{ _all_instances }}"
+    loop_control:
+      loop_var: current_sid
+    when: _all_instances | length > 0
+
+  # ============================================
+  # Process each listener
+  # ============================================
+  - name: Process each listener
+    ansible.builtin.include_tasks: sync_listener_logs.yml
+    loop: "{{ _all_listeners }}"
+    loop_control:
+      loop_var: current_listener
+    when: 
+      - sync_listener_logs | bool
+      - _all_listeners | length > 0
+
+  # ============================================
+  # Setup cron job for continuous sync
+  # ============================================
+  - name: Setup cron job for continuous sync
+    ansible.builtin.include_tasks: setup_cron.yml
+    when: setup_cron | bool
+
+  # ============================================
+  # Fetch logs to control server if not using NFS
+  # ============================================
+  - name: Fetch logs to control server if not using NFS
+    ansible.builtin.fetch:
+      src: "{{ nfs_log_path }}/{{ inventory_hostname }}/"
+      dest: "./collected_logs/{{ inventory_hostname }}/"
+      flat: no
+    when: not use_nfs | default(true) | bool == false
+
+  # ============================================
+  # Generate summary report
+  # ============================================
+  - name: Generate sync summary report
+    ansible.builtin.include_tasks: generate_report.yml

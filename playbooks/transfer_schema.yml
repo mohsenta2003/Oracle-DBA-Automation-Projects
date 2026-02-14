@@ -1,0 +1,46 @@
+---
+# ================================================================================
+# Oracle Schema Transfer Playbook - MULTI-INSTANCE SUPPORT
+# ================================================================================
+#
+# This playbook generates Data Pump export/import commands for schema transfer.
+# Automatically detects ALL database instances and checks if schema exists.
+#
+# BASIC USAGE (generates report with commands):
+#   ansible-playbook playbooks/transfer_schema.yml --limit crlnxd2201 \
+#     -e "schema_name=APP_USER"
+#
+# SPECIFIC INSTANCE:
+#   ansible-playbook playbooks/transfer_schema.yml --limit crlnxd2201 \
+#     -e "schema_name=APP_USER" -e "db_sid=ORCL1"
+#
+# TRANSFER OPTIONS:
+#   -e "schema_name=MYSCHEMA"       # REQUIRED: Schema to transfer
+#   -e "action=export"              # export, import, or both (default: export)
+#   -e "target_db=TARGET_SID"       # Target database SID
+#   -e "target_host=targethost"     # Target server hostname
+#   -e "directory_name=DATA_PUMP_DIR" # Data Pump directory
+#   -e "parallel=4"                 # Parallelism for expdp/impdp
+#   -e "execute_transfer=true"      # Actually run (default is dry-run report)
+#
+# REPORT CONTENTS:
+#   - Schema existence check
+#   - Schema size and object counts
+#   - Generated expdp/impdp commands
+#   - Step-by-step transfer instructions
+#
+# AUTO-DETECTION:
+#   - Oracle user detected from PMON process owner
+#   - ORACLE_HOME resolved from /etc/oratab for each instance
+#   - Data Pump directory location
+#
+# REPORTS:
+#   Saved to: reports/YYYY-MM-DD/hostname/transfer_<schema>_<SID>.txt
+# ================================================================================
+
+- name: Transfer Oracle Schema
+  hosts: all
+  become: no
+  gather_facts: no
+  roles:
+    - oracle_transfer_schema
