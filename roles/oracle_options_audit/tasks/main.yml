@@ -1,0 +1,1415 @@
+---
+# roles/oracle_options_audit/tasks/main.yml
+#
+# Collects v$option + dba_feature_usage_statistics from every running instance
+# on every host and INSERTs the results into the central repository on dbai.
+#
+# Tables populated:
+#   {{ repo_schema | upper }}.ORACLE_OPT_RUNS
+#   {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES
+#   {{ repo_schema | upper }}.ORACLE_OPT_VOPTION
+#   {{ repo_schema | upper }}.ORACLE_OPT_FEATURES
+#
+# Does NOT touch roles/oracle_partitioning in any way.
+#
+
+  # ============================================
+  # Build repository connection string
+  # ============================================
+  - name: Set repository connection string
+    ansible.builtin.set_fact:
+      _repo_conn_string: "{{ repo_tns_alias if (repo_tns_alias | default('')) else '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=' ~ repo_host ~ ')(PORT=' ~ repo_port ~ '))(CONNECT_DATA=(SID=' ~ repo_sid ~ ')))' }}"
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  - name: Test repository database connection
+    ansible.builtin.shell:
+      cmd: |
+        sqlplus -s /nolog << 'EOSQL'
+        CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+        SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+        SELECT 'REPO_CONNECTION_OK' FROM DUAL;
+        EXIT;
+        EOSQL
+    register: _repo_test
+    delegate_to: localhost
+    become: no
+    run_once: true
+    changed_when: false
+    failed_when: "'REPO_CONNECTION_OK' not in _repo_test.stdout"
+
+  - name: Display repository connection status
+    ansible.builtin.debug:
+      msg: "✓ Repository connection SUCCESSFUL: {{ repo_user }}@{{ repo_tns_alias if (repo_tns_alias | default('')) else (repo_host ~ ':' ~ repo_port ~ '/' ~ repo_sid) }}"
+    run_once: true
+
+  # ============================================
+  # Gather facts needed for OS/region detection
+  # ============================================
+  - name: Gather facts (OS, timezone, CPU)
+    ansible.builtin.setup:
+      gather_subset:
+        - '!all'
+        - date_time
+        - hardware
+        - distribution
+    become: no
+
+  - name: Set run timestamp
+    ansible.builtin.set_fact:
+      _audit_timestamp: "{{ ansible_date_time.date }}_{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}{{ ansible_date_time.second }}"
+      _audit_date:      "{{ ansible_date_time.date }}"
+    run_once: true
+
+  - name: Ensure role log directory exists on controller
+    ansible.builtin.file:
+      path: "{{ log_dir }}"
+      state: directory
+      mode: '0755'
+    delegate_to: localhost
+    become: no
+    run_once: true
+
+  # ============================================
+  # Auto-detect Oracle user from PMON process
+  # ============================================
+  - name: Detect Oracle user from PMON process
+    ansible.builtin.shell:
+      cmd: "ps -ef | awk '/ora_pmon_/ && !/awk/ && !/grep/ {print $1; exit}'"
+    register: _detected_oracle_user
+    changed_when: false
+    become: no
+    failed_when: false
+    when: oracle_user | default('') == ''
+
+  - name: Set Oracle user
+    ansible.builtin.set_fact:
+      _oracle_user: "{{ oracle_user | default('') or (_detected_oracle_user.stdout | default('') | trim) }}"
+
+  - name: Set skip flag if no Oracle detected
+    ansible.builtin.set_fact:
+      _skip_host:   "{{ _oracle_user == '' }}"
+      _skip_reason: "{{ 'No Oracle ora_pmon processes found' if _oracle_user == '' else '' }}"
+
+  - name: Skip message
+    ansible.builtin.debug:
+      msg: "SKIPPING {{ inventory_hostname }}: {{ _skip_reason }}"
+    when: _skip_host | bool
+
+  # ============================================
+  # Detect all running SIDs from PMON
+  # ============================================
+  - name: Detect all SIDs from PMON
+    ansible.builtin.shell:
+      cmd: "ps -ef | awk '/ora_pmon_/ && !/asm_pmon_/ && !/awk/ && !/grep/ {sub(/.*ora_pmon_/, \"\", $NF); print $NF}' | sort -u"
+    register: _pmon_instances
+    changed_when: false
+    failed_when: false
+    become: no
+    when: not (_skip_host | bool)
+
+  - name: Set instances list
+    ansible.builtin.set_fact:
+      _all_instances: >-
+        {{ [db_sid] if (db_sid | default('')) else
+           (_pmon_instances.stdout_lines | default([])
+            | select('match', '^[A-Za-z0-9_]+$') | list) }}
+    when: not (_skip_host | bool)
+
+  - name: Set empty instances list for skipped hosts
+    ansible.builtin.set_fact:
+      _all_instances: []
+    when: _skip_host | bool
+
+  - name: Update skip flag if no instances found
+    ansible.builtin.set_fact:
+      _skip_host:   true
+      _skip_reason: "No Oracle instances detected on this host"
+    when: not (_skip_host | bool) and (_all_instances | length == 0)
+
+  - name: Display detected instances
+    ansible.builtin.debug:
+      msg: "Found {{ _all_instances | length }} instance(s): {{ _all_instances | join(', ') }}"
+    when: not (_skip_host | bool) and (_all_instances | length > 0)
+
+  # ============================================
+  # Read oratab â€” SID -> ORACLE_HOME mapping
+  # ============================================
+  - name: Read oratab
+    ansible.builtin.shell:
+      cmd: "cat /etc/oratab | grep -v '^#' | grep -v '^$' | grep ':'"
+    register: _oratab_contents
+    changed_when: false
+    failed_when: false
+    become: no
+    when: not (_skip_host | bool)
+
+  - name: Parse oratab into SID->HOME dict
+    ansible.builtin.set_fact:
+      _oratab_map: "{{ _oratab_map | default({}) | combine({item.split(':')[0]: item.split(':')[1]}) }}"
+    loop: "{{ _oratab_contents.stdout_lines | default([]) }}"
+    when: not (_skip_host | bool) and (item | regex_search('^[^:]+:[^:]+'))
+
+  # ============================================
+  # Derive OS metadata (region from timezone)
+  # ============================================
+  - name: Detect IANA timezone from OS
+    ansible.builtin.shell:
+      cmd: >-
+        timedatectl show --property=Timezone --value 2>/dev/null ||
+        readlink /etc/localtime 2>/dev/null | sed 's|.*zoneinfo/||' ||
+        cat /etc/timezone 2>/dev/null ||
+        echo ""
+    register: _detected_tz
+    changed_when: false
+    failed_when: false
+    become: no
+    when: not (_skip_host | bool)
+
+  - name: Derive host region from timezone
+    ansible.builtin.set_fact:
+      _host_os_type: >-
+        {{ 'AIX' if ansible_system == 'AIX' else 'Linux' }}
+      _host_os_version: >-
+        {{ ansible_distribution | default('Unknown') }} {{ ansible_distribution_version | default('') }}
+      _host_os_kernel: >-
+        {{ ansible_kernel | default('') }}
+      _host_cpu_count: >-
+        {{ ansible_processor_vcpus | default(ansible_processor_count | default(0)) }}
+      _host_timezone: >-
+        {{ (_detected_tz.stdout | default('') | trim) or (ansible_date_time.tz | default('')) }}
+      _host_region: >-
+        {%- set tz = (_detected_tz.stdout | default('') | trim) or (ansible_date_time.tz | default('')) -%}
+        {%- if 'Europe' in tz or 'London' in tz or 'Berlin' in tz or 'Prague' in tz or 'Paris' in tz or 'Amsterdam' in tz or 'CET' in tz or 'CEST' in tz or 'BST' in tz or 'GMT' in tz -%}EMEA
+        {%- elif 'America' in tz or 'CDT' in tz or 'CST' in tz or 'EDT' in tz or 'EST' in tz or 'MDT' in tz or 'MST' in tz or 'PDT' in tz or 'PST' in tz or 'CT' == tz or 'ET' == tz or 'MT' == tz or 'PT' == tz -%}USA
+        {%- elif 'Asia' in tz or 'Pacific' in tz or 'Australia' in tz or 'Tokyo' in tz or 'Singapore' in tz or 'Sydney' in tz or 'JST' in tz or 'SGT' in tz or 'AEST' in tz or 'AEDT' in tz -%}APAC
+        {%- else -%}UNKNOWN{%- endif -%}
+    when: not (_skip_host | bool)
+
+  # ============================================
+  # Initialize per-host instance results list
+  # ============================================
+  - name: Initialize instance results list
+    ansible.builtin.set_fact:
+      _audit_instance_results: []
+
+  # ============================================
+  # Check each instance
+  # ============================================
+  - name: Audit options for each instance
+    ansible.builtin.include_tasks: check_instance.yml
+    loop: "{{ _all_instances }}"
+    loop_control:
+      loop_var: current_sid
+    when: not (_skip_host | bool) and (_all_instances | length > 0)
+
+  # ============================================
+  # INSERT run header + all results into dbai
+  # (run_once â€” executed on the Ansible controller)
+  # ============================================
+  - name: Count totals for run header
+    ansible.builtin.set_fact:
+      _total_hosts:     "{{ ansible_play_hosts | length }}"
+      _total_instances: >-
+        {{ ansible_play_hosts
+           | map('extract', hostvars, '_audit_instance_results')
+           | select('defined')
+           | map('length')
+           | map('int')
+           | sum }}
+    run_once: true
+
+  - name: INSERT run header into ORACLE_OPT_RUNS and save RUN_ID
+    ansible.builtin.shell:
+      cmd: |
+        sqlplus -s /nolog << 'EOSQL'
+        CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+        SET HEADING OFF
+        SET FEEDBACK OFF
+        SET PAGESIZE 0
+        INSERT INTO {{ repo_schema | upper }}.ORACLE_OPT_RUNS
+            (RUN_DATE, DATA_AS_OF, RUN_LABEL, TRIGGERED_BY, CONTROLLER_HOST, PLAYBOOK,
+             TOTAL_HOSTS, TOTAL_INSTANCES)
+        VALUES
+            (SYSDATE, SYSDATE,
+             '{{ run_label | replace("'", "''") }}',
+             '{{ lookup("pipe","whoami") }}',
+             '{{ lookup("pipe","hostname") }}',
+             'collect_oracle_options.yml',
+             {{ _total_hosts }},
+             {{ _total_instances }});
+        SELECT TO_CHAR(MAX(RUN_ID)) FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS;
+        COMMIT;
+        EXIT;
+        EOSQL
+    register: _run_insert
+    delegate_to: localhost
+    become: no
+    run_once: true
+    changed_when: true
+
+  - name: DEBUG - Show raw INSERT output
+    ansible.builtin.debug:
+      msg:
+        - "=== RAW SQLPLUS OUTPUT ==="
+        - "stdout: {{ _run_insert.stdout }}"
+        - "stdout_lines: {{ _run_insert.stdout_lines }}"
+        - "stderr: {{ _run_insert.stderr }}"
+        - "rc: {{ _run_insert.rc }}"
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  - name: Parse RUN_ID from insert output
+    ansible.builtin.set_fact:
+      _audit_run_id: "{{ _run_insert.stdout_lines | select('match', '^[0-9]+$') | list | last | default('0') | trim }}"
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  - name: DEBUG - Show parsed RUN_ID
+    ansible.builtin.debug:
+      msg:
+        - "=== RUN_ID PARSING ==="
+        - "Regex matches: {{ _run_insert.stdout_lines | select('match', '^[0-9]+$') | list }}"
+        - "Parsed RUN_ID: {{ _audit_run_id }}"
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  - name: Display run ID
+    ansible.builtin.debug:
+      msg: "Audit RUN_ID={{ _audit_run_id }} â€” inserting results for {{ _total_instances }} instance(s) across {{ _total_hosts }} host(s)"
+    run_once: true
+
+  # ============================================
+  # INSERT per-instance data from every host
+  # ============================================
+  - name: Ensure IS_EE_EXTRA column exists in ORACLE_OPT_VOPTION
+    ansible.builtin.shell:
+      cmd: |
+        sqlplus -s /nolog << 'EOSQL'
+        CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+        SET HEADING OFF
+        SET FEEDBACK OFF
+        SET PAGESIZE 0
+        BEGIN
+          BEGIN
+            EXECUTE IMMEDIATE 'ALTER TABLE {{ repo_schema | upper }}.ORACLE_OPT_VOPTION ADD (IS_EE_EXTRA VARCHAR2(1) DEFAULT ''N'' NOT NULL)';
+          EXCEPTION
+            WHEN OTHERS THEN
+              IF SQLCODE = -1430 THEN NULL; ELSE RAISE; END IF;
+          END;
+          BEGIN
+            EXECUTE IMMEDIATE 'ALTER TABLE {{ repo_schema | upper }}.ORACLE_OPT_VOPTION ADD (IS_INUSE VARCHAR2(1) DEFAULT ''N'' NOT NULL)';
+          EXCEPTION
+            WHEN OTHERS THEN
+              IF SQLCODE = -1430 THEN NULL; ELSE RAISE; END IF;
+          END;
+        END;
+        /
+        EXIT;
+        EOSQL
+    delegate_to: localhost
+    become: no
+    run_once: true
+    changed_when: false
+
+  - name: Create detail tables if they do not exist
+    ansible.builtin.shell:
+      cmd: |
+        sqlplus -s /nolog << 'EOSQL'
+        CONNECT {{ repo_user }}/"{{ repo_password }}"@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={{ repo_host }})(PORT={{ repo_port }}))(CONNECT_DATA=(SID={{ repo_sid }})))
+        SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+        BEGIN
+          -- â”€â”€ ORACLE_OPT_D_PART (Partitioning evidence) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+          BEGIN
+            EXECUTE IMMEDIATE '
+              CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_PART (
+                DETAIL_ID      NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                RUN_ID         NUMBER        NOT NULL,
+                INST_ID        NUMBER,
+                HOSTNAME       VARCHAR2(256) NOT NULL,
+                SID            VARCHAR2(64)  NOT NULL,
+                OWNER          VARCHAR2(128) NOT NULL,
+                TABLE_NAME     VARCHAR2(128) NOT NULL,
+                PART_TYPE      VARCHAR2(32),
+                SUBPART_TYPE   VARCHAR2(32),
+                PART_COUNT     NUMBER,
+                PART_KEY       VARCHAR2(256),
+                SIZE_GB        NUMBER,
+                LAST_UPDATED   DATE DEFAULT SYSDATE
+              )';
+          EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+          END;
+          -- â”€â”€ ORACLE_OPT_D_COMPRESS (Compression evidence) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+          BEGIN
+            EXECUTE IMMEDIATE '
+              CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_COMPRESS (
+                DETAIL_ID      NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                RUN_ID         NUMBER        NOT NULL,
+                INST_ID        NUMBER,
+                HOSTNAME       VARCHAR2(256) NOT NULL,
+                SID            VARCHAR2(64)  NOT NULL,
+                OWNER          VARCHAR2(128),
+                OBJECT_NAME    VARCHAR2(256) NOT NULL,
+                OBJECT_TYPE    VARCHAR2(32),
+                COMPRESSION    VARCHAR2(32),
+                COMPRESS_FOR   VARCHAR2(64),
+                SIZE_GB        NUMBER,
+                LAST_UPDATED   DATE DEFAULT SYSDATE
+              )';
+          EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+          END;
+          -- â”€â”€ ORACLE_OPT_D_SECURITY (TDE / Advanced Security evidence) â”€â”€â”€â”€â”€â”€â”€
+          BEGIN
+            EXECUTE IMMEDIATE '
+              CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_SECURITY (
+                DETAIL_ID      NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                RUN_ID         NUMBER        NOT NULL,
+                INST_ID        NUMBER,
+                HOSTNAME       VARCHAR2(256) NOT NULL,
+                SID            VARCHAR2(64)  NOT NULL,
+                OBJECT_TYPE    VARCHAR2(32),
+                OWNER_OR_TS    VARCHAR2(128),
+                OBJECT_NAME    VARCHAR2(256),
+                ENCRYPTED      VARCHAR2(8),
+                ALGORITHM      VARCHAR2(64),
+                SIZE_GB        NUMBER,
+                LAST_UPDATED   DATE DEFAULT SYSDATE
+              )';
+          EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+          END;
+          -- â”€â”€ ORACLE_OPT_D_INMEM (In-Memory Column Store evidence) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+          BEGIN
+            EXECUTE IMMEDIATE '
+              CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_INMEM (
+                DETAIL_ID      NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                RUN_ID         NUMBER        NOT NULL,
+                INST_ID        NUMBER,
+                HOSTNAME       VARCHAR2(256) NOT NULL,
+                SID            VARCHAR2(64)  NOT NULL,
+                OWNER          VARCHAR2(128),
+                TABLE_NAME     VARCHAR2(128),
+                INMEMORY       VARCHAR2(16),
+                PRIORITY       VARCHAR2(32),
+                COMPRESSION    VARCHAR2(64),
+                SIZE_GB        NUMBER,
+                LAST_UPDATED   DATE DEFAULT SYSDATE
+              )';
+          EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+          END;
+          -- â”€â”€ ORACLE_OPT_D_PDB (Multitenant / PDB evidence) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+          BEGIN
+            EXECUTE IMMEDIATE '
+              CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_PDB (
+                DETAIL_ID      NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                RUN_ID         NUMBER        NOT NULL,
+                INST_ID        NUMBER,
+                HOSTNAME       VARCHAR2(256) NOT NULL,
+                SID            VARCHAR2(64)  NOT NULL,
+                CON_ID         NUMBER,
+                PDB_NAME       VARCHAR2(128),
+                OPEN_MODE      VARCHAR2(32),
+                RESTRICTED     VARCHAR2(8),
+                CREATION_DATE  DATE,
+                LAST_UPDATED   DATE DEFAULT SYSDATE
+              )';
+          EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+          END;
+          -- â”€â”€ ORACLE_OPT_D_ADG (Active Data Guard evidence) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+          BEGIN
+            EXECUTE IMMEDIATE '
+              CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_ADG (
+                DETAIL_ID      NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                RUN_ID         NUMBER        NOT NULL,
+                INST_ID        NUMBER,
+                HOSTNAME       VARCHAR2(256) NOT NULL,
+                SID            VARCHAR2(64)  NOT NULL,
+                DB_UNIQUE_NAME VARCHAR2(128),
+                DB_ROLE        VARCHAR2(32),
+                OPEN_MODE      VARCHAR2(32),
+                FAL_SERVER     VARCHAR2(256),
+                APPLIED_SCN    VARCHAR2(32),
+                LAST_UPDATED   DATE DEFAULT SYSDATE
+              )';
+          EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+          END;
+          -- â”€â”€ ORACLE_OPT_D_RAC (RAC node evidence) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+          BEGIN
+            EXECUTE IMMEDIATE '
+              CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_RAC (
+                DETAIL_ID      NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                RUN_ID         NUMBER        NOT NULL,
+                INST_ID        NUMBER,
+                HOSTNAME       VARCHAR2(256) NOT NULL,
+                SID            VARCHAR2(64)  NOT NULL,
+                RAC_INST_ID    NUMBER,
+                INSTANCE_NAME  VARCHAR2(64),
+                NODE_HOST      VARCHAR2(256),
+                STATUS         VARCHAR2(32),
+                LAST_UPDATED   DATE DEFAULT SYSDATE
+              )';
+          EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+          END;
+        END;
+        /
+        EXIT;
+        EOSQL
+    delegate_to: localhost
+    become: no
+    run_once: true
+    changed_when: false
+
+  - name: Write detail SQL insert file for {{ target_host }}
+    ansible.builtin.copy:
+      dest: "{{ log_dir }}/oracle_audit_detail_{{ _audit_run_id }}_{{ target_host | replace('.','_') }}.sql"
+      content: |
+        CONNECT {{ repo_user }}/"{{ repo_password }}"@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={{ repo_host }})(PORT={{ repo_port }}))(CONNECT_DATA=(SID={{ repo_sid }})))
+        SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+        {% set hv = hostvars[target_host] %}
+        {% for r in hv._audit_instance_results | default([]) %}
+        {% if not r.is_standby | default(false) | bool and not r.skipped | default(false) | bool %}
+        {% set inst_sel %}SELECT MAX(INST_ID) FROM {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES WHERE RUN_ID={{ _audit_run_id }} AND HOSTNAME='{{ target_host | replace("'","''") }}' AND SID='{{ r.sid | replace("'","''") }}'{% endset %}
+        -- â”€â”€ Partitioning rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        {% for row in r.part_rows | default([]) %}
+        INSERT INTO {{ repo_schema | upper }}.ORACLE_OPT_D_PART
+            (RUN_ID,INST_ID,HOSTNAME,SID,OWNER,TABLE_NAME,PART_TYPE,SUBPART_TYPE,PART_COUNT,PART_KEY,SIZE_GB)
+        VALUES ({{ _audit_run_id }},({{ inst_sel }}),'{{ target_host | replace("'","''") }}','{{ r.sid | replace("'","''") }}',
+                '{{ row.owner | replace("'","''") }}','{{ row.table_name | replace("'","''") }}',
+                '{{ row.part_type | replace("'","''") }}','{{ row.subpart_type | replace("'","''") }}',
+                {{ row.part_count | default('NULL') }},
+                '{{ row.part_key | replace("'","''") }}',
+                {{ row.size_gb | default('NULL') }});
+        {% endfor %}
+        -- â”€â”€ Compression rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        {% for row in r.compress_rows | default([]) %}
+        INSERT INTO {{ repo_schema | upper }}.ORACLE_OPT_D_COMPRESS
+            (RUN_ID,INST_ID,HOSTNAME,SID,OWNER,OBJECT_NAME,OBJECT_TYPE,COMPRESSION,COMPRESS_FOR,SIZE_GB)
+        VALUES ({{ _audit_run_id }},({{ inst_sel }}),'{{ target_host | replace("'","''") }}','{{ r.sid | replace("'","''") }}',
+                '{{ row.owner | replace("'","''") }}','{{ row.object_name | replace("'","''") }}',
+                '{{ row.object_type | replace("'","''") }}','{{ row.compression | replace("'","''") }}',
+                '{{ row.compress_for | replace("'","''") }}',
+                {{ row.size_gb | default('NULL') }});
+        {% endfor %}
+        -- â”€â”€ Security / TDE rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        {% for row in r.security_rows | default([]) %}
+        INSERT INTO {{ repo_schema | upper }}.ORACLE_OPT_D_SECURITY
+            (RUN_ID,INST_ID,HOSTNAME,SID,OBJECT_TYPE,OWNER_OR_TS,OBJECT_NAME,ENCRYPTED,ALGORITHM,SIZE_GB)
+        VALUES ({{ _audit_run_id }},({{ inst_sel }}),'{{ target_host | replace("'","''") }}','{{ r.sid | replace("'","''") }}',
+                '{{ row.object_type | replace("'","''") }}','{{ row.owner_or_ts | replace("'","''") }}',
+                '{{ row.object_name | replace("'","''") }}','{{ row.encrypted | replace("'","''") }}',
+                '{{ row.algorithm | replace("'","''") }}',
+                {{ row.size_gb | default('NULL') }});
+        {% endfor %}
+        -- â”€â”€ In-Memory rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        {% for row in r.inmem_rows | default([]) %}
+        INSERT INTO {{ repo_schema | upper }}.ORACLE_OPT_D_INMEM
+            (RUN_ID,INST_ID,HOSTNAME,SID,OWNER,TABLE_NAME,INMEMORY,PRIORITY,COMPRESSION,SIZE_GB)
+        VALUES ({{ _audit_run_id }},({{ inst_sel }}),'{{ target_host | replace("'","''") }}','{{ r.sid | replace("'","''") }}',
+                '{{ row.owner | replace("'","''") }}','{{ row.table_name | replace("'","''") }}',
+                '{{ row.inmemory | replace("'","''") }}','{{ row.priority | replace("'","''") }}',
+                '{{ row.compression | replace("'","''") }}',
+                {{ row.size_gb | default('NULL') }});
+        {% endfor %}
+        -- â”€â”€ PDB rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        {% for row in r.pdb_rows | default([]) %}
+        INSERT INTO {{ repo_schema | upper }}.ORACLE_OPT_D_PDB
+            (RUN_ID,INST_ID,HOSTNAME,SID,CON_ID,PDB_NAME,OPEN_MODE,RESTRICTED,CREATION_DATE)
+        VALUES ({{ _audit_run_id }},({{ inst_sel }}),'{{ target_host | replace("'","''") }}','{{ r.sid | replace("'","''") }}',
+                {{ row.con_id | default('NULL') }},'{{ row.name | replace("'","''") }}',
+                '{{ row.open_mode | replace("'","''") }}','{{ row.restricted | replace("'","''") }}',
+                {% if row.creation_date | default('') != '' %}TO_DATE('{{ row.creation_date }}','YYYY-MM-DD'){% else %}NULL{% endif %});
+        {% endfor %}
+        -- â”€â”€ Active Data Guard rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        {% for row in r.adg_rows | default([]) %}
+        INSERT INTO {{ repo_schema | upper }}.ORACLE_OPT_D_ADG
+            (RUN_ID,INST_ID,HOSTNAME,SID,DB_UNIQUE_NAME,DB_ROLE,OPEN_MODE,FAL_SERVER,APPLIED_SCN)
+        VALUES ({{ _audit_run_id }},({{ inst_sel }}),'{{ target_host | replace("'","''") }}','{{ r.sid | replace("'","''") }}',
+                '{{ row.db_unique_name | replace("'","''") }}','{{ row.db_role | replace("'","''") }}',
+                '{{ row.open_mode | replace("'","''") }}','{{ row.fal_server | replace("'","''") }}',
+                '{{ row.applied_scn | replace("'","''") }}');
+        {% endfor %}
+        -- â”€â”€ RAC node rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        {% for row in r.rac_rows | default([]) %}
+        INSERT INTO {{ repo_schema | upper }}.ORACLE_OPT_D_RAC
+            (RUN_ID,INST_ID,HOSTNAME,SID,RAC_INST_ID,INSTANCE_NAME,NODE_HOST,STATUS)
+        VALUES ({{ _audit_run_id }},({{ inst_sel }}),'{{ target_host | replace("'","''") }}','{{ r.sid | replace("'","''") }}',
+                {{ row.inst_id | default('NULL') }},'{{ row.instance_name | replace("'","''") }}',
+                '{{ row.host_name | replace("'","''") }}','{{ row.status | replace("'","''") }}');
+        {% endfor %}
+        {% endif %}
+        {% endfor %}
+        COMMIT;
+        EXIT;
+    loop: "{{ ansible_play_hosts }}"
+    loop_control:
+      loop_var: target_host
+    delegate_to: localhost
+    become: no
+    run_once: true
+    when: _audit_run_id | default('0') != '0'
+
+  - name: Execute detail SQL insert file for {{ target_host }}
+    ansible.builtin.shell:
+      cmd: "sqlplus -s /nolog @{{ log_dir }}/oracle_audit_detail_{{ _audit_run_id }}_{{ target_host | replace('.','_') }}.sql"
+    loop: "{{ ansible_play_hosts }}"
+    loop_control:
+      loop_var: target_host
+    delegate_to: localhost
+    become: no
+    run_once: true
+    register: _detail_insert_result
+    changed_when: true
+    failed_when: >
+      _detail_insert_result.rc != 0 or
+      'ORA-' in _detail_insert_result.stdout or
+      'ORA-' in _detail_insert_result.stderr or
+      'SP2-' in _detail_insert_result.stdout or
+      'SP2-' in _detail_insert_result.stderr
+    when: _audit_run_id | default('0') != '0'
+
+  - name: Write SQL insert file for {{ target_host }}
+    ansible.builtin.copy:
+      dest: "{{ log_dir }}/oracle_audit_{{ _audit_run_id }}_{{ target_host | replace('.','_') }}.sql"
+      content: |
+        CONNECT {{ repo_user }}/"{{ repo_password }}"@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={{ repo_host }})(PORT={{ repo_port }}))(CONNECT_DATA=(SID={{ repo_sid }})))
+        SET HEADING OFF
+        SET FEEDBACK OFF
+        SET PAGESIZE 0
+        {% set hv = hostvars[target_host] %}
+        {% for r in hv._audit_instance_results | default([]) %}
+        INSERT INTO {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES
+            (RUN_ID, HOSTNAME, SID, DBID, DB_NAME, DB_UNIQUE_NAME,
+             ORACLE_VERSION, VERSION_MAJOR,
+             DB_ROLE, OPEN_MODE, IS_STANDBY, WAS_QUERIED, SKIP_REASON,
+             OS_TYPE, OS_VERSION, OS_KERNEL, CPU_COUNT,
+             HOST_TIMEZONE, REGION,
+             DB_PATCH_LEVEL, DB_PATCH_DATE, DB_PATCH_ID, OPATCH_VERSION,
+             DB_TOTAL_SIZE_GB, ORACLE_USER, ORACLE_HOME, LAST_UPDATED)
+        VALUES
+            ({{ _audit_run_id }},
+             '{{ target_host | replace("'","''") }}',
+             '{{ r.sid | replace("'","''") }}',
+             {% if r.dbid | default('') != '' %}{{ r.dbid }}{% else %}NULL{% endif %},
+             '{{ r.db_name | default('') | replace("'","''") }}',
+             '{{ r.db_unique_name | default('') | replace("'","''") }}',
+             '{{ r.oracle_version | default('') | replace("'","''") }}',
+             {% if r.version_major | default('') != '' %}{{ r.version_major }}{% else %}NULL{% endif %},
+             '{{ r.db_role | default('UNKNOWN') | replace("'","''") }}',
+             '{{ r.open_mode | default('UNKNOWN') | replace("'","''") }}',
+             '{{ 'Y' if r.is_standby | default(false) | bool else 'N' }}',
+             '{{ 'N' if r.skipped | default(false) | bool else 'Y' }}',
+             '{{ r.skip_reason | default('') | replace("'","''") }}',
+             '{{ r.os_type | default('') | replace("'","''") }}',
+             '{{ r.os_version | default('') | replace("'","''") }}',
+             '{{ r.os_kernel | default('') | replace("'","''") }}',
+             {% if r.cpu_count | default('') != '' %}{{ r.cpu_count }}{% else %}NULL{% endif %},
+             '{{ r.host_timezone | default('') | replace("'","''") }}',
+             '{{ r.region | default('UNKNOWN') | replace("'","''") }}',
+             '{{ r.db_patch_level | default('') | replace("'","''") }}',
+             {% if r.db_patch_date | default('') != '' %}TO_DATE('{{ r.db_patch_date }}','YYYY-MM-DD'){% else %}NULL{% endif %},
+             {% if r.db_patch_id | default('') != '' %}{{ r.db_patch_id }}{% else %}NULL{% endif %},
+             '{{ r.opatch_version | default('') | replace("'","''") }}',
+             {% if r.db_total_size_gb | default('') != '' %}{{ r.db_total_size_gb }}{% else %}NULL{% endif %},
+             '{{ r.oracle_user | default('') | replace("'","''") }}',
+             '{{ r.oracle_home | default('') | replace("'","''") }}',
+             SYSDATE);
+        {% set inst_sel %}SELECT MAX(INST_ID) FROM {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES WHERE RUN_ID={{ _audit_run_id }} AND HOSTNAME='{{ target_host | replace("'","''") }}' AND SID='{{ r.sid | replace("'","''") }}'{% endset %}
+        {% for opt in r.voption_rows | default([]) %}
+        INSERT INTO {{ repo_schema | upper }}.ORACLE_OPT_VOPTION
+            (RUN_ID, INST_ID, HOSTNAME, SID, REGION, OS_TYPE, OPTION_NAME, OPTION_ENABLED, IS_EE_EXTRA, IS_INUSE, LAST_UPDATED)
+        VALUES
+            ({{ _audit_run_id }},
+             ({{ inst_sel }}),
+             '{{ target_host | replace("'","''") }}',
+             '{{ r.sid | replace("'","''") }}',
+             '{{ r.region | default('UNKNOWN') | replace("'","''") }}',
+             '{{ r.os_type | default('') | replace("'","''") }}',
+             '{{ opt.name | replace("'","''") }}',
+             '{{ opt.enabled | replace("'","''") }}',
+             '{{ opt.is_ee_extra | default('N') }}',
+             '{{ opt.is_inuse | default('N') }}',
+             SYSDATE);
+        {% endfor %}
+        {% for feat in r.feature_rows | default([]) %}
+        INSERT INTO {{ repo_schema | upper }}.ORACLE_OPT_FEATURES
+            (RUN_ID, INST_ID, HOSTNAME, SID, REGION, OS_TYPE,
+             FEATURE_NAME, FEATURE_VERSION, DETECTED_USAGES, CURRENTLY_USED,
+             FIRST_USAGE_DATE, LAST_USAGE_DATE, LAST_SAMPLE_DATE, AUX_COUNT, LAST_UPDATED)
+        VALUES
+            ({{ _audit_run_id }},
+             ({{ inst_sel }}),
+             '{{ target_host | replace("'","''") }}',
+             '{{ r.sid | replace("'","''") }}',
+             '{{ r.region | default('UNKNOWN') | replace("'","''") }}',
+             '{{ r.os_type | default('') | replace("'","''") }}',
+             '{{ feat.name | replace("'","''") }}',
+             '{{ feat.version | default('') | replace("'","''") }}',
+             {{ feat.detected_usages | default(0) }},
+             '{{ feat.currently_used | default('') | replace("'","''") }}',
+             {% if feat.first_usage_date | default('') != '' %}TO_DATE('{{ feat.first_usage_date }}','YYYY-MM-DD'){% else %}NULL{% endif %},
+             {% if feat.last_usage_date | default('') != '' %}TO_DATE('{{ feat.last_usage_date }}','YYYY-MM-DD'){% else %}NULL{% endif %},
+             {% if feat.last_sample_date | default('') != '' %}TO_DATE('{{ feat.last_sample_date }}','YYYY-MM-DD'){% else %}NULL{% endif %},
+             {% if feat.aux_count is defined and feat.aux_count != '' %}{{ feat.aux_count }}{% else %}NULL{% endif %},
+             SYSDATE);
+        {% endfor %}
+        {% endfor %}
+        COMMIT;
+        EXIT;
+    loop: "{{ ansible_play_hosts }}"
+    loop_control:
+      loop_var: target_host
+    delegate_to: localhost
+    become: no
+    run_once: true
+    when: _audit_run_id | default('0') != '0'
+
+  - name: Execute SQL insert file for {{ target_host }}
+    ansible.builtin.shell:
+      cmd: "sqlplus -s /nolog @{{ log_dir }}/oracle_audit_{{ _audit_run_id }}_{{ target_host | replace('.','_') }}.sql"
+    loop: "{{ ansible_play_hosts }}"
+    loop_control:
+      loop_var: target_host
+    delegate_to: localhost
+    become: no
+    run_once: true
+    register: _insert_result
+    changed_when: true
+    failed_when: >
+      _insert_result.rc != 0 or
+      'ORA-' in _insert_result.stdout or
+      'ORA-' in _insert_result.stderr or
+      'SP2-' in _insert_result.stdout or
+      'SP2-' in _insert_result.stderr
+    when: _audit_run_id | default('0') != '0'
+
+  - name: Display insert errors if any
+    ansible.builtin.debug:
+      msg: |
+        ⚠ INSERT ERROR detected for {{ item.target_host }}:
+        STDOUT: {{ item.stdout }}
+        STDERR: {{ item.stderr }}
+    loop: "{{ _insert_result.results | default([]) }}"
+    when:
+      - _insert_result is defined
+      - item.rc is defined
+      - item.rc != 0
+    loop_control:
+      label: "{{ item.target_host }}"
+
+  - name: Verify data inserted successfully
+    ansible.builtin.shell:
+      cmd: |
+        sqlplus -s /nolog << 'EOSQL'
+        CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+        SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+        SELECT COUNT(*) FROM {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES WHERE RUN_ID = {{ _audit_run_id }};
+        EXIT;
+        EOSQL
+    register: _verify_insert
+    delegate_to: localhost
+    become: no
+    run_once: true
+    changed_when: false
+    when: _audit_run_id | default('0') != '0'
+
+  - name: Parse inserted row count
+    ansible.builtin.set_fact:
+      _inserted_count: "{{ _verify_insert.stdout | regex_replace('[^0-9]', '') | default('0') | int }}"
+    run_once: true
+    when: _verify_insert.stdout is defined
+
+  - name: Display insert verification
+    ansible.builtin.debug:
+      msg: "✓ DATA INSERT VERIFIED: {{ _inserted_count }} instances inserted into {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES (RUN_ID={{ _audit_run_id }})"
+    run_once: true
+    when: _inserted_count | default(0) | int > 0
+
+  - name: Fail if no data was inserted
+    ansible.builtin.fail:
+      msg: |
+        ✗ CRITICAL ERROR: No data was inserted into repository!
+        Expected {{ _total_instances }} instances but found {{ _inserted_count | default(0) }} in database.
+        Check SQL files in: {{ log_dir }}/oracle_audit_{{ _audit_run_id }}_*.sql
+        Check repo connection: {{ repo_user }}@{{ repo_tns_alias if (repo_tns_alias | default('')) else (repo_host ~ ':' ~ repo_port ~ '/' ~ repo_sid) }}
+    when:
+      - _audit_run_id | default('0') != '0'
+      - _inserted_count | default(0) | int == 0
+
+  # ============================================
+  # Build run summary + send email
+  # ============================================
+
+  # -- Flatten all instance results from all hosts into one list
+  - name: Build flat instance list for summary
+    ansible.builtin.set_fact:
+      _all_inst_flat: >-
+        {%- set flat = [] -%}
+        {%- for h in ansible_play_hosts -%}
+          {%- for r in hostvars[h]._audit_instance_results | default([]) -%}
+            {%- set _ = flat.append(r | combine({'hostname': h})) -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {{ flat }}
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  # -- Count queried vs skipped
+  - name: Compute summary counts
+    ansible.builtin.set_fact:
+      _sum_queried:  "{{ _all_inst_flat | selectattr('skipped','equalto',false) | selectattr('is_standby','equalto',false) | list | length }}"
+      _sum_standby:  "{{ _all_inst_flat | selectattr('is_standby','equalto',true)  | list | length }}"
+      _sum_skipped:  "{{ _all_inst_flat | selectattr('skipped','equalto',true)     | list | length }}"
+      _sum_inmem_autocollected: >-
+        {{
+          _all_inst_flat 
+          | selectattr('skipped','equalto',false)
+          | selectattr('inmem_autocollected', 'defined')
+          | selectattr('inmem_autocollected','equalto',true)
+          | list
+          | length
+        }}
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  - name: Display In-Memory auto-collection warning
+    ansible.builtin.debug:
+      msg: |
+        ==================================================================================
+        ⚠️  IN-MEMORY AUTO-COLLECTION TRIGGERED
+        ==================================================================================
+        {{ _sum_inmem_autocollected }} instance(s) had In-Memory feature IS_INUSE=Y
+        Evidence was AUTO-COLLECTED even though collect_inmemory=false
+        This ensures license audit compliance when In-Memory is actively being used.
+        ==================================================================================
+    run_once: true
+    when: (_sum_inmem_autocollected | default(0) | int) > 0
+
+  # -- Collect EE extra option status per instance: enabled+inuse / enabled-only / inuse-only
+  - name: Build EE options enabled-everywhere set
+    ansible.builtin.set_fact:
+      _ee_options_summary: >-
+        {%- set queried = _all_inst_flat
+              | selectattr('skipped','equalto',false)
+              | selectattr('is_standby','equalto',false)
+              | list -%}
+        {%- set risk = [] -%}
+        {%- set enabled_only = [] -%}
+        {%- set inuse_only = [] -%}
+        {%- set ee_names = ee_extra_options | default([]) -%}
+        {%- for opt_name in ee_names -%}
+          {%- set en = namespace(v=0) -%}
+          {%- set iu = namespace(v=0) -%}
+          {%- for r in queried -%}
+            {%- for o in r.voption_rows | default([]) -%}
+              {%- if o.name == opt_name -%}
+                {%- if o.enabled | upper == 'TRUE' -%}{%- set en.v = en.v + 1 -%}{%- endif -%}
+                {%- if o.is_inuse | default('N') == 'Y' -%}{%- set iu.v = iu.v + 1 -%}{%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {%- set n = queried | length -%}
+          {%- if en.v > 0 and iu.v > 0 -%}
+            {%- set _ = risk.append(opt_name ~ ' [' ~ en.v ~ '/' ~ n ~ ' enabled, ' ~ iu.v ~ '/' ~ n ~ ' in-use]') -%}
+          {%- elif en.v > 0 -%}
+            {%- set _ = enabled_only.append(opt_name ~ ' [' ~ en.v ~ '/' ~ n ~ ' enabled, not in-use]') -%}
+          {%- elif iu.v > 0 -%}
+            {%- set _ = inuse_only.append(opt_name ~ ' [' ~ iu.v ~ '/' ~ n ~ ' in-use, v$option=FALSE]') -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {{ {'risk': risk, 'enabled_only': enabled_only, 'inuse_only': inuse_only} }}
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  # -- Newline helper (single-quoted \n in >- blocks is a literal backslash-n)
+  - name: Define newline helper for join filters
+    ansible.builtin.set_fact:
+      _nl: "\n"
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  # -- Build per-instance summary table rows (text)
+  - name: Build instance table for email body
+    ansible.builtin.set_fact:
+      _email_inst_rows: >-
+        {%- set rows = [] -%}
+        {%- for r in _all_inst_flat | sort(attribute='hostname') -%}
+          {%- if r.is_standby | bool -%}
+            {%- set status = 'STANDBY' -%}
+          {%- elif r.skipped | bool -%}
+            {%- set status = 'SKIPPED' -%}
+          {%- else -%}
+            {%- set status = 'OK' -%}
+          {%- endif -%}
+          {%- set _ = rows.append(
+            '  %-30s %-12s %-20s %-12s %s' | format(
+              r.hostname, r.sid, r.oracle_version | default(''), status,
+              r.skip_reason | default('') if r.skipped | bool else ''
+            )
+          ) -%}
+        {%- endfor -%}
+        {{ rows | join(_nl) }}
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  # -- Build EE options ASCII summary table
+  - name: Build EE options ASCII table for email
+    ansible.builtin.set_fact:
+      _email_ee_table: >-
+        {%- set queried = _all_inst_flat
+              | selectattr('skipped','equalto',false)
+              | selectattr('is_standby','equalto',false)
+              | list -%}
+        {%- set n = queried | length -%}
+        {%- set ee_names = ee_extra_options | default([]) -%}
+        {%- set sep = '+' ~ '-'*40 ~ '+' ~ '-'*10 ~ '+' ~ '-'*10 ~ '+' ~ '-'*9 ~ '+' -%}
+        {%- set rows = [sep] -%}
+        {%- set _ = rows.append('| %-38s | %-8s | %-8s | %-7s |' | format('OPTION NAME','ENABLED','IN-USE','RISK')) -%}
+        {%- set _ = rows.append(sep) -%}
+        {%- for opt_name in ee_names -%}
+          {%- set en = namespace(v=0) -%}
+          {%- set iu = namespace(v=0) -%}
+          {%- for r in queried -%}
+            {%- for o in r.voption_rows | default([]) -%}
+              {%- if o.name == opt_name -%}
+                {%- if o.enabled | upper == 'TRUE' -%}{%- set en.v = en.v + 1 -%}{%- endif -%}
+                {%- if o.is_inuse | default('N') == 'Y' -%}{%- set iu.v = iu.v + 1 -%}{%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {%- set en_str = (en.v | string) ~ '/' ~ n -%}
+          {%- set iu_str = (iu.v | string) ~ '/' ~ n -%}
+          {%- if en.v > 0 and iu.v > 0 -%}
+            {%- set risk = '!! RISK' -%}
+          {%- elif en.v > 0 -%}
+            {%- set risk = '--' -%}
+          {%- elif iu.v > 0 -%}
+            {%- set risk = '~~ CHK' -%}
+          {%- else -%}
+            {%- set risk = '' -%}
+          {%- endif -%}
+          {%- set _ = rows.append('| %-38s | %-8s | %-8s | %-7s |' | format(opt_name, en_str, iu_str, risk)) -%}
+        {%- endfor -%}
+        {%- set _ = rows.append(sep) -%}
+        {{ rows | join(_nl) }}
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  # -- Build per-option detail section text blocks
+  - name: Build partitioning detail section for email
+    ansible.builtin.set_fact:
+      _email_detail_part: >-
+        {%- set frows = [] -%}
+        {%- set orows = [] -%}
+        {%- for r in _all_inst_flat
+              | selectattr('skipped','equalto',false)
+              | selectattr('is_standby','equalto',false)
+              | list -%}
+          {%- for f in r.feature_rows | default([]) -%}
+            {%- if 'partitioning' in (f.name | lower) and
+                   (f.currently_used | upper == 'TRUE' or f.detected_usages | int > 0) -%}
+              {%- set _ = frows.append('  %-25s %-45s %7s  %-12s %s' | format(
+                (r.hostname ~ '/' ~ r.sid)[:25],
+                (f.name | default(''))[:45],
+                f.detected_usages | default(0),
+                (f.last_usage_date | default('never'))[:12],
+                f.currently_used | default('')
+              )) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- for p in r.part_rows | default([]) -%}
+            {%- set _ = orows.append('  %-25s %-15s %-28s %-9s %-25s %5s %10s' | format(
+              (r.hostname ~ '/' ~ r.sid)[:25],
+              (p.owner | default(''))[:15],
+              (p.table_name | default(''))[:28],
+              (p.part_type | default(''))[:9],
+              (p.part_key | default(''))[:25],
+              p.part_count | default(''),
+              p.size_gb | default('0')
+            )) -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {%- set all_rows = [] -%}
+        {%- set _ = all_rows.append('  Feature Usage Stats (dba_feature_usage_statistics):') -%}
+        {%- set _ = all_rows.append('  %-25s %-45s %7s  %-12s %s' | format('host/sid','feature_name','usages','last_usage','used')) -%}
+        {%- for fr in frows -%}{%- set _ = all_rows.append(fr) -%}{%- endfor -%}
+        {%- if frows | length == 0 -%}{%- set _ = all_rows.append('  (no matching feature usage recorded)') -%}{%- endif -%}
+        {%- set _ = all_rows.append('') -%}
+        {%- set _ = all_rows.append('  Configured Objects:') -%}
+        {%- for obj in orows -%}{%- set _ = all_rows.append(obj) -%}{%- endfor -%}
+        {%- if orows | length == 0 -%}{%- set _ = all_rows.append('  (no partitioned objects detected)') -%}{%- endif -%}
+        {{ all_rows | join(_nl) }}
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  - name: Build compression detail section for email
+    ansible.builtin.set_fact:
+      _email_detail_compress: >-
+        {%- set frows = [] -%}
+        {%- set orows = [] -%}
+        {%- for r in _all_inst_flat
+              | selectattr('skipped','equalto',false)
+              | selectattr('is_standby','equalto',false)
+              | list -%}
+          {%- for f in r.feature_rows | default([]) -%}
+            {%- if 'compression' in (f.name | lower) and
+                   (f.currently_used | upper == 'TRUE' or f.detected_usages | int > 0) -%}
+              {%- set _ = frows.append('  %-25s %-45s %7s  %-12s %s' | format(
+                (r.hostname ~ '/' ~ r.sid)[:25],
+                (f.name | default(''))[:45],
+                f.detected_usages | default(0),
+                (f.last_usage_date | default('never'))[:12],
+                f.currently_used | default('')
+              )) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- for p in r.compress_rows | default([]) -%}
+            {%- set _ = orows.append('  %-25s %-15s %-28s %-10s %-20s %10s' | format(
+              (r.hostname ~ '/' ~ r.sid)[:25],
+              (p.owner | default(''))[:15],
+              (p.object_name | default(''))[:28],
+              (p.object_type | default(''))[:10],
+              (p.compress_for | default(''))[:20],
+              p.size_gb | default('0')
+            )) -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {%- set all_rows = [] -%}
+        {%- set _ = all_rows.append('  Feature Usage Stats (dba_feature_usage_statistics):') -%}
+        {%- set _ = all_rows.append('  %-25s %-45s %7s  %-12s %s' | format('host/sid','feature_name','usages','last_usage','used')) -%}
+        {%- for fr in frows -%}{%- set _ = all_rows.append(fr) -%}{%- endfor -%}
+        {%- if frows | length == 0 -%}{%- set _ = all_rows.append('  (no matching feature usage recorded)') -%}{%- endif -%}
+        {%- set _ = all_rows.append('') -%}
+        {%- set _ = all_rows.append('  Configured Objects:') -%}
+        {%- for obj in orows -%}{%- set _ = all_rows.append(obj) -%}{%- endfor -%}
+        {%- if orows | length == 0 -%}{%- set _ = all_rows.append('  (no Advanced Compression objects detected)') -%}{%- endif -%}
+        {{ all_rows | join(_nl) }}
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  - name: Build security/TDE detail section for email
+    ansible.builtin.set_fact:
+      _email_detail_security: >-
+        {%- set frows = [] -%}
+        {%- set orows = [] -%}
+        {%- for r in _all_inst_flat
+              | selectattr('skipped','equalto',false)
+              | selectattr('is_standby','equalto',false)
+              | list -%}
+          {%- for f in r.feature_rows | default([]) -%}
+            {%- if ('encryption' in (f.name | lower) or 'label security' in (f.name | lower)
+                    or 'database vault' in (f.name | lower)) and
+                   (f.currently_used | upper == 'TRUE' or f.detected_usages | int > 0) -%}
+              {%- set _ = frows.append('  %-25s %-45s %7s  %-12s %s' | format(
+                (r.hostname ~ '/' ~ r.sid)[:25],
+                (f.name | default(''))[:45],
+                f.detected_usages | default(0),
+                (f.last_usage_date | default('never'))[:12],
+                f.currently_used | default('')
+              )) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- for p in r.security_rows | default([]) -%}
+            {%- set _ = orows.append('  %-25s %-12s %-20s %-35s %-9s %s' | format(
+              (r.hostname ~ '/' ~ r.sid)[:25],
+              (p.object_type | default(''))[:12],
+              (p.owner_or_ts | default(''))[:20],
+              (p.object_name | default(''))[:35],
+              (p.encrypted | default(''))[:9],
+              p.algorithm | default('')
+            )) -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {%- set all_rows = [] -%}
+        {%- set _ = all_rows.append('  Feature Usage Stats (dba_feature_usage_statistics):') -%}
+        {%- set _ = all_rows.append('  %-25s %-45s %7s  %-12s %s' | format('host/sid','feature_name','usages','last_usage','used')) -%}
+        {%- for fr in frows -%}{%- set _ = all_rows.append(fr) -%}{%- endfor -%}
+        {%- if frows | length == 0 -%}{%- set _ = all_rows.append('  (no matching feature usage recorded)') -%}{%- endif -%}
+        {%- set _ = all_rows.append('') -%}
+        {%- set _ = all_rows.append('  Configured Objects:') -%}
+        {%- for obj in orows -%}{%- set _ = all_rows.append(obj) -%}{%- endfor -%}
+        {%- if orows | length == 0 -%}{%- set _ = all_rows.append('  (no TDE encrypted objects detected)') -%}{%- endif -%}
+        {{ all_rows | join(_nl) }}
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  - name: Build in-memory detail section for email
+    ansible.builtin.set_fact:
+      _email_detail_inmem: >-
+        {%- set frows = [] -%}
+        {%- set orows = [] -%}
+        {%- for r in _all_inst_flat
+              | selectattr('skipped','equalto',false)
+              | selectattr('is_standby','equalto',false)
+              | list -%}
+          {%- for f in r.feature_rows | default([]) -%}
+            {%- if 'in-memory column store' in (f.name | lower) and
+                   (f.currently_used | upper == 'TRUE' or f.detected_usages | int > 0) -%}
+              {%- set _ = frows.append('  %-25s %-45s %7s  %-12s %s' | format(
+                (r.hostname ~ '/' ~ r.sid)[:25],
+                (f.name | default(''))[:45],
+                f.detected_usages | default(0),
+                (f.last_usage_date | default('never'))[:12],
+                f.currently_used | default('')
+              )) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- for p in r.inmem_rows | default([]) -%}
+            {%- set _ = orows.append('  %-25s %-15s %-28s %-15s %-20s %10s' | format(
+              (r.hostname ~ '/' ~ r.sid)[:25],
+              (p.owner | default(''))[:15],
+              (p.table_name | default(''))[:28],
+              (p.priority | default(''))[:15],
+              (p.compression | default(''))[:20],
+              p.size_gb | default('0')
+            )) -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {%- set all_rows = [] -%}
+        {%- set _ = all_rows.append('  Feature Usage Stats (dba_feature_usage_statistics):') -%}
+        {%- set _ = all_rows.append('  %-25s %-45s %7s  %-12s %s' | format('host/sid','feature_name','usages','last_usage','used')) -%}
+        {%- for fr in frows -%}{%- set _ = all_rows.append(fr) -%}{%- endfor -%}
+        {%- if frows | length == 0 -%}{%- set _ = all_rows.append('  (no matching feature usage recorded)') -%}{%- endif -%}
+        {%- set _ = all_rows.append('') -%}
+        {%- set _ = all_rows.append('  Configured Objects:') -%}
+        {%- for obj in orows -%}{%- set _ = all_rows.append(obj) -%}{%- endfor -%}
+        {%- if orows | length == 0 -%}{%- set _ = all_rows.append('  (no In-Memory tables configured)') -%}{%- endif -%}
+        {{ all_rows | join(_nl) }}
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  - name: Build PDB detail section for email
+    ansible.builtin.set_fact:
+      _email_detail_pdb: >-
+        {%- set rows = [] -%}
+        {%- for r in _all_inst_flat
+              | selectattr('skipped','equalto',false)
+              | selectattr('is_standby','equalto',false)
+              | list -%}
+          {%- for p in r.pdb_rows | default([]) -%}
+            {%- set _ = rows.append('  %-25s %6s %-20s %-12s %-4s %s' | format(
+              (r.hostname ~ '/' ~ r.sid)[:25],
+              p.con_id | default(''),
+              (p.name | default(''))[:20],
+              (p.open_mode | default(''))[:12],
+              (p.restricted | default(''))[:4],
+              p.creation_date | default('')
+            )) -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {{ rows | join(_nl) if rows | length > 0 else '  (no PDBs detected -- all instances are non-CDB)' }}
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  - name: Build ADG detail section for email
+    ansible.builtin.set_fact:
+      _email_detail_adg: >-
+        {%- set frows = [] -%}
+        {%- set orows = [] -%}
+        {%- for r in _all_inst_flat
+              | selectattr('skipped','equalto',false)
+              | selectattr('is_standby','equalto',false)
+              | list -%}
+          {%- for f in r.feature_rows | default([]) -%}
+            {%- if 'active data guard' in (f.name | lower) and
+                   (f.currently_used | upper == 'TRUE' or f.detected_usages | int > 0) -%}
+              {%- set _ = frows.append('  %-25s %-45s %7s  %-12s %s' | format(
+                (r.hostname ~ '/' ~ r.sid)[:25],
+                (f.name | default(''))[:45],
+                f.detected_usages | default(0),
+                (f.last_usage_date | default('never'))[:12],
+                f.currently_used | default('')
+              )) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- for p in r.adg_rows | default([]) -%}
+            {%- set _ = orows.append('  %-25s %-25s %-12s %-12s %-20s %s' | format(
+              (r.hostname ~ '/' ~ r.sid)[:25],
+              (p.db_unique_name | default(''))[:25],
+              (p.db_role | default(''))[:12],
+              (p.open_mode | default(''))[:12],
+              (p.fal_server | default(''))[:20],
+              p.applied_scn | default('')
+            )) -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {%- set all_rows = [] -%}
+        {%- set _ = all_rows.append('  Feature Usage Stats (dba_feature_usage_statistics):') -%}
+        {%- set _ = all_rows.append('  %-25s %-45s %7s  %-12s %s' | format('host/sid','feature_name','usages','last_usage','used')) -%}
+        {%- for fr in frows -%}{%- set _ = all_rows.append(fr) -%}{%- endfor -%}
+        {%- if frows | length == 0 -%}{%- set _ = all_rows.append('  (no matching feature usage recorded)') -%}{%- endif -%}
+        {%- set _ = all_rows.append('') -%}
+        {%- set _ = all_rows.append('  Configured Objects:') -%}
+        {%- for obj in orows -%}{%- set _ = all_rows.append(obj) -%}{%- endfor -%}
+        {%- if orows | length == 0 -%}{%- set _ = all_rows.append('  (no Active Data Guard configuration detected)') -%}{%- endif -%}
+        {{ all_rows | join(_nl) }}
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  - name: Build RAC detail section for email
+    ansible.builtin.set_fact:
+      _email_detail_rac: >-
+        {%- set frows = [] -%}
+        {%- set orows = [] -%}
+        {%- for r in _all_inst_flat
+              | selectattr('skipped','equalto',false)
+              | selectattr('is_standby','equalto',false)
+              | list -%}
+          {%- for f in r.feature_rows | default([]) -%}
+            {%- if 'real application' in (f.name | lower) and
+                   (f.currently_used | upper == 'TRUE' or f.detected_usages | int > 0) -%}
+              {%- set _ = frows.append('  %-25s %-45s %7s  %-12s %s' | format(
+                (r.hostname ~ '/' ~ r.sid)[:25],
+                (f.name | default(''))[:45],
+                f.detected_usages | default(0),
+                (f.last_usage_date | default('never'))[:12],
+                f.currently_used | default('')
+              )) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- for p in r.rac_rows | default([]) -%}
+            {%- set _ = orows.append('  %-25s %6s %-20s %-25s %s' | format(
+              (r.hostname ~ '/' ~ r.sid)[:25],
+              p.inst_id | default(''),
+              (p.instance_name | default(''))[:20],
+              (p.host_name | default(''))[:25],
+              p.status | default('')
+            )) -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {%- set all_rows = [] -%}
+        {%- set _ = all_rows.append('  Feature Usage Stats (dba_feature_usage_statistics):') -%}
+        {%- set _ = all_rows.append('  %-25s %-45s %7s  %-12s %s' | format('host/sid','feature_name','usages','last_usage','used')) -%}
+        {%- for fr in frows -%}{%- set _ = all_rows.append(fr) -%}{%- endfor -%}
+        {%- if frows | length == 0 -%}{%- set _ = all_rows.append('  (no matching feature usage recorded)') -%}{%- endif -%}
+        {%- set _ = all_rows.append('') -%}
+        {%- set _ = all_rows.append('  Configured Objects:') -%}
+        {%- for obj in orows -%}{%- set _ = all_rows.append(obj) -%}{%- endfor -%}
+        {%- if orows | length == 0 -%}{%- set _ = all_rows.append('  (no RAC nodes detected)') -%}{%- endif -%}
+        {{ all_rows | join(_nl) }}
+    run_once: true
+    delegate_to: localhost
+    become: no
+
+  # -- Compose and send the email
+  - name: Send audit summary email
+    community.general.mail:
+      host:    "{{ smtp_host }}"
+      port:    "{{ smtp_port }}"
+      from:    "{{ email_from }}"
+      to:      "{{ email_to }}"
+      subject: "[Oracle License Audit] EE Options & Features Report - {{ _audit_date }} | Run #{{ _audit_run_id }} | {{ run_label }}"
+      body: |
+        =========================================================================
+         ORACLE OPTIONS & FEATURES AUDIT - RUN SUMMARY
+        =========================================================================
+         Run ID       : {{ _audit_run_id }}
+         Label        : {{ run_label }}
+         Date         : {{ _audit_date }}
+         Triggered by : {{ lookup('pipe','whoami') }}@{{ lookup('pipe','hostname') }}
+
+        -------------------------------------------------------------------------
+         TOTALS
+        -------------------------------------------------------------------------
+         Hosts in play      : {{ ansible_play_hosts | length }}
+         Instances queried  : {{ _sum_queried }}
+         Standby instances  : {{ _sum_standby }}
+         Skipped / errors   : {{ _sum_skipped }}
+
+        -------------------------------------------------------------------------
+         EE EXTRA-COST OPTIONS - LICENSE RISK SUMMARY
+        -------------------------------------------------------------------------
+        {{ _email_ee_table }}
+
+         RISK KEY:
+           !! RISK  = enabled in v$option AND in-use -- LICENSE EXPOSURE
+           ~~ CHK   = feature usage detected but v$option=FALSE -- verify
+           (enabled-only = no risk; Oracle EE installs all options by default)
+
+        {% if collect_partitioning | default(true) | bool %}{% if not (email_skip_empty_sections | default(false) | bool) or 'no partitioned' not in _email_detail_part %}
+        -------------------------------------------------------------------------
+         PARTITIONING - OBJECT LIST [ORACLE_OPT_D_PART, RUN_ID={{ _audit_run_id }}]
+        -------------------------------------------------------------------------
+          HOST/SID                  OWNER           TABLE                        TYPE      PART_KEY                  PARTS    SIZE_GB
+          {{ '-' * 118 }}
+        {{ _email_detail_part }}
+        {% endif %}{% endif %}
+        {% if collect_compression | default(true) | bool %}{% if not (email_skip_empty_sections | default(false) | bool) or 'no Advanced' not in _email_detail_compress %}
+        -------------------------------------------------------------------------
+         ADVANCED COMPRESSION - OBJECT LIST [ORACLE_OPT_D_COMPRESS, RUN_ID={{ _audit_run_id }}]
+        -------------------------------------------------------------------------
+          HOST/SID                  OWNER           OBJECT                       TYPE       COMPRESS_FOR              SIZE_GB
+          {{ '-' * 118 }}
+        {{ _email_detail_compress }}
+        {% endif %}{% endif %}
+        {% if collect_security | default(true) | bool %}{% if not (email_skip_empty_sections | default(false) | bool) or 'no TDE' not in _email_detail_security %}
+        -------------------------------------------------------------------------
+         ADVANCED SECURITY / TDE - OBJECT LIST [ORACLE_OPT_D_SECURITY, RUN_ID={{ _audit_run_id }}]
+        -------------------------------------------------------------------------
+          HOST/SID                  TYPE         OWNER/TS             OBJECT                              ENC       ALGORITHM
+          {{ '-' * 118 }}
+        {{ _email_detail_security }}
+        {% endif %}{% endif %}
+        {% if collect_inmemory | default(true) | bool %}{% if not (email_skip_empty_sections | default(false) | bool) or 'no In-Memory' not in _email_detail_inmem %}
+        -------------------------------------------------------------------------
+         IN-MEMORY DATABASE - OBJECT LIST [ORACLE_OPT_D_INMEM, RUN_ID={{ _audit_run_id }}]
+        -------------------------------------------------------------------------
+          HOST/SID                  OWNER           TABLE                        PRIORITY        COMPRESSION          SIZE_GB
+          {{ '-' * 118 }}
+        {{ _email_detail_inmem }}
+        {% endif %}{% endif %}
+        {% if collect_pdbs | default(true) | bool %}{% if not (email_skip_empty_sections | default(false) | bool) or 'no PDBs' not in _email_detail_pdb %}
+        -------------------------------------------------------------------------
+         MULTITENANT / PDB LIST [ORACLE_OPT_D_PDB, RUN_ID={{ _audit_run_id }}]
+        -------------------------------------------------------------------------
+          HOST/SID                  CON_ID PDB_NAME             OPEN_MODE    REST CREATED
+          {{ '-' * 88 }}
+        {{ _email_detail_pdb }}
+        {% endif %}{% endif %}
+        {% if collect_adg | default(true) | bool %}{% if not (email_skip_empty_sections | default(false) | bool) or 'no Active' not in _email_detail_adg %}
+        -------------------------------------------------------------------------
+         ACTIVE DATA GUARD - DETAIL [ORACLE_OPT_D_ADG, RUN_ID={{ _audit_run_id }}]
+        -------------------------------------------------------------------------
+          HOST/SID                  DB_UNIQUE_NAME            DB_ROLE      OPEN_MODE    FAL_SERVER           APPLIED_SCN
+          {{ '-' * 118 }}
+        {{ _email_detail_adg }}
+        {% endif %}{% endif %}
+        {% if collect_rac | default(true) | bool %}{% if not (email_skip_empty_sections | default(false) | bool) or 'no RAC' not in _email_detail_rac %}
+        -------------------------------------------------------------------------
+         REAL APPLICATION CLUSTERS - DETAIL [ORACLE_OPT_D_RAC, RUN_ID={{ _audit_run_id }}]
+        -------------------------------------------------------------------------
+          HOST/SID                  INST_ID INSTANCE_NAME        NODE_HOST                STATUS
+          {{ '-' * 90 }}
+        {{ _email_detail_rac }}
+        {% endif %}{% endif %}
+
+        -------------------------------------------------------------------------
+         INSTANCE SUMMARY
+        -------------------------------------------------------------------------
+          {{ 'HOSTNAME'.ljust(30) }} {{ 'SID'.ljust(12) }} {{ 'VERSION'.ljust(20) }} {{ 'STATUS'.ljust(12) }} ROLE
+          {{ '-' * 90 }}
+        {{ _email_inst_rows }}
+
+        =========================================================================
+         Full data in DB: {{ repo_host }}:{{ repo_port }}/{{ repo_sid }}
+         Schema  : {{ repo_schema | upper }}   |   RUN_ID = {{ _audit_run_id }}
+         Tables  : ORACLE_OPT_RUNS, ORACLE_OPT_INSTANCES, ORACLE_OPT_VOPTION,
+                   ORACLE_OPT_FEATURES, ORACLE_OPT_D_PART, ORACLE_OPT_D_COMPRESS,
+                   ORACLE_OPT_D_SECURITY, ORACLE_OPT_D_INMEM, ORACLE_OPT_D_PDB,
+                   ORACLE_OPT_D_ADG, ORACLE_OPT_D_RAC
+        =========================================================================
+        This is an automated message from Ansible DBA Automation.
+    delegate_to: localhost
+    become: no
+    run_once: true
+    when: send_summary_email | bool
+  # ============================================
+  # Save text summary to log folder
+  # ============================================
+  - name: Save text audit summary to log file
+    ansible.builtin.copy:
+      dest: "{{ log_dir }}/audit_summary_run{{ _audit_run_id }}_{{ _audit_date }}.txt"
+      content: |
+        =========================================================================
+         ORACLE OPTIONS & FEATURES AUDIT -- RUN SUMMARY
+        =========================================================================
+         Run ID       : {{ _audit_run_id }}
+         Label        : {{ run_label }}
+         Date         : {{ _audit_date }}
+         Triggered by : {{ lookup('pipe','whoami') }}@{{ lookup('pipe','hostname') }}
+
+        -------------------------------------------------------------------------
+         TOTALS
+        -------------------------------------------------------------------------
+         Hosts in play      : {{ ansible_play_hosts | length }}
+         Instances queried  : {{ _sum_queried }}
+         Standby instances  : {{ _sum_standby }}
+         Skipped / errors   : {{ _sum_skipped }}
+
+        -------------------------------------------------------------------------
+         EE EXTRA-COST OPTIONS -- LICENSE RISK SUMMARY
+        -------------------------------------------------------------------------
+        {{ _email_ee_table }}
+
+         RISK KEY:
+           !! RISK  = enabled in v$option AND in-use -- LICENSE EXPOSURE
+           ~~ CHK   = feature usage detected but v$option=FALSE -- verify
+           (enabled-only = no risk; Oracle EE installs all options by default)
+
+        {% if collect_partitioning | default(true) | bool %}
+        -------------------------------------------------------------------------
+         PARTITIONING -- OBJECT LIST  [ORACLE_OPT_D_PART, RUN_ID={{ _audit_run_id }}]
+        -------------------------------------------------------------------------
+          HOST/SID                  OWNER           TABLE                        TYPE      PART_KEY                  PARTS    SIZE_GB
+        {{ _email_detail_part }}
+        {% endif %}
+        {% if collect_compression | default(true) | bool %}
+        -------------------------------------------------------------------------
+         ADVANCED COMPRESSION -- OBJECT LIST  [ORACLE_OPT_D_COMPRESS, RUN_ID={{ _audit_run_id }}]
+        -------------------------------------------------------------------------
+          HOST/SID                  OWNER           OBJECT                       TYPE       COMPRESS_FOR              SIZE_GB
+        {{ _email_detail_compress }}
+        {% endif %}
+        {% if collect_security | default(true) | bool %}
+        -------------------------------------------------------------------------
+         ADVANCED SECURITY / TDE -- OBJECT LIST  [ORACLE_OPT_D_SECURITY, RUN_ID={{ _audit_run_id }}]
+        -------------------------------------------------------------------------
+          HOST/SID                  TYPE         OWNER/TS             OBJECT                              ENC       ALGORITHM
+        {{ _email_detail_security }}
+        {% endif %}
+        {% if collect_inmemory | default(true) | bool %}
+        -------------------------------------------------------------------------
+         IN-MEMORY DATABASE -- OBJECT LIST  [ORACLE_OPT_D_INMEM, RUN_ID={{ _audit_run_id }}]
+        -------------------------------------------------------------------------
+          HOST/SID                  OWNER           TABLE                        PRIORITY        COMPRESSION          SIZE_GB
+        {{ _email_detail_inmem }}
+        {% endif %}
+        {% if collect_pdbs | default(true) | bool %}
+        -------------------------------------------------------------------------
+         MULTITENANT / PDB LIST  [ORACLE_OPT_D_PDB, RUN_ID={{ _audit_run_id }}]
+        -------------------------------------------------------------------------
+          HOST/SID                  CON_ID PDB_NAME             OPEN_MODE    REST CREATED
+        {{ _email_detail_pdb }}
+        {% endif %}
+        {% if collect_adg | default(true) | bool %}
+        -------------------------------------------------------------------------
+         ACTIVE DATA GUARD  [ORACLE_OPT_D_ADG, RUN_ID={{ _audit_run_id }}]
+        -------------------------------------------------------------------------
+          HOST/SID                  DB_UNIQUE_NAME            DB_ROLE      OPEN_MODE    FAL_SERVER           APPLIED_SCN
+        {{ _email_detail_adg }}
+        {% endif %}
+        {% if collect_rac | default(true) | bool %}
+        -------------------------------------------------------------------------
+         REAL APPLICATION CLUSTERS  [ORACLE_OPT_D_RAC, RUN_ID={{ _audit_run_id }}]
+        -------------------------------------------------------------------------
+          HOST/SID                  INST_ID INSTANCE_NAME        NODE_HOST                STATUS
+        {{ _email_detail_rac }}
+        {% endif %}
+        -------------------------------------------------------------------------
+         INSTANCE SUMMARY
+        -------------------------------------------------------------------------
+          {{ 'HOSTNAME'.ljust(30) }} {{ 'SID'.ljust(12) }} {{ 'VERSION'.ljust(20) }} STATUS
+        {{ _email_inst_rows }}
+
+        =========================================================================
+         Repository : {{ repo_host }}:{{ repo_port }}/{{ repo_sid }}  |  RUN_ID = {{ _audit_run_id }}
+         Schema     : {{ repo_schema | upper }}
+        =========================================================================
+    delegate_to: localhost
+    become: no
+    run_once: true
+    when: _audit_run_id | default('0') != '0'

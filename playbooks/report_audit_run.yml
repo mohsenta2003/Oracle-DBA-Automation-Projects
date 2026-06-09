@@ -1,0 +1,2353 @@
+---
+# playbooks/report_audit_run.yml
+#
+# Generate and email the Oracle Options Audit report from an EXISTING run
+# stored in the central DB — WITHOUT re-running against any Oracle hosts.
+#
+# Usage:
+#   ansible-playbook playbooks/report_audit_run.yml -i ansibleInventory/inv_key.yml
+#   ansible-playbook playbooks/report_audit_run.yml -i ansibleInventory/inv_key.yml -e "report_run_id=22"
+#   ansible-playbook playbooks/report_audit_run.yml -i ansibleInventory/inv_key.yml -e "report_run_id=22 send_summary_email=true"
+#   ansible-playbook playbooks/report_audit_run.yml -i ansibleInventory/inv_key.yml -e "list_runs_only=true"
+
+- name: Oracle Options Audit — Report from DB
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  become: no
+  
+  vars_files:
+    - ../vars/repo_config.yml
+  
+  vars:
+    report_run_id:             ""     # Specify exact RUN_ID(s), comma-separated. Leave empty for auto-detect.
+    list_runs_only:            false
+    send_summary_email:        true
+    email_skip_empty_sections: false
+    smtp_port:  25
+
+    # Import the same option list used during collection to ensure name matching works
+    # This list must match what's stored in ORACLE_OPT_VOPTION.OPTION_NAME
+    ee_extra_options:
+      - "Real Application Clusters"
+      - "RAC"
+      - "Real Application Clusters One Node"
+      - "Active Data Guard"
+      - "Active Data Guard - Real-Time Query"
+      - "GoldenGate"
+      - "Multitenant"
+      - "Partitioning"
+      - "Advanced Compression"
+      - "Advanced Security"
+      - "Advanced Security Option"
+      - "Label Security"
+      - "Database Vault"
+      - "Oracle Database Vault"
+      - "In-Memory Column Store"
+      - "In-Memory Database Cache"
+      - "OLAP"
+      - "Oracle OLAP"
+      - "Data Mining"
+      - "Oracle Data Mining"
+      - "Advanced Analytics"
+      - "Oracle Advanced Analytics"
+      - "Spatial"
+      - "Spatial and Graph"
+      - "Real Application Testing"
+      - "Database Replay"
+      - "SQL Performance Analyzer"
+      - "Diagnostics Pack"
+      - "Tuning Pack"
+      - "Database Lifecycle Management Pack"
+      - "Data Masking and Subsetting Pack"
+      - "Data Masking Pack"
+      - "Cloud Management Pack for Oracle Database"
+      - "Change Management Pack"
+      - "Configuration Management Pack"
+      - "Provisioning and Patch Automation Pack"
+
+    _conn: "{{ repo_tns_alias if (repo_tns_alias | default('')) else '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=' ~ repo_host ~ ')(PORT=' ~ repo_port ~ '))(CONNECT_DATA=(SID=' ~ repo_sid ~ ')))' }}"
+
+  tasks:
+
+    - name: Define newline helper
+      ansible.builtin.set_fact:
+        _nl: "\n"
+
+    # ── List available runs ────────────────────────────────────────────────────
+    - name: List available runs in DB
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING ON FEEDBACK OFF PAGESIZE 50 LINESIZE 120
+          SET COLSEP '|'
+          COLUMN RUN_ID    FORMAT 9999
+          COLUMN RUN_LABEL FORMAT A40
+          COLUMN RUN_DATE  FORMAT A20
+          COLUMN HOSTS     FORMAT 9999
+          COLUMN INSTANCES FORMAT 9999
+          SELECT RUN_ID,
+                 SUBSTR(RUN_LABEL,1,40) AS RUN_LABEL,
+                 TO_CHAR(RUN_DATE,'YYYY-MM-DD HH24:MI') AS RUN_DATE,
+                 TOTAL_HOSTS AS HOSTS,
+                 TOTAL_INSTANCES AS INSTANCES
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS
+          ORDER BY RUN_ID DESC
+          FETCH FIRST 20 ROWS ONLY;
+          EXIT;
+          EOSQL
+      register: _run_list
+      changed_when: false
+
+    - name: Show available runs
+      ansible.builtin.debug:
+        msg: "{{ _run_list.stdout_lines }}"
+
+    - name: Stop here if list_runs_only
+      ansible.builtin.meta: end_play
+      when: list_runs_only | bool
+
+    # ── Resolve RUN_ID(s) ──────────────────────────────────────────────────────
+    # DEFAULT: Show ALL hosts with their individual latest RUN_ID (per-host latest)
+    # OVERRIDE: Use specific report_run_id if provided
+    
+    - name: Resolve all hosts with their latest RUN_ID (DEFAULT - per-host latest)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          SELECT LISTAGG(DISTINCT run_id, ',') WITHIN GROUP (ORDER BY run_id)
+          FROM (
+            SELECT i.hostname, MAX(i.run_id) AS run_id
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i
+            GROUP BY i.hostname
+          );
+          EXIT;
+          EOSQL
+      register: _all_hosts_runs
+      changed_when: false
+      when: report_run_id == ""
+
+    - name: Set effective RUN_ID(s)
+      ansible.builtin.set_fact:
+        _eff_run_id: >-
+          {%- if report_run_id != '' -%}
+            {{ report_run_id }}
+          {%- else -%}
+            {{ _all_hosts_runs.stdout | default('') | trim }}
+          {%- endif -%}
+        _report_mode: >-
+          {%- if report_run_id != '' -%}
+            specific
+          {%- else -%}
+            all_hosts
+          {%- endif -%}
+
+    - name: Fail if no runs found
+      ansible.builtin.fail:
+        msg: "No runs found in {{ repo_schema | upper }}.ORACLE_OPT_RUNS. Run the audit first."
+      when: _eff_run_id == "" or _eff_run_id == "None"
+
+    - name: Show selected RUN_ID(s)
+      ansible.builtin.debug:
+        msg: >-
+          {%- if _report_mode == 'all_hosts' -%}
+          Generating report for ALL HOSTS (each host's latest individual audit) — RUN_IDs: {{ _eff_run_id }}
+          {%- elif _report_mode == 'specific' -%}
+          Generating report for specific RUN_ID(s): {{ _eff_run_id }}
+          {%- endif -%}
+
+    # ── Fetch run header ───────────────────────────────────────────────────────
+    - name: Fetch run header (all hosts mode - per-host latest)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400
+          WITH host_latest_run AS (
+            SELECT i.hostname, MAX(i.run_id) AS run_id
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i
+            WHERE i.run_id IN ({{ _eff_run_id }})
+            GROUP BY i.hostname
+          ),
+          run_summary AS (
+            SELECT
+              r.run_id,
+              r.run_label,
+              r.run_date,
+              COUNT(DISTINCT hlr.hostname) AS host_count,
+              COUNT(DISTINCT i.hostname || '|' || i.sid) AS instance_count,
+              COUNT(CASE WHEN i.is_standby = 'Y' THEN 1 END) AS standby_count,
+              COUNT(CASE WHEN i.was_queried = 'N' AND i.is_standby = 'N' THEN 1 END) AS skipped_count
+            FROM host_latest_run hlr
+            JOIN {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i ON i.hostname = hlr.hostname AND i.run_id = hlr.run_id
+            JOIN {{ repo_schema | upper }}.ORACLE_OPT_RUNS r ON r.run_id = hlr.run_id
+            GROUP BY r.run_id, r.run_label, r.run_date
+          )
+          SELECT
+            NVL(LISTAGG(run_id, ',') WITHIN GROUP (ORDER BY run_id), '') || '|' ||
+            NVL(LISTAGG(SUBSTR(run_label,1,30), '; ') WITHIN GROUP (ORDER BY run_id), '') || '|' ||
+            NVL(TO_CHAR(MIN(run_date),'YYYY-MM-DD'), '') || '|' ||
+            NVL(TO_CHAR(SUM(host_count)), '0') || '|' ||
+            NVL(TO_CHAR(SUM(instance_count)), '0') || '|' ||
+            NVL(TO_CHAR(SUM(standby_count)), '0') || '|' ||
+            NVL(TO_CHAR(SUM(skipped_count)), '0')
+          FROM run_summary;
+          EXIT;
+          EOSQL
+      register: _run_hdr_raw
+      changed_when: false
+      when: _report_mode == 'all_hosts'
+
+    - name: Fetch run header (specific mode only)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400
+          WITH run_summary AS (
+            SELECT
+              r.run_id,
+              r.run_label,
+              r.run_date,
+              r.total_hosts,
+              r.total_instances,
+              COUNT(CASE WHEN i.is_standby = 'Y' THEN 1 END) AS standby_count,
+              COUNT(CASE WHEN i.was_queried = 'N' AND i.is_standby = 'N' THEN 1 END) AS skipped_count
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS r
+            LEFT JOIN {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i ON i.run_id = r.run_id
+            WHERE r.run_id IN ({{ _eff_run_id }})
+            GROUP BY r.run_id, r.run_label, r.run_date, r.total_hosts, r.total_instances
+          )
+          SELECT
+            NVL(LISTAGG(run_id, ',') WITHIN GROUP (ORDER BY run_id), '') || '|' ||
+            NVL(LISTAGG(SUBSTR(run_label,1,30), '; ') WITHIN GROUP (ORDER BY run_id), '') || '|' ||
+            NVL(TO_CHAR(MIN(run_date),'YYYY-MM-DD'), '') || '|' ||
+            NVL(TO_CHAR(SUM(NVL(total_hosts,0))), '0') || '|' ||
+            NVL(TO_CHAR(SUM(NVL(total_instances,0))), '0') || '|' ||
+            NVL(TO_CHAR(SUM(standby_count)), '0') || '|' ||
+            NVL(TO_CHAR(SUM(skipped_count)), '0')
+          FROM run_summary;
+          EXIT;
+          EOSQL
+      register: _run_hdr_raw_specific
+      changed_when: false
+      when: _report_mode == 'specific'
+
+    - name: Set run header variable
+      ansible.builtin.set_fact:
+        _run_hdr_raw: "{{ _run_hdr_raw_specific }}"
+      when: _report_mode == 'specific'
+
+    - name: Debug run header output
+      ansible.builtin.debug:
+        msg: "Run header SQL output: '{{ _run_hdr_raw.stdout | trim }}'"
+      when: _run_hdr_raw is defined and _run_hdr_raw.stdout is defined
+
+    - name: Parse run header
+      ansible.builtin.set_fact:
+        _rpt_run_id:  "{{ (_run_hdr_raw.stdout | trim).split('|')[0] }}"
+        _rpt_label:   "{{ (_run_hdr_raw.stdout | trim).split('|')[1] }}"
+        _rpt_date:    "{{ (_run_hdr_raw.stdout | trim).split('|')[2] }}"
+        _rpt_hosts:   "{{ (_run_hdr_raw.stdout | trim).split('|')[3] }}"
+        _rpt_queried: "{{ (_run_hdr_raw.stdout | trim).split('|')[4] }}"
+        _rpt_standby: "{{ (_run_hdr_raw.stdout | trim).split('|')[5] }}"
+        _rpt_skipped: "{{ (_run_hdr_raw.stdout | trim).split('|')[6] }}"
+        _report_timestamp: "{{ lookup('pipe', 'date +%Y-%m-%d_%H-%M-%S') }}"
+
+    # ── Fetch platform breakdown (for multi-platform reports) ─────────────────
+    - name: Fetch platform breakdown (all hosts mode - per-host latest)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400
+          WITH host_latest_run AS (
+            SELECT i.hostname, MAX(i.run_id) AS run_id
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i
+            WHERE i.run_id IN ({{ _eff_run_id }})
+            GROUP BY i.hostname
+          )
+          SELECT
+            CASE
+              WHEN UPPER(i.os_type) = 'AIX' THEN 'AIX'
+              WHEN UPPER(i.os_type) LIKE '%LINUX%' AND UPPER(i.region) LIKE '%EU%' THEN 'EU-Linux'
+              WHEN UPPER(i.os_type) LIKE '%LINUX%' THEN 'US-Linux'
+              ELSE 'Other'
+            END || '|' ||
+            CASE
+              WHEN UPPER(i.hostname) LIKE 'CRLNXP%' OR UPPER(i.hostname) LIKE 'UKLNXP%' 
+                   OR UPPER(i.hostname) LIKE 'UKAIXP%' OR UPPER(i.hostname) LIKE 'DCUP%' 
+                   OR UPPER(i.hostname) LIKE 'CRANXP%' OR UPPER(i.hostname) LIKE 'IP-%' THEN 'Production'
+              WHEN UPPER(i.hostname) LIKE 'CRLNXM%' THEN 'Model'
+              WHEN UPPER(i.hostname) LIKE 'CRLNXT%' OR UPPER(i.hostname) LIKE 'CRLNXD%' 
+                   OR UPPER(i.hostname) LIKE 'UKLNXT%' OR UPPER(i.hostname) LIKE 'UKAIXT%' 
+                   OR UPPER(i.hostname) LIKE 'DCUNX%' THEN 'Test-Dev'
+              ELSE 'Other'
+            END || '|' ||
+            TO_CHAR(MAX(hlr.run_id)) || '|' ||
+            TO_CHAR(MAX(r.run_date), 'YYYY-MM-DD HH24:MI') || '|' ||
+            TO_CHAR(COUNT(DISTINCT i.hostname)) || '|' ||
+            TO_CHAR(COUNT(DISTINCT i.sid)) AS platform_info
+          FROM host_latest_run hlr
+          JOIN {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i ON i.hostname = hlr.hostname AND i.run_id = hlr.run_id
+          JOIN {{ repo_schema | upper }}.ORACLE_OPT_RUNS r ON r.run_id = hlr.run_id
+          GROUP BY
+            CASE
+              WHEN UPPER(i.os_type) = 'AIX' THEN 'AIX'
+              WHEN UPPER(i.os_type) LIKE '%LINUX%' AND UPPER(i.region) LIKE '%EU%' THEN 'EU-Linux'
+              WHEN UPPER(i.os_type) LIKE '%LINUX%' THEN 'US-Linux'
+              ELSE 'Other'
+            END,
+            CASE
+              WHEN UPPER(i.hostname) LIKE 'CRLNXP%' OR UPPER(i.hostname) LIKE 'UKLNXP%' 
+                   OR UPPER(i.hostname) LIKE 'UKAIXP%' OR UPPER(i.hostname) LIKE 'DCUP%' 
+                   OR UPPER(i.hostname) LIKE 'CRANXP%' OR UPPER(i.hostname) LIKE 'IP-%' THEN 'Production'
+              WHEN UPPER(i.hostname) LIKE 'CRLNXM%' THEN 'Model'
+              WHEN UPPER(i.hostname) LIKE 'CRLNXT%' OR UPPER(i.hostname) LIKE 'CRLNXD%' 
+                   OR UPPER(i.hostname) LIKE 'UKLNXT%' OR UPPER(i.hostname) LIKE 'UKAIXT%' 
+                   OR UPPER(i.hostname) LIKE 'DCUNX%' THEN 'Test-Dev'
+              ELSE 'Other'
+            END
+          ORDER BY 1, 2;
+          EXIT;
+          EOSQL
+      register: _platform_breakdown_raw
+      changed_when: false
+      when: _report_mode == 'all_hosts'
+
+    - name: Fetch platform breakdown
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400
+          SELECT
+            CASE
+              WHEN UPPER(i.os_type) = 'AIX' THEN 'AIX'
+              WHEN UPPER(i.os_type) LIKE '%LINUX%' AND UPPER(i.region) LIKE '%EU%' THEN 'EU-Linux'
+              WHEN UPPER(i.os_type) LIKE '%LINUX%' THEN 'US-Linux'
+              ELSE 'Other'
+            END || '|' ||
+            TO_CHAR(i.run_id) || '|' ||
+            TO_CHAR(r.run_date, 'YYYY-MM-DD HH24:MI') || '|' ||
+            TO_CHAR(COUNT(DISTINCT i.hostname)) || '|' ||
+            TO_CHAR(COUNT(DISTINCT i.sid)) AS platform_info
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i
+          JOIN {{ repo_schema | upper }}.ORACLE_OPT_RUNS r ON r.run_id = i.run_id
+          WHERE i.RUN_ID IN ({{ _eff_run_id }})
+          GROUP BY
+            CASE
+              WHEN UPPER(i.os_type) = 'AIX' THEN 'AIX'
+              WHEN UPPER(i.os_type) LIKE '%LINUX%' AND UPPER(i.region) LIKE '%EU%' THEN 'EU-Linux'
+              WHEN UPPER(i.os_type) LIKE '%LINUX%' THEN 'US-Linux'
+              ELSE 'Other'
+            END,
+            i.run_id,
+            TO_CHAR(r.run_date, 'YYYY-MM-DD HH24:MI')
+          ORDER BY platform_type;
+          EXIT;
+          EOSQL
+      register: _platform_breakdown_raw
+      changed_when: false
+      when: _report_mode != 'all_hosts'
+
+    # ── Fetch all distinct hosts with audit status ────────────────────────────
+    - name: Fetch all hosts with latest audit status (all hosts mode)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500 WRAP OFF TRIMSPOOL ON
+          WITH host_latest_run AS (
+            SELECT i.hostname, MAX(i.run_id) AS run_id
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i
+            WHERE i.run_id IN ({{ _eff_run_id }})
+            GROUP BY i.hostname
+          ),
+          host_summary AS (
+            SELECT
+              i.hostname,
+              hlr.run_id,
+              CASE
+                WHEN UPPER(i.os_type) = 'AIX' THEN 'AIX'
+                WHEN UPPER(i.os_type) LIKE '%LINUX%' AND UPPER(i.region) LIKE '%EU%' THEN 'EU-Linux'
+                WHEN UPPER(i.os_type) LIKE '%LINUX%' THEN 'US-Linux'
+                ELSE 'Other'
+              END AS platform_type,
+              CASE
+                WHEN UPPER(i.hostname) LIKE 'CRLNXP%' OR UPPER(i.hostname) LIKE 'UKLNXP%' 
+                     OR UPPER(i.hostname) LIKE 'UKAIXP%' OR UPPER(i.hostname) LIKE 'DCUP%' 
+                     OR UPPER(i.hostname) LIKE 'CRANXP%' OR UPPER(i.hostname) LIKE 'IP-%' THEN 'Production'
+                WHEN UPPER(i.hostname) LIKE 'CRLNXM%' THEN 'Model'
+                WHEN UPPER(i.hostname) LIKE 'CRLNXT%' OR UPPER(i.hostname) LIKE 'CRLNXD%' 
+                     OR UPPER(i.hostname) LIKE 'UKLNXT%' OR UPPER(i.hostname) LIKE 'UKAIXT%' 
+                     OR UPPER(i.hostname) LIKE 'DCUNX%' THEN 'Test-Dev'
+                ELSE 'Other'
+              END AS environment,
+              NVL(i.region, 'US') AS region,
+              MAX(r.run_date) AS latest_audit_date,
+              COUNT(DISTINCT i.sid) AS instance_count,
+              COUNT(CASE WHEN i.is_standby = 'Y' THEN 1 END) AS standby_count
+            FROM host_latest_run hlr
+            JOIN {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i ON i.hostname = hlr.hostname AND i.run_id = hlr.run_id
+            JOIN {{ repo_schema | upper }}.ORACLE_OPT_RUNS r ON r.run_id = hlr.run_id
+            GROUP BY i.hostname, hlr.run_id,
+              CASE
+                WHEN UPPER(i.os_type) = 'AIX' THEN 'AIX'
+                WHEN UPPER(i.os_type) LIKE '%LINUX%' AND UPPER(i.region) LIKE '%EU%' THEN 'EU-Linux'
+                WHEN UPPER(i.os_type) LIKE '%LINUX%' THEN 'US-Linux'
+                ELSE 'Other'
+              END,
+              CASE
+                WHEN UPPER(i.hostname) LIKE 'CRLNXP%' OR UPPER(i.hostname) LIKE 'UKLNXP%' 
+                     OR UPPER(i.hostname) LIKE 'UKAIXP%' OR UPPER(i.hostname) LIKE 'DCUP%' 
+                     OR UPPER(i.hostname) LIKE 'CRANXP%' OR UPPER(i.hostname) LIKE 'IP-%' THEN 'Production'
+                WHEN UPPER(i.hostname) LIKE 'CRLNXM%' THEN 'Model'
+                WHEN UPPER(i.hostname) LIKE 'CRLNXT%' OR UPPER(i.hostname) LIKE 'CRLNXD%' 
+                     OR UPPER(i.hostname) LIKE 'UKLNXT%' OR UPPER(i.hostname) LIKE 'UKAIXT%' 
+                     OR UPPER(i.hostname) LIKE 'DCUNX%' THEN 'Test-Dev'
+                ELSE 'Other'
+              END,
+              NVL(i.region, 'US')
+          ),
+          host_licenses AS (
+            SELECT
+              v.hostname,
+              LISTAGG(DISTINCT CASE WHEN v.IS_INUSE = 'Y' THEN v.OPTION_NAME END, '; ') WITHIN GROUP (ORDER BY v.OPTION_NAME) AS licensed_options_inuse
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_VOPTION v
+            JOIN host_latest_run hlr ON hlr.hostname = v.hostname AND hlr.run_id = v.run_id
+            WHERE v.IS_EE_EXTRA = 'Y'
+            GROUP BY v.hostname
+          )
+          SELECT
+            hs.platform_type || '|' ||
+            hs.environment || '|' ||
+            hs.region || '|' ||
+            hs.hostname || '|' ||
+            TO_CHAR(hs.run_id) || '|' ||
+            TO_CHAR(hs.latest_audit_date, 'YYYY-MM-DD HH24:MI') || '|' ||
+            TO_CHAR(hs.instance_count) || '|' ||
+            TO_CHAR(hs.standby_count) || '|' ||
+            NVL(hl.licensed_options_inuse, 'None')
+          FROM host_summary hs
+          LEFT JOIN host_licenses hl ON hl.hostname = hs.hostname
+          ORDER BY hs.platform_type, hs.environment, hs.region, hs.hostname;
+          EXIT;
+          EOSQL
+      register: _all_hosts_status_raw
+      changed_when: false
+      when: _report_mode == 'all_hosts'
+
+    # ── Fetch EE license statistics for email summary ─────────────────────────
+    - name: Fetch overall EE license statistics (all hosts mode)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 WRAP OFF TRIMSPOOL ON
+          WITH host_latest_run AS (
+            SELECT i.hostname, MAX(i.run_id) AS run_id
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i
+            WHERE i.run_id IN ({{ _eff_run_id }})
+            GROUP BY i.hostname
+          ),
+          historical_usage AS (
+            SELECT 
+              vh.hostname,
+              vh.sid,
+              vh.option_name,
+              MAX(CASE WHEN vh.is_inuse = 'Y' THEN 1 ELSE 0 END) AS ever_used
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_VOPTION vh
+            WHERE vh.is_ee_extra = 'Y'
+            GROUP BY vh.hostname, vh.sid, vh.option_name
+          ),
+          option_stats AS (
+            SELECT
+              v.OPTION_NAME,
+              COUNT(DISTINCT CASE WHEN v.OPTION_ENABLED = 'TRUE' THEN v.HOSTNAME || '|' || v.SID END) AS enabled_instances,
+              COUNT(DISTINCT CASE WHEN v.IS_INUSE = 'Y' THEN v.HOSTNAME || '|' || v.SID END) AS inuse_instances,
+              COUNT(DISTINCT CASE WHEN v.OPTION_ENABLED = 'TRUE' THEN v.HOSTNAME END) AS enabled_hosts,
+              COUNT(DISTINCT CASE WHEN v.IS_INUSE = 'Y' THEN v.HOSTNAME END) AS inuse_hosts,
+              COUNT(DISTINCT CASE WHEN h.ever_used = 1 THEN v.HOSTNAME || '|' || v.SID END) AS ever_used_instances,
+              COUNT(DISTINCT CASE WHEN h.ever_used = 1 THEN v.HOSTNAME END) AS ever_used_hosts
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_VOPTION v
+            JOIN host_latest_run hlr ON hlr.hostname = v.HOSTNAME AND hlr.run_id = v.RUN_ID
+            LEFT JOIN historical_usage h ON h.hostname = v.HOSTNAME AND h.sid = v.SID AND h.option_name = v.OPTION_NAME
+            WHERE v.IS_EE_EXTRA = 'Y'
+            GROUP BY v.OPTION_NAME
+          )
+          SELECT
+            OPTION_NAME || '|' ||
+            TO_CHAR(enabled_instances) || '|' ||
+            TO_CHAR(inuse_instances) || '|' ||
+            TO_CHAR(enabled_hosts) || '|' ||
+            TO_CHAR(inuse_hosts) || '|' ||
+            TO_CHAR(ever_used_instances) || '|' ||
+            TO_CHAR(ever_used_hosts)
+          FROM option_stats
+          WHERE enabled_instances > 0 OR inuse_instances > 0 OR ever_used_instances > 0
+          ORDER BY inuse_instances DESC, ever_used_instances DESC, enabled_instances DESC, OPTION_NAME;
+          EXIT;
+          EOSQL
+      register: _ee_license_stats_raw
+      changed_when: false
+      when: _report_mode == 'all_hosts'
+
+    # ── Fetch v$option / EE summary ───────────────────────────────────────────
+    - name: Fetch voption rows from DB (all hosts mode - per-host latest)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500 WRAP OFF TRIMSPOOL ON
+          WITH host_latest_run AS (
+            SELECT i.hostname, MAX(i.run_id) AS run_id
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i
+            WHERE i.run_id IN ({{ _eff_run_id }})
+            GROUP BY i.hostname
+          ),
+          historical_usage AS (
+            SELECT 
+              vh.hostname,
+              vh.sid,
+              vh.option_name,
+              MAX(CASE WHEN vh.is_inuse = 'Y' THEN 1 ELSE 0 END) AS ever_used,
+              MAX(CASE WHEN vh.is_inuse = 'Y' THEN r.run_date END) AS last_used_date
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_VOPTION vh
+            JOIN {{ repo_schema | upper }}.ORACLE_OPT_RUNS r ON r.run_id = vh.run_id
+            WHERE vh.is_ee_extra = 'Y'
+            GROUP BY vh.hostname, vh.sid, vh.option_name
+          ),
+          voption_with_instance AS (
+            SELECT 
+              v.option_name,
+              v.hostname,
+              v.sid,
+              v.option_enabled,
+              v.is_inuse,
+              v.run_id,
+              i.os_type,
+              i.region
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_VOPTION v
+            JOIN host_latest_run hlr ON hlr.hostname = v.hostname AND hlr.run_id = v.run_id
+            JOIN {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i ON i.hostname = hlr.hostname AND i.run_id = hlr.run_id AND i.sid = v.sid
+            WHERE v.is_ee_extra = 'Y'
+          )
+          SELECT 
+            vi.option_name || '|' ||
+            vi.hostname || '|' ||
+            vi.sid || '|' ||
+            vi.option_enabled || '|' ||
+            vi.is_inuse || '|' ||
+            CASE
+              WHEN UPPER(vi.os_type) = 'AIX' THEN 'AIX'
+              WHEN UPPER(vi.os_type) LIKE '%LINUX%' AND UPPER(vi.region) LIKE '%EU%' THEN 'EU-Linux'
+              WHEN UPPER(vi.os_type) LIKE '%LINUX%' THEN 'US-Linux'
+              ELSE 'Other'
+            END || '|' ||
+            CASE
+              WHEN UPPER(vi.hostname) LIKE 'CRLNXP%' OR UPPER(vi.hostname) LIKE 'UKLNXP%' 
+                   OR UPPER(vi.hostname) LIKE 'UKAIXP%' OR UPPER(vi.hostname) LIKE 'DCUP%' 
+                   OR UPPER(vi.hostname) LIKE 'CRANXP%' OR UPPER(vi.hostname) LIKE 'IP-%' THEN 'Production'
+              WHEN UPPER(vi.hostname) LIKE 'CRLNXM%' THEN 'Model'
+              WHEN UPPER(vi.hostname) LIKE 'CRLNXT%' OR UPPER(vi.hostname) LIKE 'CRLNXD%' 
+                   OR UPPER(vi.hostname) LIKE 'UKLNXT%' OR UPPER(vi.hostname) LIKE 'UKAIXT%' 
+                   OR UPPER(vi.hostname) LIKE 'DCUNX%' THEN 'Test-Dev'
+              ELSE 'Other'
+            END || '|' ||
+            NVL(TO_CHAR(h.ever_used), '0') || '|' ||
+            NVL(TO_CHAR(h.last_used_date, 'YYYY-MM-DD'), 'NEVER') AS result
+          FROM voption_with_instance vi
+          LEFT JOIN historical_usage h ON h.hostname = vi.hostname AND h.sid = vi.sid AND h.option_name = vi.option_name
+          ORDER BY vi.option_name, vi.is_inuse DESC, h.ever_used DESC, vi.hostname, vi.sid;
+          EXIT;
+          EOSQL
+      register: _voption_raw
+      changed_when: false
+      when: _report_mode == 'all_hosts'
+
+    - name: Fetch voption rows from DB (with platform info)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500 WRAP OFF TRIMSPOOL ON
+          WITH historical_usage AS (
+            SELECT 
+              vh.hostname,
+              vh.sid,
+              vh.option_name,
+              MAX(CASE WHEN vh.is_inuse = 'Y' THEN 1 ELSE 0 END) AS ever_used,
+              MAX(CASE WHEN vh.is_inuse = 'Y' THEN rh.run_date END) AS last_used_date
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_VOPTION vh
+            JOIN {{ repo_schema | upper }}.ORACLE_OPT_RUNS rh ON rh.run_id = vh.run_id
+            WHERE vh.run_id IN ({{ _eff_run_id }})
+            AND vh.is_ee_extra = 'Y'
+            GROUP BY vh.hostname, vh.sid, vh.option_name
+          )
+          SELECT v.option_name || '|' ||
+                 v.hostname || '|' ||
+                 v.sid || '|' ||
+                 MAX(v.option_enabled) || '|' ||
+                 MAX(v.is_inuse) || '|' ||
+                 MAX(CASE
+                   WHEN UPPER(i.os_type) = 'AIX' THEN 'AIX'
+                   WHEN UPPER(i.os_type) LIKE '%LINUX%' AND UPPER(i.region) LIKE '%EU%' THEN 'EU-Linux'
+                   WHEN UPPER(i.os_type) LIKE '%LINUX%' THEN 'US-Linux'
+                   ELSE 'Other'
+                 END) || '|' ||
+                 MAX(CASE
+                   WHEN UPPER(i.hostname) LIKE 'CRLNXP%' OR UPPER(i.hostname) LIKE 'UKLNXP%' 
+                        OR UPPER(i.hostname) LIKE 'UKAIXP%' OR UPPER(i.hostname) LIKE 'DCUP%' 
+                        OR UPPER(i.hostname) LIKE 'CRANXP%' OR UPPER(i.hostname) LIKE 'IP-%' THEN 'Production'
+                   WHEN UPPER(i.hostname) LIKE 'CRLNXM%' THEN 'Model'
+                   WHEN UPPER(i.hostname) LIKE 'CRLNXT%' OR UPPER(i.hostname) LIKE 'CRLNXD%' 
+                        OR UPPER(i.hostname) LIKE 'UKLNXT%' OR UPPER(i.hostname) LIKE 'UKAIXT%' 
+                        OR UPPER(i.hostname) LIKE 'DCUNX%' THEN 'Test-Dev'
+                   ELSE 'Other'
+                 END) || '|' ||
+                 MAX(h.ever_used) || '|' ||
+                 NVL(TO_CHAR(MAX(h.last_used_date), 'YYYY-MM-DD'), 'NEVER') AS result
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_VOPTION v
+          JOIN {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i
+            ON i.run_id = v.run_id AND i.hostname = v.hostname AND i.sid = v.sid
+          LEFT JOIN historical_usage h 
+            ON h.hostname = v.hostname AND h.sid = v.sid AND h.option_name = v.option_name
+          WHERE v.run_id IN ({{ _eff_run_id }})
+          AND   v.is_ee_extra = 'Y'
+          GROUP BY v.option_name, v.hostname, v.sid
+          ORDER BY v.option_name, MAX(v.is_inuse) DESC, MAX(h.ever_used) DESC, v.hostname, v.sid;
+          EXIT;
+          EOSQL
+      register: _voption_raw_specific
+      changed_when: false
+      when: _report_mode != 'all_hosts'
+
+    # ── Unify voption variable (copy specific mode result to main variable) ───
+    - name: Set unified _voption_raw variable from specific mode
+      ansible.builtin.set_fact:
+        _voption_raw: "{{ _voption_raw_specific }}"
+      when: _report_mode != 'all_hosts'
+
+    # ── DEBUG: Show what _voption_raw query returned ──────────────────────────
+    - name: DEBUG - Show _voption_raw query result stats
+      ansible.builtin.debug:
+        msg:
+          - "==== VOPTION RAW QUERY DIAGNOSTICS ===="
+          - "Query executed: {{ 'all_hosts' if _report_mode == 'all_hosts' else 'specific_run' }} mode"
+          - "Effective RUN_ID(s): {{ _eff_run_id }}"
+          - "Stdout defined: {{ _voption_raw.stdout is defined }}"
+          - "Stderr defined: {{ _voption_raw.stderr is defined }}"
+          - "Return code: {{ _voption_raw.rc | default('N/A') }}"
+          - "Stdout length: {{ (_voption_raw.stdout | default('') | length) }} characters"
+          - "Stderr length: {{ (_voption_raw.stderr | default('') | length) }} characters"
+          - "Line count: {{ (_voption_raw.stdout | default('') | trim).split('\n') | length }}"
+          - "First 5 lines of stdout:"
+          - "{{ (_voption_raw.stdout | default('NO DATA') | trim).split('\n')[:5] | join('\n  ') }}"
+          - "Stderr content:"
+          - "{{ _voption_raw.stderr | default('NO STDERR') }}"
+          - "======================================="
+      when: _voption_raw is defined
+
+    - name: Build EE options plain-text table (categorized by platform)
+      ansible.builtin.set_fact:
+        _rpt_ee_table: >-
+          {%- set vopts = [] -%}
+          {%- set unique_instances = [] -%}
+          {%- for line in (_voption_raw.stdout | default('') | trim).split('\n') -%}
+            {%- if '|' in line -%}
+              {%- set p = line.split('|') -%}
+              {%- if p | length >= 9 -%}
+                {%- set _ = vopts.append({'name': p[0]|trim, 'host': p[1]|trim, 'sid': p[2]|trim, 'enabled': p[3]|trim, 'inuse': p[4]|trim, 'platform': p[5]|trim, 'environment': p[6]|trim, 'ever_used': p[7]|trim, 'last_used_date': p[8]|trim}) -%}
+                {%- set inst_key = p[1]|trim ~ '|' ~ p[2]|trim -%}
+                {%- if inst_key not in unique_instances -%}
+                  {%- set _ = unique_instances.append(inst_key) -%}
+                {%- endif -%}
+              {%- elif p | length >= 7 -%}
+                {%- set _ = vopts.append({'name': p[0]|trim, 'host': p[1]|trim, 'sid': p[2]|trim, 'enabled': p[3]|trim, 'inuse': p[4]|trim, 'platform': p[5]|trim, 'environment': p[6]|trim, 'ever_used': '0', 'last_used_date': 'NEVER'}) -%}
+                {%- set inst_key = p[1]|trim ~ '|' ~ p[2]|trim -%}
+                {%- if inst_key not in unique_instances -%}
+                  {%- set _ = unique_instances.append(inst_key) -%}
+                {%- endif -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- set n = unique_instances | length -%}
+          {%- set platforms = vopts | map(attribute='platform') | unique | list | sort -%}
+          {%- set rows = [] -%}
+          {%- for opt_name in ee_extra_options -%}
+            {%- set opt_vopts = [] -%}
+            {%- for o in vopts -%}
+              {%- if o.name == opt_name or (o.name | upper) == (opt_name | upper) -%}
+                {%- set _ = opt_vopts.append(o) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- if opt_vopts | length > 0 -%}
+              {%- set en_tot = namespace(v=0) -%}{%- set iu_tot = namespace(v=0) -%}{%- set ev_tot = namespace(v=0) -%}
+              {%- set en_list = [] -%}{%- set iu_list = [] -%}{%- set ev_list = [] -%}
+              {%- for o in opt_vopts -%}
+                {%- set inst_key = o.host ~ '|' ~ o.sid -%}
+                {%- if (o.enabled | upper in ['TRUE', 'Y', '1']) and inst_key not in en_list -%}{%- set en_tot.v = en_tot.v + 1 -%}{%- set _ = en_list.append(inst_key) -%}{%- endif -%}
+                {%- if (o.inuse | upper in ['Y', 'TRUE', '1']) and inst_key not in iu_list -%}{%- set iu_tot.v = iu_tot.v + 1 -%}{%- set _ = iu_list.append(inst_key) -%}{%- endif -%}
+                {%- if (o.ever_used | string in ['1', 'Y', 'TRUE']) and inst_key not in ev_list -%}{%- set ev_tot.v = ev_tot.v + 1 -%}{%- set _ = ev_list.append(inst_key) -%}{%- endif -%}
+              {%- endfor -%}
+              {%- if iu_tot.v > 0 -%}{%- set risk = '!! RISK' -%}
+              {%- elif en_tot.v > 0 and ev_tot.v > 0 -%}{%- set risk = '!! WARN' -%}
+              {%- elif en_tot.v > 0 -%}{%- set risk = '~~ INFO' -%}
+              {%- elif ev_tot.v > 0 -%}{%- set risk = '~~ CHK' -%}
+              {%- else -%}{%- set risk = '' -%}{%- endif -%}
+              {%- if risk != '' -%}
+                {%- set _ = rows.append('') -%}
+                {%- set _ = rows.append(risk ~ ' ' ~ opt_name ~ ' (enabled=' ~ en_tot.v ~ '/' ~ n ~ ' in-use=' ~ iu_tot.v ~ '/' ~ n ~ ' ever-used=' ~ ev_tot.v ~ ')') -%}
+                {%- set _ = rows.append('-' * 130) -%}
+                {%- for platform in platforms -%}
+                  {%- set plat_instances = opt_vopts | selectattr('platform', 'equalto', platform) | list -%}
+                  {%- if plat_instances | length > 0 -%}
+                    {%- set _ = rows.append('  [' ~ platform ~ ']') -%}
+                    {%- for o in plat_instances -%}
+                      {%- if (o.enabled | upper in ['TRUE', 'Y', '1']) or (o.inuse | upper in ['Y', 'TRUE', '1']) or (o.ever_used | string in ['1', 'Y', 'TRUE']) -%}
+                        {%- set _ = rows.append('    %-12s %-28s %-14s  enabled=%-5s  now=%-3s  ever=%-3s  last_seen=%-12s' | format('[' ~ o.environment ~ ']', o.host, o.sid, o.enabled, o.inuse, o.ever_used, o.last_used_date)) -%}
+                      {%- endif -%}
+                    {%- endfor -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ rows | join(_nl) if rows | length > 0 else '  (no EE extra-cost options in-use or with historical usage)' }}
+
+    # ── DEBUG: Show parsed option counts ───────────────────────────────────────
+    - name: DEBUG - Show parsed voption counts per option  
+      ansible.builtin.debug:
+        msg:
+          - "==== PARSED VOPTION DATA SUMMARY ===="
+          - "EE table rows built: {{ (_rpt_ee_table | default('') | trim).split('\n') | length }}"
+          - "Options with RISK or CHK flags:"
+          - >-
+            {%- set vopts = [] -%}
+            {%- for line in (_voption_raw.stdout | default('') | trim).split('\n') -%}
+              {%- if '|' in line -%}{%- set p = line.split('|') -%}
+                {%- if p | length >= 7 -%}{%- set _ = vopts.append({'name': p[0]|trim, 'inuse': p[4]|trim | upper, 'enabled': p[3]|trim | upper}) -%}{%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- set option_names = vopts | map(attribute='name') | unique | list | sort -%}
+            {%- for opt in option_names -%}
+              {%- set opt_instances = [] -%}
+              {%- for v in vopts -%}
+                {%- if v.name == opt or (v.name | upper) == (opt | upper) -%}
+                  {%- set _ = opt_instances.append(v) -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {%- set enabled_count = opt_instances | selectattr('enabled','in',['TRUE','Y','1']) | list | length -%}
+              {%- set inuse_count = opt_instances | selectattr('inuse','in',['Y','TRUE','1']) | list | length -%}
+              {{ opt }}: {{ enabled_count }} enabled, {{ inuse_count }} in-use
+            {%- endfor -%}
+          - "======================================"
+      when: _voption_raw is defined
+
+    # ── Fetch instance summary ─────────────────────────────────────────────────
+    - name: Fetch instance rows from DB
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 WRAP OFF TRIMSPOOL ON
+          SELECT HOSTNAME || '|' ||
+                 SID || '|' ||
+                 NVL(ORACLE_VERSION,'') || '|' ||
+                 NVL(IS_STANDBY,'N') || '|' ||
+                 NVL(WAS_QUERIED,'Y') || '|' ||
+                 NVL(SKIP_REASON,'') || '|' ||
+                 NVL(DB_ROLE,'')
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES
+          WHERE RUN_ID IN ({{ _eff_run_id }})
+          ORDER BY HOSTNAME, SID;
+          EXIT;
+          EOSQL
+      register: _inst_raw
+      changed_when: false
+
+    - name: Build instance summary plain-text rows
+      ansible.builtin.set_fact:
+        _rpt_inst_rows: >-
+          {%- set rows = [] -%}
+          {%- for line in (_inst_raw.stdout | default('') | trim).split('\n') -%}
+            {%- if '|' in line -%}
+              {%- set p = line.split('|') -%}
+              {%- if p | length >= 4 -%}
+                {%- set hostname    = p[0]|trim -%}
+                {%- set sid         = p[1]|trim -%}
+                {%- set ver         = p[2]|trim -%}
+                {%- set standby     = p[3]|trim -%}
+                {%- set was_queried = p[4]|trim -%}
+                {%- set skipreason  = p[5]|trim -%}
+                {%- set role        = p[6]|trim -%}
+                {%- if standby == 'Y' -%}{%- set status = 'STANDBY' -%}
+                {%- elif was_queried == 'N' -%}{%- set status = 'SKIPPED' -%}
+                {%- else -%}{%- set status = 'OK' -%}
+                {%- endif -%}
+                {%- set _ = rows.append('  %-30s %-12s %-20s %-12s %s' | format(
+                    hostname, sid, ver, status, skipreason if was_queried == 'N' else role)) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ rows | join(_nl) }}
+
+    # ── Fetch detail tables ────────────────────────────────────────────────────
+    - name: Fetch D_PART rows from DB
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 WRAP OFF TRIMSPOOL ON
+          SELECT HOSTNAME || '|' || SID || '|' || OWNER || '|' || TABLE_NAME || '|' ||
+                 NVL(PART_TYPE,'') || '|' || NVL(PART_KEY,'') || '|' ||
+                 NVL(TO_CHAR(PART_COUNT),'') || '|' || NVL(TO_CHAR(SIZE_GB),'0')
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_D_PART
+          WHERE RUN_ID IN ({{ _eff_run_id }})
+          ORDER BY HOSTNAME, SID, OWNER, TABLE_NAME;
+          EXIT;
+          EOSQL
+      register: _part_raw
+      changed_when: false
+
+    - name: Fetch D_COMPRESS rows from DB
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 WRAP OFF TRIMSPOOL ON
+          SELECT HOSTNAME || '|' || SID || '|' || NVL(OWNER,'') || '|' ||
+                 OBJECT_NAME || '|' || NVL(OBJECT_TYPE,'') || '|' ||
+                 NVL(COMPRESS_FOR,'') || '|' || NVL(TO_CHAR(SIZE_GB),'0')
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_D_COMPRESS
+          WHERE RUN_ID IN ({{ _eff_run_id }})
+          ORDER BY HOSTNAME, SID, OWNER, OBJECT_NAME;
+          EXIT;
+          EOSQL
+      register: _compress_raw
+      changed_when: false
+
+    - name: Fetch D_SECURITY rows from DB
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 WRAP OFF TRIMSPOOL ON
+          SELECT HOSTNAME || '|' || SID || '|' || NVL(OBJECT_TYPE,'') || '|' ||
+                 NVL(OWNER_OR_TS,'') || '|' || NVL(OBJECT_NAME,'') || '|' ||
+                 NVL(ENCRYPTED,'') || '|' || NVL(ALGORITHM,'')
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_D_SECURITY
+          WHERE RUN_ID IN ({{ _eff_run_id }})
+          ORDER BY HOSTNAME, SID, OBJECT_TYPE, OWNER_OR_TS;
+          EXIT;
+          EOSQL
+      register: _security_raw
+      changed_when: false
+
+    - name: Fetch D_INMEM rows from DB
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 WRAP OFF TRIMSPOOL ON
+          SELECT HOSTNAME || '|' || SID || '|' || NVL(OWNER,'') || '|' ||
+                 NVL(TABLE_NAME,'') || '|' || NVL(PRIORITY,'') || '|' ||
+                 NVL(COMPRESSION,'') || '|' || NVL(TO_CHAR(SIZE_GB),'0')
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_D_INMEM
+          WHERE RUN_ID IN ({{ _eff_run_id }})
+          ORDER BY HOSTNAME, SID, OWNER, TABLE_NAME;
+          EXIT;
+          EOSQL
+      register: _inmem_raw
+      changed_when: false
+
+    # In-Memory fallback: per-instance status from VOPTION when D_INMEM is empty
+    - name: Fetch In-Memory per-instance VOPTION data (fallback for empty D_INMEM)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 WRAP OFF TRIMSPOOL ON
+          WITH host_latest_run AS (
+            SELECT i.hostname, MAX(i.run_id) AS run_id
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i
+            WHERE i.run_id IN ({{ _eff_run_id }})
+            GROUP BY i.hostname
+          )
+          SELECT v.HOSTNAME || '|' || v.SID || '|' ||
+                 MAX(v.OPTION_ENABLED) || '|' ||
+                 MAX(v.IS_INUSE) || '|' ||
+                 MAX(i.ORACLE_VERSION) || '|' ||
+                 MAX(i.DB_ROLE) AS result
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_VOPTION v
+          JOIN host_latest_run hlr ON hlr.hostname = v.HOSTNAME AND hlr.run_id = v.RUN_ID
+          JOIN {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i
+            ON i.RUN_ID = v.RUN_ID AND i.HOSTNAME = v.HOSTNAME AND i.SID = v.SID
+          WHERE v.OPTION_NAME = 'In-Memory Column Store'
+          AND   (v.OPTION_ENABLED = 'TRUE' OR v.IS_INUSE = 'Y')
+          GROUP BY v.HOSTNAME, v.SID
+          ORDER BY MAX(v.IS_INUSE) DESC, v.HOSTNAME, v.SID;
+          EXIT;
+          EOSQL
+      register: _inmem_voption_raw
+      changed_when: false
+
+    - name: Fetch D_PDB rows from DB
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 WRAP OFF TRIMSPOOL ON
+          SELECT HOSTNAME || '|' || SID || '|' || NVL(TO_CHAR(CON_ID),'') || '|' ||
+                 NVL(PDB_NAME,'') || '|' || NVL(OPEN_MODE,'') || '|' ||
+                 NVL(RESTRICTED,'') || '|' || NVL(TO_CHAR(CREATION_DATE,'YYYY-MM-DD'),'')
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_D_PDB
+          WHERE RUN_ID IN ({{ _eff_run_id }})
+          ORDER BY HOSTNAME, SID, CON_ID;
+          EXIT;
+          EOSQL
+      register: _pdb_raw
+      changed_when: false
+
+    - name: Fetch D_ADG rows from DB
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 WRAP OFF TRIMSPOOL ON
+          SELECT HOSTNAME || '|' || SID || '|' || NVL(DB_UNIQUE_NAME,'') || '|' ||
+                 NVL(DB_ROLE,'') || '|' || NVL(OPEN_MODE,'') || '|' ||
+                 NVL(FAL_SERVER,'') || '|' || NVL(APPLIED_SCN,'')
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_D_ADG
+          WHERE RUN_ID IN ({{ _eff_run_id }})
+          ORDER BY HOSTNAME, SID;
+          EXIT;
+          EOSQL
+      register: _adg_raw
+      changed_when: false
+
+    # ADG fallback: per-instance ADG status from VOPTION when D_ADG is empty
+    - name: Fetch ADG per-instance VOPTION data (fallback for empty D_ADG)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 WRAP OFF TRIMSPOOL ON
+          WITH host_latest_run AS (
+            SELECT i.hostname, MAX(i.run_id) AS run_id
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i
+            WHERE i.run_id IN ({{ _eff_run_id }})
+            GROUP BY i.hostname
+          )
+          SELECT v.HOSTNAME || '|' || v.SID || '|' ||
+                 MAX(v.OPTION_ENABLED) || '|' ||
+                 MAX(v.IS_INUSE) || '|' ||
+                 MAX(i.ORACLE_VERSION) || '|' ||
+                 MAX(i.DB_ROLE) AS result
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_VOPTION v
+          JOIN host_latest_run hlr ON hlr.hostname = v.HOSTNAME AND hlr.run_id = v.RUN_ID
+          JOIN {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i
+            ON i.RUN_ID = v.RUN_ID AND i.HOSTNAME = v.HOSTNAME AND i.SID = v.SID
+          WHERE v.OPTION_NAME = 'Active Data Guard'
+          AND   (v.OPTION_ENABLED = 'TRUE' OR v.IS_INUSE = 'Y')
+          GROUP BY v.HOSTNAME, v.SID
+          ORDER BY MAX(v.IS_INUSE) DESC, v.HOSTNAME, v.SID;
+          EXIT;
+          EOSQL
+      register: _adg_voption_raw
+      changed_when: false
+
+    - name: Fetch D_RAC rows from DB (only TRUE RAC with license option enabled)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 WRAP OFF TRIMSPOOL ON
+          SELECT r.HOSTNAME || '|' || r.SID || '|' || NVL(TO_CHAR(r.RAC_INST_ID),'') || '|' ||
+                 NVL(r.INSTANCE_NAME,'') || '|' || NVL(r.NODE_HOST,'') || '|' ||
+                 NVL(r.STATUS,'')
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_D_RAC r
+          WHERE r.RUN_ID IN ({{ _eff_run_id }})
+          AND EXISTS (
+              SELECT 1 FROM {{ repo_schema | upper }}.ORACLE_OPT_VOPTION v
+              WHERE v.HOSTNAME = r.HOSTNAME 
+              AND v.SID = r.SID
+              AND v.RUN_ID IN ({{ _eff_run_id }})
+              AND v.OPTION_NAME IN ('Real Application Clusters', 'Real Application Clusters One Node')
+              AND v.OPTION_ENABLED = 'TRUE'
+              AND v.IS_INUSE = 'Y'
+          )
+          AND (r.HOSTNAME, r.SID) IN (
+              SELECT HOSTNAME, SID FROM {{ repo_schema | upper }}.ORACLE_OPT_D_RAC
+              WHERE RUN_ID IN ({{ _eff_run_id }})
+              GROUP BY HOSTNAME, SID HAVING COUNT(*) > 1
+          )
+          ORDER BY r.HOSTNAME, r.SID, r.RAC_INST_ID;
+          EXIT;
+          EOSQL
+      register: _rac_raw
+      changed_when: false
+
+    # ── Build plain-text detail sections ──────────────────────────────────────
+    - name: Build plain-text detail sections
+      ansible.builtin.set_fact:
+        _rpt_detail_part: >-
+          {%- set rows = [] -%}
+          {%- for line in (_part_raw.stdout | default('') | trim).split('\n') -%}
+            {%- if '|' in line -%}
+              {%- set p = line.split('|') -%}
+              {%- if p | length >= 7 -%}
+                {%- set _ = rows.append('  %-25s %-15s %-28s %-9s %-25s %5s %10s' | format(
+                  (p[0]|trim ~ '/' ~ p[1]|trim)[:25], (p[2]|trim)[:15], (p[3]|trim)[:28],
+                  (p[4]|trim)[:9], (p[5]|trim)[:25], p[6]|trim, p[7]|default('0')|trim)) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ rows | join(_nl) if rows | length > 0 else '  (no partitioned objects in this run)' }}
+        _rpt_detail_compress: >-
+          {%- set rows = [] -%}
+          {%- for line in (_compress_raw.stdout | default('') | trim).split('\n') -%}
+            {%- if '|' in line -%}
+              {%- set p = line.split('|') -%}
+              {%- if p | length >= 6 -%}
+                {%- set _ = rows.append('  %-25s %-15s %-28s %-10s %-20s %10s' | format(
+                  (p[0]|trim ~ '/' ~ p[1]|trim)[:25], (p[2]|trim)[:15], (p[3]|trim)[:28],
+                  (p[4]|trim)[:10], (p[5]|trim)[:20], p[6]|default('0')|trim)) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ rows | join(_nl) if rows | length > 0 else '  (no Advanced Compression objects in this run)' }}
+        _rpt_detail_security: >-
+          {%- set rows = [] -%}
+          {%- for line in (_security_raw.stdout | default('') | trim).split('\n') -%}
+            {%- if '|' in line -%}
+              {%- set p = line.split('|') -%}
+              {%- if p | length >= 6 -%}
+                {%- set _ = rows.append('  %-25s %-12s %-20s %-35s %-9s %s' | format(
+                  (p[0]|trim ~ '/' ~ p[1]|trim)[:25], (p[2]|trim)[:12], (p[3]|trim)[:20],
+                  (p[4]|trim)[:35], (p[5]|trim)[:9], p[6]|default('')|trim)) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ rows | join(_nl) if rows | length > 0 else '  (no TDE encrypted objects in this run)' }}
+        _rpt_detail_inmem: >-
+          {%- set rows = [] -%}
+          {%- for line in (_inmem_raw.stdout | default('') | trim).split('\n') -%}
+            {%- if '|' in line -%}
+              {%- set p = line.split('|') -%}
+              {%- if p | length >= 6 -%}
+                {%- set _ = rows.append('  %-25s %-15s %-28s %-15s %-20s %10s' | format(
+                  (p[0]|trim ~ '/' ~ p[1]|trim)[:25], (p[2]|trim)[:15], (p[3]|trim)[:28],
+                  (p[4]|trim)[:15], (p[5]|trim)[:20], p[6]|default('0')|trim)) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ rows | join(_nl) if rows | length > 0 else '  (no In-Memory tables in this run)' }}
+        _rpt_detail_pdb: >-
+          {%- set rows = [] -%}
+          {%- for line in (_pdb_raw.stdout | default('') | trim).split('\n') -%}
+            {%- if '|' in line -%}
+              {%- set p = line.split('|') -%}
+              {%- if p | length >= 6 -%}
+                {%- set _ = rows.append('  %-25s %6s %-20s %-12s %-4s %s' | format(
+                  (p[0]|trim ~ '/' ~ p[1]|trim)[:25], p[2]|trim,
+                  (p[3]|trim)[:20], (p[4]|trim)[:12], (p[5]|trim)[:4], p[6]|default('')|trim)) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ rows | join(_nl) if rows | length > 0 else '  (no PDBs in this run — all instances are non-CDB)' }}
+        _rpt_detail_adg: >-
+          {%- set rows = [] -%}
+          {%- for line in (_adg_raw.stdout | default('') | trim).split('\n') -%}
+            {%- if '|' in line -%}
+              {%- set p = line.split('|') -%}
+              {%- if p | length >= 6 -%}
+                {%- set _ = rows.append('  %-25s %-25s %-12s %-12s %-20s %s' | format(
+                  (p[0]|trim ~ '/' ~ p[1]|trim)[:25], (p[2]|trim)[:25], (p[3]|trim)[:12],
+                  (p[4]|trim)[:12], (p[5]|trim)[:20], p[6]|default('')|trim)) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ rows | join(_nl) if rows | length > 0 else '  (no Active Data Guard configuration in this run)' }}
+        _rpt_detail_rac: >-
+          {%- set rows = [] -%}
+          {%- for line in (_rac_raw.stdout | default('') | trim).split('\n') -%}
+            {%- if '|' in line -%}
+              {%- set p = line.split('|') -%}
+              {%- if p | length >= 5 -%}
+                {%- set _ = rows.append('  %-25s %6s %-20s %-25s %s' | format(
+                  (p[0]|trim ~ '/' ~ p[1]|trim)[:25], p[2]|trim,
+                  (p[3]|trim)[:20], (p[4]|trim)[:25], p[5]|default('')|trim)) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ rows | join(_nl) if rows | length > 0 else '  (no RAC nodes in this run)' }}
+
+    # ── Assemble and print plain-text report ──────────────────────────────────
+    - name: Assemble full plain-text report
+      ansible.builtin.set_fact:
+        _full_report: |
+          ╔════════════════════════════════════════════════════════════════════════════════╗
+          ║                 ORACLE LICENSE OPTIONS AUDIT REPORT                            ║
+          ╚════════════════════════════════════════════════════════════════════════════════╝
+          
+          ┌─ REPORT METADATA ─────────────────────────────────────────────────────────────┐
+          │ Audit Cycles      : {{ _rpt_label }}
+          │ Reference         : {{ _rpt_run_id }}
+          │ Data Collected    : {{ _rpt_date }}
+          │ Report Generated  : {{ _report_timestamp | replace('_', ' ') | replace('-', ':', 2) }}
+          │ Generated by      : {{ lookup('pipe','whoami') }}@{{ lookup('pipe','hostname') }}
+          │ Repository        : {{ repo_host }}:{{ repo_port }}/{{ repo_sid }}
+          └───────────────────────────────────────────────────────────────────────────────┘
+          
+          ┌─ INFRASTRUCTURE SUMMARY ──────────────────────────────────────────────────────┐
+          │ Total Hosts       : {{ _rpt_hosts }}
+          │ Total Instances   : {{ _rpt_queried }}
+          │ Standby Instances : {{ _rpt_standby }}
+          │ Skipped/Errors    : {{ _rpt_skipped }}
+          └───────────────────────────────────────────────────────────────────────────────┘
+          {%- if _report_mode == 'all_hosts' and _all_hosts_status_raw is defined -%}
+          {{ '' }}
+          ┌─ LICENSE RISK OVERVIEW BY ENVIRONMENT ────────────────────────────────────────┐
+          {%- set host_data = [] -%}
+          {%- for line in (_all_hosts_status_raw.stdout | default('') | trim).split('\n') -%}
+          {%- if '|' in line -%}
+          {%- set parts = line.split('|') -%}
+          {%- if parts | length >= 9 -%}
+          {%- set _ = host_data.append({
+              'platform': parts[0]|trim,
+              'environment': parts[1]|trim,
+              'hostname': parts[3]|trim,
+              'instances': parts[6]|trim,
+              'licenses': parts[8]|trim
+          }) -%}
+          {%- endif -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- set prod_hosts = host_data | selectattr('environment', 'equalto', 'Production') | list -%}
+          {%- set model_hosts = host_data | selectattr('environment', 'equalto', 'Model') | list -%}
+          {%- set test_hosts = host_data | selectattr('environment', 'equalto', 'Test-Dev') | list -%}
+          {%- set prod_with_lic = prod_hosts | selectattr('licenses', 'ne', 'None') | list -%}
+          {%- set model_with_lic = model_hosts | selectattr('licenses', 'ne', 'None') | list -%}
+          {%- set test_with_lic = test_hosts | selectattr('licenses', 'ne', 'None') | list -%}
+          {{ '' }}│ 🔴 PRODUCTION       : {{ prod_hosts | length }} hosts ({{ prod_with_lic | length }} using licensed options)
+          │ 🟠 MODEL            : {{ model_hosts | length }} hosts ({{ model_with_lic | length }} using licensed options)
+          │ 🟢 TEST/DEV         : {{ test_hosts | length }} hosts ({{ test_with_lic | length }} using licensed options)
+          └───────────────────────────────────────────────────────────────────────────────┘
+          {%- endif -%}
+          
+          ╔════════════════════════════════════════════════════════════════════════════════╗
+          ║                        LICENSE RISK ASSESSMENT                                 ║
+          ╚════════════════════════════════════════════════════════════════════════════════╝
+          
+          ┌─ FIELD LEGEND ────────────────────────────────────────────────────────────────┐
+          │ enabled  → Is the option CONFIGURED in database? (v$option = TRUE/FALSE)
+          │ now      → Is it IN-USE right now? (current audit cycle)
+          │ ever     → Was it EVER used? (⚠️  Oracle licenses are PERPETUAL - if ever=1,
+          │            you owe Oracle money even if you later disabled it!)
+          │ last_seen→ Last DATE when this option was actively used in production
+          └───────────────────────────────────────────────────────────────────────────────┘
+          
+          {{ _rpt_ee_table }}
+          
+          ┌─ RISK LEVEL KEY ──────────────────────────────────────────────────────────────┐
+          │ !! RISK  → Option IN-USE NOW (current audit) → 🔴 ACTIVE LICENSE EXPOSURE
+          │ !! WARN  → Enabled + Historical use only → 🟠 PAST USAGE (Oracle may still bill)
+          │ ~~ INFO  → Enabled but NEVER used → 🟡 POTENTIAL FUTURE RISK
+          │ ~~ CHK   → Disabled but has historical usage → ⚠️  VERIFY COMPLIANCE
+          │
+          │ NOTE: All enabled instances shown below (even if never used)
+          └───────────────────────────────────────────────────────────────────────────────┘
+          {%- if _report_mode == 'all_hosts' and _all_hosts_status_raw is defined -%}
+          {{ '' }}
+          ╔════════════════════════════════════════════════════════════════════════════════╗
+          ║                    HOSTS WITH LICENSED OPTIONS IN-USE                          ║
+          ╚════════════════════════════════════════════════════════════════════════════════╝
+          {%- set host_data = [] -%}
+          {%- for line in (_all_hosts_status_raw.stdout | default('') | trim).split('\n') -%}
+          {%- if '|' in line -%}
+          {%- set parts = line.split('|') -%}
+          {%- if parts | length >= 9 -%}
+          {%- set _ = host_data.append({
+              'platform': parts[0]|trim,
+              'environment': parts[1]|trim,
+              'hostname': parts[3]|trim,
+              'run_id': parts[4]|trim,
+              'instances': parts[6]|trim,
+              'standby': parts[7]|trim,
+              'licenses': parts[8]|trim
+          }) -%}
+          {%- endif -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- set environments = ['Production', 'Model', 'Test-Dev'] -%}
+          {%- for env in environments -%}
+          {%- set env_hosts = host_data | selectattr('environment', 'equalto', env) | selectattr('licenses', 'ne', 'None') | list -%}
+          {%- if env_hosts | length > 0 -%}
+          {{ '' }}
+          ┌─ {{ env.upper() }} ENVIRONMENT ─────────────────────────────────────────────────
+          │ Hosts with licensed options: {{ env_hosts | length }}
+          {%- for host in env_hosts %}
+          │ • {{ host.hostname.ljust(30) }} [{{ host.platform.ljust(9) }}] {{ host.instances }} inst  → {{ host.licenses[:70] }}
+          {%- endfor %}
+          └─────────────────────────────────────────────────────────────────────────────────
+          {%- endif -%}
+          {%- endfor -%}
+          {%- endif -%}
+          
+          ╔════════════════════════════════════════════════════════════════════════════════╗
+          ║                         DETAILED EVIDENCE                                      ║
+          ╚════════════════════════════════════════════════════════════════════════════════╝
+          {%- set has_evidence = false %}
+          {%- if _rpt_detail_part is defined and _rpt_detail_part | trim != '(no data)' and '  (no partitioned tables' not in _rpt_detail_part %}
+          {%- set has_evidence = true %}
+          
+          ┌─ PARTITIONING ────────────────────────────────────────────────────────────────┐
+          {{ _rpt_detail_part }}
+          └───────────────────────────────────────────────────────────────────────────────┘
+          {%- endif %}
+          {%- if _rpt_detail_compress is defined and _rpt_detail_compress | trim != '(no data)' and '  (no compressed' not in _rpt_detail_compress %}
+          {%- set has_evidence = true %}
+          
+          ┌─ ADVANCED COMPRESSION ────────────────────────────────────────────────────────┐
+          {{ _rpt_detail_compress }}
+          └───────────────────────────────────────────────────────────────────────────────┘
+          {%- endif %}
+          {%- if _rpt_detail_security is defined and _rpt_detail_security | trim != '(no data)' and '  (no encrypted' not in _rpt_detail_security %}
+          {%- set has_evidence = true %}
+          
+          ┌─ ADVANCED SECURITY (TDE) ─────────────────────────────────────────────────────┐
+          {{ _rpt_detail_security }}
+          └───────────────────────────────────────────────────────────────────────────────┘
+          {%- endif %}
+          {%- if _rpt_detail_inmem is defined and _rpt_detail_inmem | trim != '(no data)' and '  (no In-Memory' not in _rpt_detail_inmem %}
+          {%- set has_evidence = true %}
+          
+          ┌─ IN-MEMORY COLUMN STORE ──────────────────────────────────────────────────────┐
+          {{ _rpt_detail_inmem }}
+          └───────────────────────────────────────────────────────────────────────────────┘
+          {%- endif %}
+          {%- if _rpt_detail_adg is defined and _rpt_detail_adg | trim != '(no data)' and '  (no Active Data Guard' not in _rpt_detail_adg %}
+          {%- set has_evidence = true %}
+          
+          ┌─ ACTIVE DATA GUARD ───────────────────────────────────────────────────────────┐
+          {{ _rpt_detail_adg }}
+          └───────────────────────────────────────────────────────────────────────────────┘
+          {%- endif %}
+          {%- if _rpt_detail_rac is defined and _rpt_detail_rac | trim != '(no data)' and '  (no RAC nodes' not in _rpt_detail_rac %}
+          {%- set has_evidence = true %}
+          
+          ┌─ REAL APPLICATION CLUSTERS (RAC) ─────────────────────────────────────────────┐
+          │ NOTE: Shows only databases with "Real Application Clusters" license option   │
+          │       ENABLED & IN-USE. Grid Infrastructure HA clusters (without RAC license) │
+          │       are NOT included. RAC requires active multi-instance simultaneous access│
+          └───────────────────────────────────────────────────────────────────────────────┘
+          {{ _rpt_detail_rac }}
+          └───────────────────────────────────────────────────────────────────────────────┘
+          {%- endif %}
+          {%- if not has_evidence %}
+          
+          ┌───────────────────────────────────────────────────────────────────────────────┐
+          │ No detailed evidence data available for this report run.
+          └───────────────────────────────────────────────────────────────────────────────┘
+          {%- endif %}
+          
+          ═══════════════════════════════════════════════════════════════════════════════════
+          Report generated by Oracle DBA Automation Framework
+          Data source: {{ repo_schema | upper }} schema on {{ repo_host }}:{{ repo_port }}/{{ repo_sid }}
+          ═══════════════════════════════════════════════════════════════════════════════════
+          
+
+    - name: Print report to console
+      ansible.builtin.debug:
+        msg: "{{ _full_report.split('\n') }}"
+
+    # ── Build HTML email ───────────────────────────────────────────────────────
+    - name: Build HTML report body
+      ansible.builtin.set_fact:
+        _html_report: |
+          <!DOCTYPE html>
+          <html><head><meta charset="UTF-8">
+          <style>
+          html{scroll-behavior:smooth}
+          body{margin:0;padding:16px 16px 16px 220px;background:linear-gradient(135deg, #667eea 0%, #764ba2 100%);font-family:'Segoe UI',Roboto,Arial,sans-serif;font-size:13px;color:#263238;min-height:100vh}
+          .wrap{max-width:1100px;margin:0 auto;background:#fff;padding:32px 36px;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.15)}
+          .nav-sidebar{position:fixed;left:16px;top:16px;width:180px;background:rgba(255,255,255,0.98);border-radius:10px;padding:16px;box-shadow:0 4px 16px rgba(0,0,0,.2);max-height:calc(100vh - 32px);overflow-y:auto;z-index:1000;backdrop-filter:blur(10px)}
+          .nav-sidebar h3{margin:0 0 12px;font-size:12px;color:#667eea;text-transform:uppercase;letter-spacing:1px;font-weight:700}
+          .nav-sidebar a{display:block;padding:6px 10px;margin:2px 0;color:#455a64;text-decoration:none;border-radius:5px;font-size:11px;transition:all 0.2s;border-left:3px solid transparent}
+          .nav-sidebar a:hover{background:#e8eaf6;color:#667eea;border-left-color:#667eea;transform:translateX(2px)}
+          .nav-sidebar a.red{border-left-color:#e53935}
+          .nav-sidebar a.red:hover{background:#ffebee;color:#c62828}
+          .nav-sidebar a.ora{border-left-color:#fb8c00}
+          .nav-sidebar a.ora:hover{background:#fff3e0;color:#e65100}
+          .nav-sidebar hr{border:none;border-top:1px solid #e0e0e0;margin:8px 0}
+          h1{font-size:20px;color:#1a2533;border-bottom:4px solid #667eea;padding-bottom:12px;margin:0 0 20px;font-weight:600;letter-spacing:-0.5px}
+          .meta-bar{background:linear-gradient(135deg, #e3f2fd 0%, #f3e5f5 100%);padding:12px 18px;border-radius:8px;margin-bottom:18px;font-size:12px;line-height:2.2;border-left:4px solid #667eea}
+          .tots{border-collapse:collapse;width:100%;margin-bottom:24px;table-layout:fixed}
+          .tots td{padding:16px 12px;text-align:center;border:none;background:linear-gradient(135deg, #f8f9ff 0%, #faf5ff 100%);border-radius:8px;position:relative}
+          .tots td:not(:last-child)::after{content:'';position:absolute;right:0;top:20%;height:60%;width:1px;background:#e0e0e0}
+          .tot-n{font-size:28px;font-weight:700;background:linear-gradient(135deg, #667eea 0%, #764ba2 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+          .tot-l{font-size:11px;color:#78909c;margin-top:4px;text-transform:uppercase;letter-spacing:0.5px}
+          .sh{color:#fff;padding:10px 16px;border-radius:8px;margin:28px 0 10px;font-size:13px;font-weight:600;display:flex;justify-content:space-between;align-items:center;box-shadow:0 2px 8px rgba(0,0,0,.1)}
+          .sh a.bk{color:#e3f2fd;font-size:11px;font-weight:normal;text-decoration:none;transition:color 0.3s}
+          .sh a.bk:hover{color:#fff}
+          .sh-grey{background:linear-gradient(135deg, #455a64 0%, #37474f 100%)}
+          .sh-red{background:linear-gradient(135deg, #e53935 0%, #b71c1c 100%)}
+          .sh-ora{background:linear-gradient(135deg, #fb8c00 0%, #e65100 100%)}
+          table.data{border-collapse:collapse;width:100%;font-size:12px;margin-bottom:10px;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.05)}
+          table.data th{background:linear-gradient(135deg, #455a64 0%, #37474f 100%);color:#fff;padding:8px 10px;text-align:left;white-space:nowrap;font-weight:600;letter-spacing:0.3px;position:sticky;top:0;z-index:100}
+          table.data td{padding:7px 10px;border-bottom:1px solid #f5f5f5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px;transition:background 0.2s}
+          table.data tr:hover td{background:#f0f7ff!important}
+          table.data tr.env-prod-row td{background:#ffebee!important;border-left:3px solid #d32f2f}
+          table.data tr.env-model-row td{background:#fff3e0!important;border-left:3px solid #f57c00}
+          table.data tr.env-test-row td{background:#e8f5e9!important;border-left:3px solid #43a047}
+          table.data tr.platform-aix-row td{border-right:3px solid #0277bd}
+          table.data tr.platform-linux-row td{border-right:3px solid #7cb342}
+          table.data tr.risk td{background:#ffcdd2!important;color:#b71c1c;font-weight:bold;border-left:4px solid #d32f2f!important}
+          table.data tr.warn td{background:#ffe0b2!important;color:#bf360c;border-left:4px solid #ff6f00!important}
+          table.data tr.chk td{background:#fff9c4!important;color:#795548;border-left:4px solid #fbc02d!important}
+          .br{background:linear-gradient(135deg, #e53935 0%, #c62828 100%);color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;box-shadow:0 2px 4px rgba(198,40,40,.3)}
+          .bw{background:linear-gradient(135deg, #fb8c00 0%, #e65100 100%);color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;box-shadow:0 2px 4px rgba(230,81,0,.3)}
+          .bc{background:linear-gradient(135deg, #fdd835 0%, #f9a825 100%);color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;box-shadow:0 2px 4px rgba(249,168,37,.3)}
+          .bg{background:linear-gradient(135deg, #78909c 0%, #546e7a 100%);color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;box-shadow:0 2px 4px rgba(84,110,122,.3)}
+          .platform-badge{color:#fff;padding:3px 9px;border-radius:5px;font-size:10px;font-weight:700;margin-right:6px;display:inline-block;text-transform:uppercase;letter-spacing:0.5px;box-shadow:0 2px 4px rgba(0,0,0,.2)}
+          .platform-aix{background:linear-gradient(135deg, #039be5 0%, #0277bd 100%)}
+          .platform-us{background:linear-gradient(135deg, #66bb6a 0%, #43a047 100%)}
+          .platform-eu{background:linear-gradient(135deg, #ff7043 0%, #f4511e 100%)}
+          .env-badge{color:#fff;padding:3px 10px;border-radius:5px;font-size:10px;font-weight:700;margin-right:6px;display:inline-block;text-transform:uppercase;letter-spacing:0.5px;box-shadow:0 2px 4px rgba(0,0,0,.2)}
+          .env-prod{background:linear-gradient(135deg, #ef5350 0%, #d32f2f 100%)}
+          .env-model{background:linear-gradient(135deg, #ffa726 0%, #f57c00 100%)}
+          .env-test{background:linear-gradient(135deg, #66bb6a 0%, #43a047 100%)}
+          .sumbox{background:#f8f9fa;border-left:5px solid #667eea;padding:10px 16px;margin-bottom:12px;font-size:12px;border-radius:0 6px 6px 0;box-shadow:0 2px 4px rgba(0,0,0,.05)}
+          .sumbox.red{border-color:#e53935;background:#ffebee}
+          .sumbox.ora{border-color:#fb8c00;background:#fff3e0}
+          .notebox{background:#fffde7;border-left:5px solid #fbc02d;padding:10px 16px;margin-bottom:12px;font-size:12px;border-radius:0 6px 6px 0;box-shadow:0 2px 4px rgba(251,192,45,.2)}
+          .key{font-size:11px;color:#78909c;margin:0 0 8px;font-style:italic}
+          .toc{background:#f5f7fa;border:1px solid #e0e0e0;padding:12px 18px;border-radius:8px;margin:12px 0 20px;font-size:12px;box-shadow:0 2px 4px rgba(0,0,0,.05)}
+          .toc a{color:#667eea;text-decoration:none;margin-right:16px;white-space:nowrap;font-weight:500;transition:color 0.3s}
+          .toc a:hover{color:#764ba2;text-decoration:underline}
+          .footer{margin-top:28px;font-size:11px;color:#b0bec5;border-top:2px solid #eceff1;padding-top:12px;line-height:1.9}
+          code{background:#f0f4f8;padding:2px 6px;border-radius:4px;font-family:'Consolas','Monaco',monospace;font-size:11px;color:#455a64;border:1px solid #e0e0e0}
+          .mono{font-family:'Consolas','Monaco',monospace;font-size:11px;color:#455a64}
+          .empty{color:#aaa;font-size:12px;padding:6px 0;margin:0;font-style:italic}
+          .tog-hdr{cursor:pointer;background:linear-gradient(135deg, #f5f7fa 0%, #e8eaf6 100%);border:1px solid #d0d5dd;padding:8px 14px;border-radius:6px;font-size:12px;color:#37474f;user-select:none;margin:3px 0 0;display:block;transition:all 0.3s;font-weight:500}
+          .tog-hdr:hover{background:linear-gradient(135deg, #e3f2fd 0%, #d1c4e9 100%);color:#667eea;box-shadow:0 2px 6px rgba(102,126,234,.2)}
+          .tog-body{margin:0 0 8px}
+          .check-yes{color:#43a047;font-size:16px;font-weight:bold}
+          .check-no{color:#ccc;font-size:16px}
+          .env-section{margin:16px 0 10px;padding:8px 14px;background:linear-gradient(135deg, #e8eaf6 0%, #f3e5f5 100%);border-left:5px solid #667eea;border-radius:0 6px 6px 0;font-weight:600;font-size:12px;color:#37474f;box-shadow:0 2px 4px rgba(102,126,234,.15)}
+          </style></head>
+          <body>
+          <div class="nav-sidebar">
+            <h3>&#128195; Navigation</h3>
+            <a href="#top">&#11014; Top</a>
+            <a href="#summary">&#128202; Summary</a>
+            <hr>
+            <a href="#sec-platform">&#127760; Platform</a>
+            <a href="#sec-hosts">&#128196; All Hosts</a>
+            <a href="#sec-ee" class="red">&#9888; EE Options</a>
+            <a href="#sec-voption-detail">&#128209; Instances</a>
+            <hr>
+            <a href="#sec-part" class="red">&#128200; Partitioning</a>
+            <a href="#sec-compress" class="ora">&#128230; Compression</a>
+            <a href="#sec-security">&#128274; TDE</a>
+            <a href="#sec-inmem" class="red">&#9889; In-Memory</a>
+            <a href="#sec-adg" class="red">&#128504; Data Guard</a>
+            <a href="#sec-rac">&#128279; RAC</a>
+            <a href="#sec-pdb">&#128202; Multitenant</a>
+            <a href="#sec-inst">&#128203; Instances</a>
+          </div>
+          <div class="wrap" id="top">
+
+          <h1>&#128203;&nbsp;Oracle EE Options &amp; Features Audit &mdash; Run #{{ _rpt_run_id }}</h1>
+          <div class="meta-bar">
+            <b>Label:</b> {{ _rpt_label }} &nbsp;&bull;&nbsp;
+            <b>Data Collected:</b> {{ _rpt_date }} &nbsp;&bull;&nbsp;
+            <b>Report Generated:</b> {{ _report_timestamp | replace('_', ' ') | replace('-', ':', 2) }} &nbsp;&bull;&nbsp;
+            <b>Generated by:</b> {{ lookup('pipe','whoami') }}@{{ lookup('pipe','hostname') }}
+          </div>
+
+          <div id="summary"></div>
+          <table class="tots"><tr>
+            <td><div class="tot-n">{{ _rpt_hosts }}</div><div class="tot-l">Hosts in play</div></td>
+            <td><div class="tot-n">{{ _rpt_queried }}</div><div class="tot-l">Instances queried</div></td>
+            <td><div class="tot-n">{{ _rpt_standby }}</div><div class="tot-l">Standby instances</div></td>
+            <td><div class="tot-n">{{ _rpt_skipped }}</div><div class="tot-l">Skipped / errors</div></td>
+          </tr></table>
+
+          {%- set platform_lines = (_platform_breakdown_raw.stdout | default('') | trim).split('\n') -%}
+          {%- if platform_lines | length > 0 and platform_lines[0] != '' %}
+          <div class="sh sh-grey" id="sec-platform">&#127760; Platform & Environment Breakdown</div>
+          <table class="data">
+          <tr><th>Platform</th><th>Environment</th><th>Audit Cycle</th><th>Collection Date</th><th style="text-align:center">Hosts</th><th style="text-align:center">Instances</th></tr>
+          {%- for line in platform_lines %}
+            {%- if '|' in line %}
+              {%- set parts = line.split('|') %}
+              {%- if parts | length >= 6 %}
+                {%- set ptype = parts[0]|trim %}
+                {%- set env_type = parts[1]|trim %}
+                {%- if ptype == 'AIX' %}{%- set pbadge = 'platform-aix' -%}{%- set plat_class = 'platform-aix-row' -%}
+                {%- elif ptype == 'US-Linux' %}{%- set pbadge = 'platform-us' -%}{%- set plat_class = 'platform-linux-row' -%}
+                {%- elif ptype == 'EU-Linux' %}{%- set pbadge = 'platform-eu' -%}{%- set plat_class = 'platform-linux-row' -%}
+                {%- else %}{%- set pbadge = 'platform-badge' -%}{%- set plat_class = '' -%}{%- endif %}
+                {%- if env_type == 'Production' %}{%- set env_class = 'env-prod-row' -%}{%- set ebadge = 'env-prod' -%}
+                {%- elif env_type == 'Model' %}{%- set env_class = 'env-model-row' -%}{%- set ebadge = 'env-model' -%}
+                {%- else %}{%- set env_class = 'env-test-row' -%}{%- set ebadge = 'env-test' -%}{%- endif %}
+          <tr class="{{ env_class }} {{ plat_class }}">
+            <td><span class="platform-badge {{ pbadge }}">{{ ptype }}</span></td>
+            <td><span class="env-badge {{ ebadge }}">{{ env_type }}</span></td>
+            <td class="mono">{{ parts[2]|trim }}</td>
+            <td>{{ parts[3]|trim }}</td>
+            <td style="text-align:center"><b>{{ parts[4]|trim }}</b></td>
+            <td style="text-align:center"><b>{{ parts[5]|trim }}</b></td>
+          </tr>
+              {%- endif %}
+            {%- endif %}
+          {%- endfor %}
+          </table>
+          {%- endif %}
+
+          {# ── All Hosts Audit Status (all_hosts mode only) ────────────── #}
+          {%- if _report_mode == 'all_hosts' and _all_hosts_status_raw is defined %}
+          {%- set host_data = [] %}
+          {%- for line in (_all_hosts_status_raw.stdout | default('') | trim).split('\n') %}
+            {%- if '|' in line %}
+              {%- set parts = line.split('|') %}
+              {%- if parts | length >= 9 %}
+                {%- set _ = host_data.append({
+                    'platform': parts[0]|trim,
+                    'environment': parts[1]|trim,
+                    'region': parts[2]|trim,
+                    'hostname': parts[3]|trim,
+                    'run_id': parts[4]|trim,
+                    'audit_date': parts[5]|trim,
+                    'instances': parts[6]|trim,
+                    'standby': parts[7]|trim,
+                    'licenses': parts[8]|trim
+                }) %}
+              {%- endif %}
+            {%- endif %}
+          {%- endfor %}
+          {%- if host_data | length > 0 %}
+          <div class="sh sh-grey" id="sec-hosts">&#128196; All Hosts Audit Status (by Platform, Environment & Region)</div>
+          <div class="sumbox"><b>{{ host_data | length }}</b> unique host(s) across all platforms with latest audit data</div>
+          {%- set platforms = host_data | map(attribute='platform') | unique | list | sort %}
+          {%- for platform in platforms %}
+            {%- set platform_hosts = host_data | selectattr('platform', 'equalto', platform) | list %}
+            {%- if platform == 'AIX' %}{%- set pbadge = 'platform-aix' -%}
+            {%- elif platform == 'US-Linux' %}{%- set pbadge = 'platform-us' -%}
+            {%- elif platform == 'EU-Linux' %}{%- set pbadge = 'platform-eu' -%}
+            {%- else %}{%- set pbadge = 'platform-badge' -%}{%- endif %}
+            {%- set environments = platform_hosts | map(attribute='environment') | unique | list | sort %}
+          <div class="tog-hdr" onclick="togSec(this)">&#9660; <span class="platform-badge {{ pbadge }}">{{ platform }}</span> &mdash; {{ platform_hosts | length }} host(s)</div>
+          <div class="tog-body">
+          {%- for environment in environments %}
+            {%- set env_hosts = platform_hosts | selectattr('environment', 'equalto', environment) | list %}
+          <div style="margin:10px 0 5px 0;font-weight:bold;color:#546e7a">{{ environment }} ({{ env_hosts | length }} hosts)</div>
+          <table class="data">
+          <tr><th>Hostname</th><th>Region</th><th>Audit Cycle</th><th>Latest Audit</th><th style="text-align:center">Inst</th><th style="text-align:center">Stdby</th><th>License Options In-Use</th></tr>
+          {%- for host in env_hosts %}
+            {%- if host.environment == 'Production' %}{%- set env_class = 'env-prod-row' -%}
+            {%- elif host.environment == 'Model' %}{%- set env_class = 'env-model-row' -%}
+            {%- else %}{%- set env_class = 'env-test-row' -%}{%- endif %}
+            {%- if host.platform == 'AIX' %}{%- set plat_class = 'platform-aix-row' -%}
+            {%- else %}{%- set plat_class = 'platform-linux-row' -%}{%- endif %}
+          <tr class="{{ env_class }} {{ plat_class }}">
+            <td class="mono">{{ host.hostname }}</td>
+            <td>{{ host.region }}</td>
+            <td class="mono">{{ host.run_id }}</td>
+            <td>{{ host.audit_date }}</td>
+            <td style="text-align:center">{{ host.instances }}</td>
+            <td style="text-align:center">{{ host.standby }}</td>
+            <td style="font-size:10px;max-width:300px" title="{{ host.licenses }}">{{ host.licenses if host.licenses != 'None' else '<span style="color:#aaa">None</span>' }}</td>
+          </tr>
+          {%- endfor %}
+          </table>
+          {%- endfor %}
+          </div>
+          {%- endfor %}
+          {%- endif %}
+          {%- endif %}
+
+          <div class="sh sh-grey" id="sec-ee">&#9888; EE Extra-Cost Options &mdash; License Risk Summary</div>
+          {# Parse voption data with validation #}
+          {% set vopts = [] %}
+          {% set unique_instances = [] %}
+          {% set raw_data = _voption_raw.stdout | default('') | trim %}
+          {% if raw_data | length == 0 %}
+            {# Query returned no data - show warning #}
+            <div class="notebox">⚠️ <b>No EE extra-cost option data found.</b> This may indicate:<br>
+            • IS_EE_EXTRA column not set during collection (check collection logs)<br>
+            • No data collected yet (run collect_oracle_options.yml first)<br>
+            • Run ID mismatch (verify RUN_ID: {{ _eff_run_id }})</div>
+          {% endif %}
+          {% for line in raw_data.split('\n') %}
+            {% if '|' in line and line | trim | length > 0 %}{% set p = line.split('|') %}
+              {% if p | length >= 9 %}
+                {% set opt_name = p[0]|trim %}
+                {% set hostname = p[1]|trim %}
+                {% set sid = p[2]|trim %}
+                {% set enabled = p[3]|trim | upper %}
+                {% set inuse = p[4]|trim | upper %}
+                {% set platform = p[5]|trim %}
+                {% set environment = p[6]|trim %}
+                {% set ever_used = p[7]|trim %}
+                {% set last_used = p[8]|trim %}
+                {% set _ = vopts.append({
+                  'name': opt_name,
+                  'host': hostname,
+                  'sid': sid,
+                  'enabled': enabled,
+                  'inuse': inuse,
+                  'platform': platform,
+                  'environment': environment,
+                  'ever_used': ever_used,
+                  'last_used_date': last_used
+                }) %}
+                {% set inst_key = hostname ~ '|' ~ sid %}
+                {% if inst_key not in unique_instances %}{% set _ = unique_instances.append(inst_key) %}{% endif %}
+              {% elif p | length >= 7 %}
+                {% set opt_name = p[0]|trim %}
+                {% set hostname = p[1]|trim %}
+                {% set sid = p[2]|trim %}
+                {% set _ = vopts.append({
+                  'name': opt_name,
+                  'host': hostname,
+                  'sid': sid,
+                  'enabled': p[3]|trim | upper,
+                  'inuse': p[4]|trim | upper,
+                  'platform': p[5]|trim,
+                  'environment': p[6]|trim,
+                  'ever_used': '0',
+                  'last_used_date': 'NEVER'
+                }) %}
+                {% set inst_key = hostname ~ '|' ~ sid %}
+                {% if inst_key not in unique_instances %}{% set _ = unique_instances.append(inst_key) %}{% endif %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {# Debug: show parsing results #}
+          {% if vopts | length == 0 and raw_data | length > 0 %}
+            <div class="notebox">⚠️ <b>Data parsing issue:</b> Query returned {{ raw_data.split('\n') | length }} lines but 0 were parsed successfully. Check data format.</div>
+          {% endif %}
+          {# DEBUG: Show what options were actually parsed #}
+          {% if vopts | length > 0 %}
+            {% set unique_opt_names = vopts | map(attribute='name') | unique | list | sort %}
+            <div class="notebox" style="border-color:#2196f3;background:#e3f2fd">
+              <b>DEBUG:</b> Parsed {{ vopts | length }} voption rows with {{ unique_instances | length }} unique instances.<br>
+              <b>Option names found in data:</b> {{ unique_opt_names | join(', ') }}<br>
+              <b>First ee_extra_options entry:</b> {{ ee_extra_options[0] if ee_extra_options | length > 0 else 'NONE' }}
+            </div>
+          {% endif %}
+          {% set n = unique_instances | length %}
+          <table class="data">
+          <tr><th style="width:38%">Option Name</th><th style="text-align:center;background:#d32f2f;color:#fff">🔴 Prod</th><th style="text-align:center;background:#f57c00;color:#fff">🟠 Model</th><th style="text-align:center;background:#388e3c;color:#fff">🟢 Test-Dev</th><th style="text-align:center">Total Enabled</th><th style="text-align:center">Total In-Use</th><th style="text-align:center">Ever Used</th><th>Risk</th></tr>
+          {% for opt_name in ee_extra_options %}
+            {% set en_prod = namespace(v=0) %}{% set iu_prod = namespace(v=0) %}{% set ev_prod = namespace(v=0) %}{% set en_prod_list = [] %}{% set iu_prod_list = [] %}{% set ev_prod_list = [] %}
+            {% set en_model = namespace(v=0) %}{% set iu_model = namespace(v=0) %}{% set ev_model = namespace(v=0) %}{% set en_model_list = [] %}{% set iu_model_list = [] %}{% set ev_model_list = [] %}
+            {% set en_test = namespace(v=0) %}{% set iu_test = namespace(v=0) %}{% set ev_test = namespace(v=0) %}{% set en_test_list = [] %}{% set iu_test_list = [] %}{% set ev_test_list = [] %}
+            {% set en_total = namespace(v=0) %}{% set iu_total = namespace(v=0) %}{% set ever_total = namespace(v=0) %}
+            {% set en_total_list = [] %}{% set iu_total_list = [] %}{% set ever_total_list = [] %}
+            {% for o in vopts %}
+              {# Match option names - case-sensitive exact match #}
+              {% if o.name == opt_name or (o.name | upper) == (opt_name | upper) %}
+                {% set inst_key = o.host ~ '|' ~ o.sid %}
+                {# Normalize boolean checks #}
+                {% set is_enabled = (o.enabled | upper in ['TRUE', 'Y', '1']) %}
+                {% set is_inuse = (o.inuse | upper in ['Y', 'TRUE', '1']) %}
+                {% set was_ever_used = (o.ever_used | string in ['1', 'Y', 'TRUE']) %}
+                {% if is_enabled and inst_key not in en_total_list %}
+                  {% set en_total.v = en_total.v + 1 %}{% set _ = en_total_list.append(inst_key) %}
+                {% endif %}
+                {% if is_inuse and inst_key not in iu_total_list %}
+                  {% set iu_total.v = iu_total.v + 1 %}{% set _ = iu_total_list.append(inst_key) %}
+                {% endif %}
+                {% if was_ever_used and inst_key not in ever_total_list %}
+                  {% set ever_total.v = ever_total.v + 1 %}{% set _ = ever_total_list.append(inst_key) %}
+                {% endif %}
+                {% if o.environment == 'Production' %}
+                  {% if is_enabled and inst_key not in en_prod_list %}{% set en_prod.v = en_prod.v + 1 %}{% set _ = en_prod_list.append(inst_key) %}{% endif %}
+                  {% if is_inuse and inst_key not in iu_prod_list %}{% set iu_prod.v = iu_prod.v + 1 %}{% set _ = iu_prod_list.append(inst_key) %}{% endif %}
+                  {% if was_ever_used and inst_key not in ev_prod_list %}{% set ev_prod.v = ev_prod.v + 1 %}{% set _ = ev_prod_list.append(inst_key) %}{% endif %}
+                {% elif o.environment == 'Model' %}
+                  {% if is_enabled and inst_key not in en_model_list %}{% set en_model.v = en_model.v + 1 %}{% set _ = en_model_list.append(inst_key) %}{% endif %}
+                  {% if is_inuse and inst_key not in iu_model_list %}{% set iu_model.v = iu_model.v + 1 %}{% set _ = iu_model_list.append(inst_key) %}{% endif %}
+                  {% if was_ever_used and inst_key not in ev_model_list %}{% set ev_model.v = ev_model.v + 1 %}{% set _ = ev_model_list.append(inst_key) %}{% endif %}
+                {% elif o.environment == 'Test-Dev' %}
+                  {% if is_enabled and inst_key not in en_test_list %}{% set en_test.v = en_test.v + 1 %}{% set _ = en_test_list.append(inst_key) %}{% endif %}
+                  {% if is_inuse and inst_key not in iu_test_list %}{% set iu_test.v = iu_test.v + 1 %}{% set _ = iu_test_list.append(inst_key) %}{% endif %}
+                  {% if was_ever_used and inst_key not in ev_test_list %}{% set ev_test.v = ev_test.v + 1 %}{% set _ = ev_test_list.append(inst_key) %}{% endif %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+            {% if (en_total.v > 0 and iu_total.v > 0) or (en_total.v > 0 and ever_total.v > 0) %}{% set cls='risk' %}{% set badge='<span class="br">!! RISK</span>' %}
+            {% elif iu_total.v > 0 or ever_total.v > 0 %}{% set cls='chk' %}{% set badge='<span class="bc">~~ CHK</span>' %}
+            {% else %}{% set cls='' %}{% set badge='<span style="color:#ccc">&mdash;</span>' %}{% endif %}
+          <tr class="{{ cls }}">
+            <td>{{ opt_name }}</td>
+            <td style="text-align:center;background:#ffebee;font-size:10px">{{ '<b>' ~ en_prod.v ~ '</b>/' ~ iu_prod.v if en_prod.v > 0 or iu_prod.v > 0 else '<span style="color:#ccc">—</span>' }}{{ ' <span class="bw" style="font-size:9px">⚠' ~ ev_prod.v ~ '</span>' if ev_prod.v > 0 else '' }}</td>
+            <td style="text-align:center;background:#fff3e0;font-size:10px">{{ '<b>' ~ en_model.v ~ '</b>/' ~ iu_model.v if en_model.v > 0 or iu_model.v > 0 else '<span style="color:#ccc">—</span>' }}{{ ' <span class="bw" style="font-size:9px">⚠' ~ ev_model.v ~ '</span>' if ev_model.v > 0 else '' }}</td>
+            <td style="text-align:center;background:#e8f5e9;font-size:10px">{{ '<b>' ~ en_test.v ~ '</b>/' ~ iu_test.v if en_test.v > 0 or iu_test.v > 0 else '<span style="color:#ccc">—</span>' }}{{ ' <span class="bw" style="font-size:9px">⚠' ~ ev_test.v ~ '</span>' if ev_test.v > 0 else '' }}</td>
+            <td style="text-align:center;font-weight:bold">{{ en_total.v }}/{{ n }}</td>
+            <td style="text-align:center;font-weight:bold">{{ iu_total.v }}/{{ n }}</td>
+            <td style="text-align:center;font-weight:bold">{{ '<span class="bw" title="Was in-use in past even if disabled now">⚠ ' ~ ever_total.v ~ '</span>' if ever_total.v > 0 else '<span style="color:#ccc">0</span>' }}</td>
+            <td>{{ badge }}</td>
+          </tr>
+          {% endfor %}
+          </table>
+          <p class="key">
+            <b>Environment columns:</b> Enabled/In-Use counts &mdash; <span class="env-badge env-prod">Production</span> <span class="env-badge env-model">Model</span> <span class="env-badge env-test">Test-Dev</span><br>
+            <b>Ever Used:</b> <span class="bw">⚠ Historical usage detected</span> &mdash; was in-use in past runs even if currently disabled (license risk!)<br>
+            <span style="background:#c62828;color:#fff;padding:1px 5px;border-radius:2px">!! RISK</span> Currently enabled+in-use OR enabled with historical usage &mdash; <b>LICENSE EXPOSURE</b> &nbsp;&nbsp;
+            <span style="background:#f9a825;color:#fff;padding:1px 5px;border-radius:2px">~~ CHK</span> Usage detected (current or historical) but v$option=FALSE &mdash; verify &nbsp;&nbsp;
+            <span style="color:#888">enabled-only (never used) = no risk</span>
+          </p>
+
+          {# ── Per-option collapsible instance evidence BY ENVIRONMENT (ALL ENABLED instances) ── #}
+          <div class="sh sh-grey" id="sec-voption-detail">&#128209;&nbsp;Per-Option Instance Evidence &mdash; all enabled instances (by Environment)</div>
+          <p class="key">One row per database instance. Shows instances where option is ENABLED, currently IN-USE, or has HISTORICAL usage. Grouped by environment: <span class="env-badge env-prod">Production</span> <span class="env-badge env-model">Model</span> <span class="env-badge env-test">Test-Dev</span>
+          <br><b>Badge meanings:</b> <span class="br" style="padding:2px 6px">!! RISK</span> = In-use NOW &nbsp; <span class="bw" style="padding:2px 6px">!! WARN</span> = Enabled + Historical use only &nbsp; <span class="bg" style="padding:2px 6px">~~ INFO</span> = Enabled but never used &nbsp; <span class="bc" style="padding:2px 6px">~~ CHK</span> = Disabled with history
+          <br><b>Row colors:</b> <span class="risk" style="padding:2px 6px">🔴 Red = Active NOW</span> &nbsp; <span class="warn" style="padding:2px 6px">🟠 Orange = Enabled + Historical only</span> &nbsp; <span class="chk" style="padding:2px 6px">🟡 Yellow = Disabled with history</span> &nbsp; <span style="padding:2px 6px;background:#f5f5f5">⚪ Gray = Enabled, never used</span></p>
+          {% for opt_name in ee_extra_options %}
+            {%- set iu_total = namespace(v=0) -%}{%- set en_total = namespace(v=0) -%}{%- set ev_total = namespace(v=0) -%}{%- set inuse_now_total = namespace(v=0) -%}
+            {%- set iu_list = [] -%}{%- set en_list = [] -%}{%- set ev_list = [] -%}{%- set inuse_now_list = [] -%}
+            {%- set prod_instances = [] -%}{%- set model_instances = [] -%}{%- set test_instances = [] -%}
+            {%- for o in vopts -%}
+              {%- if o.name == opt_name -%}
+                {%- set inst_key = o.host ~ '|' ~ o.sid -%}
+                {%- if o.enabled | upper == 'TRUE' and inst_key not in en_list -%}
+                  {%- set en_total.v = en_total.v + 1 -%}{%- set _ = en_list.append(inst_key) -%}
+                {%- endif -%}
+                {%- if o.inuse == 'Y' and inst_key not in inuse_now_list -%}
+                  {%- set inuse_now_total.v = inuse_now_total.v + 1 -%}{%- set _ = inuse_now_list.append(inst_key) -%}
+                {%- endif -%}
+                {%- if (o.enabled | upper == 'TRUE' or o.inuse == 'Y' or o.ever_used == '1') and inst_key not in iu_list -%}
+                  {%- set iu_total.v = iu_total.v + 1 -%}{%- set _ = iu_list.append(inst_key) -%}
+                  {%- if o.environment == 'Production' -%}{%- set _ = prod_instances.append(o) -%}
+                  {%- elif o.environment == 'Model' -%}{%- set _ = model_instances.append(o) -%}
+                  {%- elif o.environment == 'Test-Dev' -%}{%- set _ = test_instances.append(o) -%}
+                  {%- endif -%}
+                {%- endif -%}
+                {%- if o.ever_used == '1' and inst_key not in ev_list -%}
+                  {%- set ev_total.v = ev_total.v + 1 -%}{%- set _ = ev_list.append(inst_key) -%}
+                {%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- if iu_total.v > 0 -%}
+              {%- if inuse_now_total.v > 0 -%}{%- set badge='<span class="br">!! RISK</span>' -%}
+              {%- elif en_total.v > 0 and ev_total.v > 0 -%}{%- set badge='<span class="bw">!! WARN</span>' -%}
+              {%- elif en_total.v > 0 -%}{%- set badge='<span class="bg">~~ INFO</span>' -%}
+              {%- elif ev_total.v > 0 -%}{%- set badge='<span class="bc">~~ CHK</span>' -%}
+              {%- else -%}{%- set badge='<span class="bg">~~ INFO</span>' -%}{%- endif -%}
+          <div class="tog-hdr" onclick="togSec(this)">&#9660; {{ badge }} &nbsp;{{ opt_name }} &mdash; {{ en_total.v }}/{{ n }} enabled &bull; {{ iu_total.v }}/{{ n }} shown (enabled/active/historical)</div>
+          <div class="tog-body">
+          {%- if prod_instances | length > 0 -%}
+          <div class="env-section"><span class="env-badge env-prod">PRODUCTION</span> {{ prod_instances | length }} instance(s)</div>
+          <table class="data">
+          <tr><th>Platform</th><th>Hostname</th><th>SID</th><th style="text-align:center">Enabled</th><th style="text-align:center">In-Use Now</th><th style="text-align:center">Ever Used</th><th>Last Seen</th></tr>
+          {%- for o in prod_instances -%}
+            {%- if o.inuse == 'Y' -%}{%- set rcls='risk' -%}
+            {%- elif o.enabled | upper == 'TRUE' and o.ever_used == '1' -%}{%- set rcls='warn' -%}
+            {%- elif o.enabled | upper == 'TRUE' -%}{%- set rcls='' -%}
+            {%- elif o.ever_used == '1' -%}{%- set rcls='chk' -%}
+            {%- else -%}{%- set rcls='' -%}{%- endif -%}
+            {%- if o.platform == 'AIX' -%}{%- set pbadge = 'platform-aix' -%}{%- set plat_class = 'platform-aix-row' -%}
+            {%- elif o.platform == 'US-Linux' -%}{%- set pbadge = 'platform-us' -%}{%- set plat_class = 'platform-linux-row' -%}
+            {%- elif o.platform == 'EU-Linux' -%}{%- set pbadge = 'platform-eu' -%}{%- set plat_class = 'platform-linux-row' -%}
+            {%- else -%}{%- set pbadge = 'platform-badge' -%}{%- set plat_class = '' -%}{%- endif -%}
+          <tr class="{{ rcls }} env-prod-row {{ plat_class }}">
+            <td><span class="platform-badge {{ pbadge }}">{{ o.platform }}</span></td>
+            <td class="mono">{{ o.host }}</td>
+            <td class="mono">{{ o.sid }}</td>
+            <td style="text-align:center">{{ '<span class="check-yes">✓</span>' if o.enabled | upper == 'TRUE' else '<span class="check-no">✗</span>' }}</td>
+            <td style="text-align:center">{{ '<span class="check-yes">✓</span>' if o.inuse == 'Y' else '<span class="check-no">✗</span>' }}</td>
+            <td style="text-align:center">{{ '<span class="bw">⚠</span>' if o.ever_used == '1' else '<span class="check-no">✗</span>' }}</td>
+            <td style="font-size:10px">{{ o.last_used_date if o.last_used_date != 'NEVER' else '<span style="color:#ccc">Never</span>' }}</td>
+          </tr>
+          {%- endfor -%}
+          </table>
+          {%- endif -%}
+          {%- if model_instances | length > 0 -%}
+          <div class="env-section"><span class="env-badge env-model">MODEL</span> {{ model_instances | length }} instance(s)</div>
+          <table class="data">
+          <tr><th>Platform</th><th>Hostname</th><th>SID</th><th style="text-align:center">Enabled</th><th style="text-align:center">In-Use Now</th><th style="text-align:center">Ever Used</th><th>Last Seen</th></tr>
+          {%- for o in model_instances -%}
+            {%- if o.inuse == 'Y' -%}{%- set rcls='risk' -%}
+            {%- elif o.enabled | upper == 'TRUE' and o.ever_used == '1' -%}{%- set rcls='warn' -%}
+            {%- elif o.enabled | upper == 'TRUE' -%}{%- set rcls='' -%}
+            {%- elif o.ever_used == '1' -%}{%- set rcls='chk' -%}
+            {%- else -%}{%- set rcls='' -%}{%- endif -%}
+            {%- if o.platform == 'AIX' -%}{%- set pbadge = 'platform-aix' -%}{%- set plat_class = 'platform-aix-row' -%}
+            {%- elif o.platform == 'US-Linux' -%}{%- set pbadge = 'platform-us' -%}{%- set plat_class = 'platform-linux-row' -%}
+            {%- elif o.platform == 'EU-Linux' -%}{%- set pbadge = 'platform-eu' -%}{%- set plat_class = 'platform-linux-row' -%}
+            {%- else -%}{%- set pbadge = 'platform-badge' -%}{%- set plat_class = '' -%}{%- endif -%}
+          <tr class="{{ rcls }} env-model-row {{ plat_class }}">
+            <td><span class="platform-badge {{ pbadge }}">{{ o.platform }}</span></td>
+            <td class="mono">{{ o.host }}</td>
+            <td class="mono">{{ o.sid }}</td>
+            <td style="text-align:center">{{ '<span class="check-yes">✓</span>' if o.enabled | upper == 'TRUE' else '<span class="check-no">✗</span>' }}</td>
+            <td style="text-align:center">{{ '<span class="check-yes">✓</span>' if o.inuse == 'Y' else '<span class="check-no">✗</span>' }}</td>
+            <td style="text-align:center">{{ '<span class="bw">⚠</span>' if o.ever_used == '1' else '<span class="check-no">✗</span>' }}</td>
+            <td style="font-size:10px">{{ o.last_used_date if o.last_used_date != 'NEVER' else '<span style="color:#ccc">Never</span>' }}</td>
+          </tr>
+          {%- endfor -%}
+          </table>
+          {%- endif -%}
+          {%- if test_instances | length > 0 -%}
+          <div class="env-section"><span class="env-badge env-test">TEST-DEV</span> {{ test_instances | length }} instance(s)</div>
+          <table class="data">
+          <tr><th>Platform</th><th>Hostname</th><th>SID</th><th style="text-align:center">Enabled</th><th style="text-align:center">In-Use Now</th><th style="text-align:center">Ever Used</th><th>Last Seen</th></tr>
+          {%- for o in test_instances -%}
+            {%- if o.inuse == 'Y' -%}{%- set rcls='risk' -%}
+            {%- elif o.enabled | upper == 'TRUE' and o.ever_used == '1' -%}{%- set rcls='warn' -%}
+            {%- elif o.enabled | upper == 'TRUE' -%}{%- set rcls='' -%}
+            {%- elif o.ever_used == '1' -%}{%- set rcls='chk' -%}
+            {%- else -%}{%- set rcls='' -%}{%- endif -%}
+            {%- if o.platform == 'AIX' -%}{%- set pbadge = 'platform-aix' -%}{%- set plat_class = 'platform-aix-row' -%}
+            {%- elif o.platform == 'US-Linux' -%}{%- set pbadge = 'platform-us' -%}{%- set plat_class = 'platform-linux-row' -%}
+            {%- elif o.platform == 'EU-Linux' -%}{%- set pbadge = 'platform-eu' -%}{%- set plat_class = 'platform-linux-row' -%}
+            {%- else -%}{%- set pbadge = 'platform-badge' -%}{%- set plat_class = '' -%}{%- endif -%}
+          <tr class="{{ rcls }} env-test-row {{ plat_class }}">
+            <td><span class="platform-badge {{ pbadge }}">{{ o.platform }}</span></td>
+            <td class="mono">{{ o.host }}</td>
+            <td class="mono">{{ o.sid }}</td>
+            <td style="text-align:center">{{ '<span class="check-yes">✓</span>' if o.enabled | upper == 'TRUE' else '<span class="check-no">✗</span>' }}</td>
+            <td style="text-align:center">{{ '<span class="check-yes">✓</span>' if o.inuse == 'Y' else '<span class="check-no">✗</span>' }}</td>
+            <td style="text-align:center">{{ '<span class="bw">⚠</span>' if o.ever_used == '1' else '<span class="check-no">✗</span>' }}</td>
+            <td style="font-size:10px">{{ o.last_used_date if o.last_used_date != 'NEVER' else '<span style="color:#ccc">Never</span>' }}</td>
+          </tr>
+          {%- endfor -%}
+          </table>
+          {%- endif -%}
+          </div>
+            {%- endif -%}
+          {% endfor %}
+
+          <div class="toc">
+            <b>Jump to:</b>
+            <a href="#sec-voption-detail">&#128209; Option Evidence</a>
+            <a href="#sec-adg">&#128504; ADG</a>
+            <a href="#sec-compress">&#128230; Compression</a>
+            <a href="#sec-security">&#128274; TDE/Security</a>
+            <a href="#sec-inmem">&#9889; In-Memory</a>
+            <a href="#sec-pdb">&#128202; PDBs</a>
+            <a href="#sec-rac">&#128279; RAC</a>
+            <a href="#sec-inst">&#128203; Instances</a>
+            <a href="#sec-part">&#128200; Partitioning</a><br>
+            <span style="color:#90a4ae;font-size:11px">&#9432; In email: all sections fully visible. Open saved HTML file in browser for click-to-expand/collapse.</span>
+          </div>
+
+          {# ── Partitioning data parsed here; HTML rendered at end of report ── #}
+          {% set part_rows = [] %}
+          {% for line in (_part_raw.stdout | default('') | trim).split('\n') %}
+            {% if '|' in line %}{% set p = line.split('|') %}
+              {% if p | length >= 7 %}{% set _ = part_rows.append({'host': p[0]|trim, 'sid': p[1]|trim, 'owner': p[2]|trim, 'tbl': p[3]|trim, 'type': p[4]|trim, 'key': p[5]|trim, 'parts': p[6]|trim, 'size': p[7]|default('0')|trim}) %}{% endif %}
+            {% endif %}
+          {% endfor %}
+          {% set part_schemas = part_rows | map(attribute='owner') | list | unique | list %}
+          {% set part_insts = (part_rows | map(attribute='host') | list | zip(part_rows | map(attribute='sid') | list)) | list | unique | list %}
+
+          {# ── Advanced Compression ─────────────────────────────────────── #}
+          {% set comp_rows = [] %}
+          {% for line in (_compress_raw.stdout | default('') | trim).split('\n') %}
+            {% if '|' in line %}{% set p = line.split('|') %}
+              {% if p | length >= 6 %}{% set _ = comp_rows.append({'host': p[0]|trim, 'sid': p[1]|trim, 'owner': p[2]|trim, 'obj': p[3]|trim, 'type': p[4]|trim, 'cfor': p[5]|trim, 'size': p[6]|default('0')|trim}) %}{% endif %}
+            {% endif %}
+          {% endfor %}
+          {% set comp_schemas = comp_rows | map(attribute='owner') | list | unique | list %}
+          {% set comp_insts = (comp_rows | map(attribute='host') | list | zip(comp_rows | map(attribute='sid') | list)) | list | unique | list %}
+          <div class="sh sh-ora" id="sec-compress"><span>&#128230; Advanced Compression [ORACLE_OPT_D_COMPRESS, RUN_ID={{ _rpt_run_id }}]</span><a class="bk" href="#top">&#8679; top</a></div>
+          <div class="sumbox ora">
+            <b>{{ comp_rows | length }}</b> compressed objects &bull; <b>{{ comp_insts | length }}</b> instance(s) &bull; <b>{{ comp_schemas | length }}</b> schema(s){% if comp_schemas | length > 0 %}: {{ comp_schemas[:8] | join(', ') }}{% if comp_schemas | length > 8 %} &hellip; (+{{ comp_schemas | length - 8 }} more){% endif %}{% endif %}
+          </div>
+          {% if comp_rows | length > 0 %}
+          <div class="tog-hdr init-closed" onclick="togSec(this)">&#9660; {{ comp_rows | length }} compressed object(s) &mdash; click to expand/collapse</div>
+          <div class="tog-body">
+          <table class="data">
+          <tr><th>Host / SID</th><th>Owner</th><th>Object</th><th>Type</th><th>Compress For</th><th style="text-align:right">Size GB</th></tr>
+          {% for r in comp_rows %}
+          <tr><td class="mono">{{ r.host }}/{{ r.sid }}</td><td>{{ r.owner }}</td><td>{{ r.obj }}</td><td>{{ r.type }}</td><td>{{ r.cfor }}</td><td style="text-align:right">{{ r.size }}</td></tr>
+          {% endfor %}
+          </table></div>
+          {% else %}<p class="empty">No Advanced Compression objects in this run.</p>{% endif %}
+
+          {# ── Advanced Security / TDE ──────────────────────────────────── #}
+          {% set sec_rows = [] %}
+          {% for line in (_security_raw.stdout | default('') | trim).split('\n') %}
+            {% if '|' in line %}{% set p = line.split('|') %}
+              {% if p | length >= 6 %}{% set _ = sec_rows.append({'host': p[0]|trim, 'sid': p[1]|trim, 'type': p[2]|trim, 'owner': p[3]|trim, 'obj': p[4]|trim, 'enc': p[5]|trim, 'alg': p[6]|default('')|trim}) %}{% endif %}
+            {% endif %}
+          {% endfor %}
+          <div class="sh sh-grey" id="sec-security"><span>&#128274; Advanced Security / TDE [ORACLE_OPT_D_SECURITY, RUN_ID={{ _rpt_run_id }}]</span><a class="bk" href="#top">&#8679; top</a></div>
+          <div class="sumbox"><b>{{ sec_rows | length }}</b> encrypted object(s)</div>
+          {% if sec_rows | length > 0 %}
+          <div class="tog-hdr init-closed" onclick="togSec(this)">&#9660; {{ sec_rows | length }} encrypted object(s) &mdash; click to expand/collapse</div>
+          <div class="tog-body">
+          <table class="data">
+          <tr><th>Host / SID</th><th>Type</th><th>Owner / TS</th><th>Object</th><th>Encrypted</th><th>Algorithm</th></tr>
+          {% for r in sec_rows %}
+          <tr><td class="mono">{{ r.host }}/{{ r.sid }}</td><td>{{ r.type }}</td><td>{{ r.owner }}</td><td>{{ r.obj }}</td><td>{{ r.enc }}</td><td>{{ r.alg }}</td></tr>
+          {% endfor %}
+          </table></div>
+          {% else %}<p class="empty">No TDE encrypted objects in this run.</p>{% endif %}
+
+          {# ── In-Memory Column Store (with VOPTION fallback) ───────────── #}
+          {% set inmem_rows = [] %}
+          {% for line in (_inmem_raw.stdout | default('') | trim).split('\n') %}
+            {% if '|' in line %}{% set p = line.split('|') %}
+              {% if p | length >= 6 %}{% set _ = inmem_rows.append({'host': p[0]|trim, 'sid': p[1]|trim, 'owner': p[2]|trim, 'tbl': p[3]|trim, 'prio': p[4]|trim, 'comp': p[5]|trim, 'size': p[6]|default('0')|trim}) %}{% endif %}
+            {% endif %}
+          {% endfor %}
+          {% set inmem_vopt = [] %}
+          {% for line in (_inmem_voption_raw.stdout | default('') | trim).split('\n') %}
+            {% if '|' in line %}{% set p = line.split('|') %}
+              {% if p | length >= 5 %}{% set _ = inmem_vopt.append({'host': p[0]|trim, 'sid': p[1]|trim, 'enabled': p[2]|trim, 'inuse': p[3]|trim, 'ver': p[4]|trim, 'role': p[5]|default('')|trim}) %}{% endif %}
+            {% endif %}
+          {% endfor %}
+          {% set inmem_insts = (inmem_rows | map(attribute='host') | list | zip(inmem_rows | map(attribute='sid') | list)) | list | unique | list %}
+          <div class="sh sh-red" id="sec-inmem"><span>&#9889; In-Memory Column Store [ORACLE_OPT_D_INMEM, RUN_ID={{ _rpt_run_id }}]</span><a class="bk" href="#top">&#8679; top</a></div>
+          {% if inmem_rows | length > 0 %}
+          <div class="sumbox red">
+            <b>{{ inmem_rows | length }}</b> In-Memory table(s) &bull; <b>{{ inmem_insts | length }}</b> instance(s){% if inmem_insts | length > 0 %}: {{ inmem_insts | map('join', '/') | list | join(', ') }}{% endif %}
+          </div>
+          <div class="tog-hdr init-closed" onclick="togSec(this)">&#9660; {{ inmem_rows | length }} In-Memory table(s) &mdash; click to expand/collapse</div>
+          <div class="tog-body">
+          <table class="data">
+          <tr><th>Host / SID</th><th>Owner</th><th>Table</th><th>Priority</th><th>Compression</th><th style="text-align:right">Size GB</th></tr>
+          {% for r in inmem_rows %}
+          <tr><td class="mono">{{ r.host }}/{{ r.sid }}</td><td>{{ r.owner }}</td><td>{{ r.tbl }}</td><td>{{ r.prio }}</td><td>{{ r.comp }}</td><td style="text-align:right">{{ r.size }}</td></tr>
+          {% endfor %}
+          </table></div>
+          {% elif inmem_vopt | length > 0 %}
+          <div class="sumbox red"><b>{{ inmem_vopt | length }}</b> instance(s) with In-Memory option enabled/detected &mdash; <b>no tables configured with INMEMORY attribute</b></div>
+          <div class="notebox">
+            <b>What this means:</b> <code>v$option</code> shows <em>In-Memory Column Store</em> is available (or dba_feature_usage_statistics detected prior usage),
+            but <strong>no tables have been explicitly loaded into the In-Memory Column Store</strong> (<code>ALTER TABLE ... INMEMORY</code>).
+            This is common on Oracle EE installs where <code>inmemory_size &gt; 0</code> in the spfile but no objects are configured.
+            Check the <code>inmemory_size</code> parameter and <code>V$IM_SEGMENTS</code> on each instance below to confirm.
+          </div>
+          <div class="tog-hdr" onclick="togSec(this)">&#9660; {{ inmem_vopt | length }} instance(s) where In-Memory option is available</div>
+          <div class="tog-body">
+          <table class="data">
+          <tr><th>Hostname</th><th>SID</th><th>v$option Enabled</th><th>Feature In-Use</th><th>Version</th><th>DB Role</th></tr>
+          {% for r in inmem_vopt %}
+          <tr class="{{ 'risk' if r.inuse == 'Y' else 'warn' }}">
+            <td class="mono">{{ r.host }}</td><td class="mono">{{ r.sid }}</td>
+            <td style="text-align:center">{{ r.enabled }}</td>
+            <td style="text-align:center">{{ '<span class="br">YES</span>' if r.inuse == 'Y' else '&mdash;' }}</td>
+            <td>{{ r.ver }}</td><td>{{ r.role }}</td>
+          </tr>
+          {% endfor %}
+          </table></div>
+          {% else %}
+          <div class="sumbox"><b>0</b> In-Memory table(s)</div>
+          <p class="empty">No In-Memory Column Store objects in this run.</p>
+          {% endif %}
+
+          {# ── Multitenant / PDB ───────────────────────────────────────── #}
+          {% set pdb_rows = [] %}
+          {% for line in (_pdb_raw.stdout | default('') | trim).split('\n') %}
+            {% if '|' in line %}{% set p = line.split('|') %}
+              {% if p | length >= 5 %}{% set _ = pdb_rows.append({'host': p[0]|trim, 'sid': p[1]|trim, 'conid': p[2]|trim, 'pdb': p[3]|trim, 'mode': p[4]|trim, 'rest': p[5]|default('')|trim, 'cdate': p[6]|default('')|trim}) %}{% endif %}
+            {% endif %}
+          {% endfor %}
+          {% set pdb_cdbs = (pdb_rows | map(attribute='host') | list | zip(pdb_rows | map(attribute='sid') | list)) | list | unique | list %}
+          <div class="sh sh-grey" id="sec-pdb"><span>&#128202; Multitenant / PDB List [ORACLE_OPT_D_PDB, RUN_ID={{ _rpt_run_id }}]</span><a class="bk" href="#top">&#8679; top</a></div>
+          <div class="sumbox"><b>{{ pdb_rows | length }}</b> PDB(s) across <b>{{ pdb_cdbs | length }}</b> CDB instance(s)</div>
+          {% if pdb_rows | length > 0 %}
+          <div class="tog-hdr init-closed" onclick="togSec(this)">&#9660; {{ pdb_rows | length }} PDB(s) across {{ pdb_cdbs | length }} CDB(s) &mdash; click to expand/collapse</div>
+          <div class="tog-body">
+          <table class="data">
+          <tr><th>Host / SID</th><th>CON_ID</th><th>PDB Name</th><th>Open Mode</th><th>Restricted</th><th>Created</th></tr>
+          {% for r in pdb_rows %}
+          <tr><td class="mono">{{ r.host }}/{{ r.sid }}</td><td>{{ r.conid }}</td><td>{{ r.pdb }}</td><td>{{ r.mode }}</td><td>{{ r.rest }}</td><td>{{ r.cdate }}</td></tr>
+          {% endfor %}
+          </table></div>
+          {% else %}<p class="empty">No PDBs in this run &mdash; all instances are non-CDB.</p>{% endif %}
+
+          {# ── Active Data Guard (with VOPTION fallback) ────────────────── #}
+          {% set adg_rows = [] %}
+          {% for line in (_adg_raw.stdout | default('') | trim).split('\n') %}
+            {% if '|' in line %}{% set p = line.split('|') %}
+              {% if p | length >= 6 %}{% set _ = adg_rows.append({'host': p[0]|trim, 'sid': p[1]|trim, 'uname': p[2]|trim, 'role': p[3]|trim, 'mode': p[4]|trim, 'fal': p[5]|trim, 'scn': p[6]|default('')|trim}) %}{% endif %}
+            {% endif %}
+          {% endfor %}
+          {% set adg_vopt = [] %}
+          {% for line in (_adg_voption_raw.stdout | default('') | trim).split('\n') %}
+            {% if '|' in line %}{% set p = line.split('|') %}
+              {% if p | length >= 5 %}{% set _ = adg_vopt.append({'host': p[0]|trim, 'sid': p[1]|trim, 'enabled': p[2]|trim, 'inuse': p[3]|trim, 'ver': p[4]|trim, 'role': p[5]|default('')|trim}) %}{% endif %}
+            {% endif %}
+          {% endfor %}
+          <div class="sh sh-red" id="sec-adg"><span>&#128504; Active Data Guard [ORACLE_OPT_D_ADG, RUN_ID={{ _rpt_run_id }}]</span><a class="bk" href="#top">&#8679; top</a></div>
+          {% if adg_rows | length > 0 %}
+          {% set adg_insts = (adg_rows | map(attribute='host') | list | zip(adg_rows | map(attribute='sid') | list)) | list | unique | list %}
+          <div class="sumbox red"><b>{{ adg_rows | length }}</b> ADG detail row(s) &bull; <b>{{ adg_insts | length }}</b> instance(s)</div>
+          <div class="tog-hdr" onclick="togSec(this)">&#9660; {{ adg_rows | length }} ADG row(s)</div>
+          <div class="tog-body">
+          <table class="data">
+          <tr><th>Host / SID</th><th>DB Unique Name</th><th>DB Role</th><th>Open Mode</th><th>FAL Server</th><th>Applied SCN</th></tr>
+          {% for r in adg_rows %}
+          <tr><td class="mono">{{ r.host }}/{{ r.sid }}</td><td>{{ r.uname }}</td><td>{{ r.role }}</td><td>{{ r.mode }}</td><td>{{ r.fal }}</td><td>{{ r.scn }}</td></tr>
+          {% endfor %}
+          </table></div>
+          {% elif adg_vopt | length > 0 %}
+          <div class="sumbox red"><b>{{ adg_vopt | length }}</b> instance(s) with ADG enabled or in-use (detail table empty for this run)</div>
+          <div class="notebox">
+            <b>Note:</b> ORACLE_OPT_D_ADG has no detail rows for this run (detail collection may have been introduced after run #{{ _rpt_run_id }}).
+            The EE Risk table above derives counts from <code>ORACLE_OPT_VOPTION</code> (v$option) and <code>ORACLE_OPT_FEATURES</code> (dba_feature_usage_statistics).<br>
+            Below are instances where the ADG option is <b>enabled or in-use</b> according to ORACLE_OPT_VOPTION &mdash; these drive the risk count.
+          </div>
+          <div class="tog-hdr" onclick="togSec(this)">&#9660; {{ adg_vopt | length }} instance(s) with ADG option</div>
+          <div class="tog-body">
+          <table class="data">
+          <tr><th>Hostname</th><th>SID</th><th>v$option Enabled</th><th>Feature In-Use</th><th>Version</th><th>DB Role</th></tr>
+          {% for r in adg_vopt %}
+          <tr class="{{ 'risk' if r.inuse == 'Y' else 'warn' }}">
+            <td class="mono">{{ r.host }}</td><td class="mono">{{ r.sid }}</td>
+            <td style="text-align:center">{{ r.enabled }}</td>
+            <td style="text-align:center">{{ '<span class="br">YES</span>' if r.inuse == 'Y' else '&mdash;' }}</td>
+            <td>{{ r.ver }}</td><td>{{ r.role }}</td>
+          </tr>
+          {% endfor %}
+          </table></div>
+          {% else %}
+          <p class="empty">No Active Data Guard data in this run.</p>
+          {% endif %}
+
+          {# ── Real Application Clusters (requires RAC license option enabled & in-use) ── #}
+          {% set rac_rows = [] %}
+          {% for line in (_rac_raw.stdout | default('') | trim).split('\n') %}
+            {% if '|' in line %}{% set p = line.split('|') %}
+              {% if p | length >= 5 %}{% set _ = rac_rows.append({'host': p[0]|trim, 'sid': p[1]|trim, 'inst': p[2]|trim, 'iname': p[3]|trim, 'node': p[4]|trim, 'status': p[5]|default('')|trim}) %}{% endif %}
+            {% endif %}
+          {% endfor %}
+          {% set rac_dbs = (rac_rows | map(attribute='host') | list | zip(rac_rows | map(attribute='sid') | list)) | list | unique | list %}
+          <div class="sh sh-grey" id="sec-rac"><span>&#128279; Real Application Clusters [ORACLE_OPT_D_RAC, RUN_ID={{ _rpt_run_id }}]</span><a class="bk" href="#top">&#8679; top</a></div>
+          <div class="notebox"><b>Note:</b> This section shows only databases with the <b>"Real Application Clusters"</b> license option <b>ENABLED &amp; IN-USE</b>. Grid Infrastructure HA failover clusters (without RAC license) are <b>NOT</b> included here. RAC requires active multi-instance access to the same database simultaneously.</div>
+          <div class="sumbox"><b>{{ rac_dbs | length }}</b> RAC database(s) &bull; <b>{{ rac_rows | length }}</b> node-instance(s)</div>
+          {% if rac_rows | length > 0 %}
+          <div class="tog-hdr init-closed" onclick="togSec(this)">&#9660; {{ rac_rows | length }} RAC node(s) &mdash; click to expand/collapse</div>
+          <div class="tog-body">
+          <table class="data">
+          <tr><th>Host / SID</th><th>Inst #</th><th>Instance Name</th><th>Node Host</th><th>Status</th></tr>
+          {% for r in rac_rows %}
+          <tr><td class="mono">{{ r.host }}/{{ r.sid }}</td><td>{{ r.inst }}</td><td>{{ r.iname }}</td><td>{{ r.node }}</td><td>{{ r.status }}</td></tr>
+          {% endfor %}
+          </table></div>
+          {% else %}<p class="empty">No RAC databases in this run.</p>{% endif %}
+
+          {# ── Instance Summary ─────────────────────────────────────────── #}
+          <div class="sh sh-grey" id="sec-inst"><span>&#128203; Instance Summary</span><a class="bk" href="#top">&#8679; top</a></div>
+          <div class="tog-hdr init-closed" onclick="togSec(this)">&#9660; All {{ _rpt_queried }} instance(s) &mdash; click to expand/collapse</div>
+          <div class="tog-body">
+          <table class="data">
+          <tr><th>Hostname</th><th>SID</th><th>Version</th><th>Status</th><th>Role / Note</th></tr>
+          {% for line in (_inst_raw.stdout | default('') | trim).split('\n') %}
+            {% if '|' in line %}{% set p = line.split('|') %}
+              {% if p | length >= 4 %}
+                {% set hostname = p[0]|trim %}{% set sid = p[1]|trim %}{% set ver = p[2]|trim %}
+                {% set standby = p[3]|trim %}{% set was_queried = p[4]|trim %}
+                {% set skipreason = p[5]|trim %}{% set role = p[6]|trim %}
+                {% if standby == 'Y' %}{% set status = 'STANDBY' %}{% set rowcls = 'chk' %}
+                {% elif was_queried == 'N' %}{% set status = 'SKIPPED' %}{% set rowcls = 'warn' %}
+                {% else %}{% set status = 'OK' %}{% set rowcls = '' %}{% endif %}
+          <tr class="{{ rowcls }}"><td class="mono">{{ hostname }}</td><td class="mono">{{ sid }}</td><td>{{ ver }}</td><td>{{ status }}</td><td>{{ skipreason if was_queried == 'N' else role }}</td></tr>
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          </table></div>
+
+          {# ── Partitioning (last section — most rows, moved here) ────── #}
+          <div class="sh sh-red" id="sec-part"><span>&#128200; Partitioning [ORACLE_OPT_D_PART, RUN_ID={{ _rpt_run_id }}]</span><a class="bk" href="#top">&#8679; top</a></div>
+          <div class="sumbox red">
+            <b>{{ part_rows | length }}</b> partitioned objects &bull; <b>{{ part_insts | length }}</b> instance(s) &bull; <b>{{ part_schemas | length }}</b> schema(s){% if part_schemas | length > 0 %}: {{ part_schemas[:12] | join(', ') }}{% if part_schemas | length > 12 %} &hellip; (+{{ part_schemas | length - 12 }} more){% endif %}{% endif %}
+          </div>
+          {% if part_rows | length > 0 %}
+          <div class="tog-hdr init-closed" onclick="togSec(this)">&#9660; {{ part_rows | length }} partitioned object(s) &mdash; click to expand/collapse</div>
+          <div class="tog-body">
+          <table class="data">
+          <tr><th>Host / SID</th><th>Owner</th><th>Table</th><th>Type</th><th>Partition Key</th><th style="text-align:right">Parts</th><th style="text-align:right">Size GB</th></tr>
+          {% for r in part_rows %}
+          <tr><td class="mono" title="{{ r.host }}/{{ r.sid }}">{{ r.host }}/{{ r.sid }}</td><td>{{ r.owner }}</td><td title="{{ r.tbl }}">{{ r.tbl }}</td><td>{{ r.type }}</td><td>{{ r.key }}</td><td style="text-align:right">{{ r.parts }}</td><td style="text-align:right">{{ r.size }}</td></tr>
+          {% endfor %}
+          </table></div>
+          {% else %}<p class="empty">No partitioned objects in this run.</p>{% endif %}
+
+          <div class="footer">
+            Full data: <code>{{ repo_host }}:{{ repo_port }}/{{ repo_sid }}</code> &bull;
+            Schema: <code>{{ repo_schema | upper }}</code> &bull; RUN_ID: <code>{{ _rpt_run_id }}</code><br>
+            &#128196; Interactive report (navigation + collapsible sections) &rarr; open in browser:<br>
+            <code>{{ report_output_dir | default('/tmp') }}/oracle_audit_{{ _report_timestamp }}.html</code><br>
+            Tables: ORACLE_OPT_RUNS, ORACLE_OPT_INSTANCES, ORACLE_OPT_VOPTION, ORACLE_OPT_FEATURES,
+            ORACLE_OPT_D_PART, ORACLE_OPT_D_COMPRESS, ORACLE_OPT_D_SECURITY, ORACLE_OPT_D_INMEM,
+            ORACLE_OPT_D_PDB, ORACLE_OPT_D_ADG, ORACLE_OPT_D_RAC<br>
+            <em>Generated by Ansible DBA Automation &bull; Data collected: {{ _rpt_date }} &bull; Report generated: {{ _report_timestamp | replace('_', ' ') | replace('-', ':') }}</em>
+          </div>
+          <script>
+          function togSec(h){var b=h.nextElementSibling;var open=b.style.display!=='none';b.style.display=open?'none':'';h.innerHTML=open?h.innerHTML.replace('\u25BC','\u25B6'):h.innerHTML.replace('\u25B6','\u25BC');}
+          document.addEventListener('DOMContentLoaded',function(){document.querySelectorAll('.tog-hdr.init-closed').forEach(function(h){h.nextElementSibling.style.display='none';h.innerHTML=h.innerHTML.replace('\u25BC','\u25B6');});});
+          </script>
+          </div></body></html>
+
+    - name: Save HTML report to local file
+      ansible.builtin.copy:
+        content: "{{ _html_report }}"
+        dest: "{{ report_output_dir | default('/tmp') }}/oracle_audit_{{ _report_timestamp }}.html"
+        mode: '0644'
+      delegate_to: localhost
+      become: no
+
+    - name: Save text report to local file
+      ansible.builtin.copy:
+        content: "{{ _full_report }}"
+        dest: "{{ report_output_dir | default('/tmp') }}/oracle_audit_{{ _report_timestamp }}.txt"
+        mode: '0644'
+      delegate_to: localhost
+      become: no
+
+    - name: Show report file locations
+      ansible.builtin.debug:
+        msg:
+          - "HTML report saved: {{ report_output_dir | default('/tmp') }}/oracle_audit_{{ _report_timestamp }}.html"
+          - "Text report saved: {{ report_output_dir | default('/tmp') }}/oracle_audit_{{ _report_timestamp }}.txt"
+
+    - name: Send report email with attachments
+      community.general.mail:
+        host:    "{{ smtp_host }}"
+        port:    "{{ smtp_port }}"
+        from:    "{{ email_from }}"
+        to:      "{{ email_to }}"
+        subject: "[Oracle License Audit] EE Options Investigation — {{ _report_timestamp | replace('_', ' ') }} | {{ _rpt_hosts }} Hosts | {{ _rpt_queried }} Instances"
+        subtype: html
+        body: |
+          <html>
+          <head>
+            <style>
+              body { font-family: 'Segoe UI', Arial, sans-serif; font-size: 14px; color: #333; line-height: 1.6; max-width: 900px; margin: 0 auto; }
+              .header { background: linear-gradient(135deg, #1565c0 0%, #0d47a1 100%); color: white; padding: 30px; border-radius: 8px 8px 0 0; }
+              .header h1 { margin: 0 0 10px 0; font-size: 24px; font-weight: 600; }
+              .header p { margin: 5px 0; opacity: 0.95; font-size: 13px; }
+              .content { padding: 30px; background: #fff; }
+              .section { margin-bottom: 25px; }
+              .section-title { color: #1565c0; font-size: 16px; font-weight: 600; margin-bottom: 12px; border-bottom: 2px solid #e3f2fd; padding-bottom: 8px; }
+              .summary-box { background: #f5f5f5; border-left: 4px solid #1565c0; padding: 15px 20px; margin: 15px 0; border-radius: 4px; }
+              .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 15px 0; }
+              .stat-card { background: white; border: 1px solid #e0e0e0; padding: 15px; text-align: center; border-radius: 6px; }
+              .stat-number { font-size: 28px; font-weight: 700; color: #1565c0; display: block; margin-bottom: 5px; }
+              .stat-label { font-size: 12px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
+              .platform-item { padding: 8px 15px; margin: 5px 0; background: #fafafa; border-left: 3px solid #4caf50; border-radius: 3px; }
+              .platform-aix { border-left-color: #ff9800; }
+              .platform-us { border-left-color: #2196f3; }
+              .platform-eu { border-left-color: #9c27b0; }
+              .risk-high { color: #d32f2f; font-weight: 600; }
+              .risk-medium { color: #f57c00; font-weight: 600; }
+              .attachment-box { background: #e3f2fd; padding: 15px 20px; border-radius: 6px; margin: 15px 0; }
+              .attachment-item { margin: 8px 0; padding-left: 25px; position: relative; }
+              .attachment-item:before { content: "📎"; position: absolute; left: 0; }
+              .footer { background: #f5f5f5; padding: 20px; text-align: center; font-size: 11px; color: #999; border-radius: 0 0 8px 8px; }
+              ul { padding-left: 20px; }
+              li { margin: 8px 0; }
+              .key-finding { background: #fff3e0; border-left: 4px solid #ff9800; padding: 12px 18px; margin: 10px 0; border-radius: 4px; }
+            </style>
+          </head>
+          <body>
+            <div class="header">
+              <h1>🔍 Oracle Enterprise Edition Options Investigation</h1>
+              <p><b>Report Generated:</b> {{ _report_timestamp | replace('_', ' ') | replace('-', ':', 2) }} | <b>Data Collected:</b> {{ _rpt_date }} | <b>Audit Cycles:</b> {{ _rpt_label }} | <b>Reference:</b> {{ _rpt_run_id }}</p>
+            </div>
+            
+            <div class="content">
+              <!-- Executive Summary -->
+              <div class="section">
+                <div class="section-title">📊 Executive Summary</div>
+                <div class="summary-box">
+                  <p><b>Purpose:</b> This automated audit investigates Oracle Enterprise Edition extra-cost options and advanced features across our infrastructure to identify potential license compliance risks and optimization opportunities.</p>
+                  <p><b>Scope:</b> {%- if _report_mode == 'all_hosts' -%}Comprehensive audit showing ALL UNIQUE HOSTS from the repository, each with their latest individual audit data. This ensures complete visibility across all platforms and regions collected over time.{%- else -%}Comprehensive scan of v$option settings, dba_feature_usage_statistics, and supporting evidence queries including partitioning tables, compression details, TDE encryption, In-Memory configuration, and Active Data Guard settings.{%- endif -%}</p>
+                </div>
+                
+                <div class="stats-grid">
+                  {%- if _report_mode == 'all_hosts' and _all_hosts_status_raw is defined -%}
+                  {%- set total_unique_hosts = (_all_hosts_status_raw.stdout | default('') | trim).split('\n') | select('search', '\\|') | list | length -%}
+                  <div class="stat-card">
+                    <span class="stat-number">{{ total_unique_hosts }}</span>
+                    <span class="stat-label">Unique Hosts (All Time)</span>
+                  </div>
+                  {%- else -%}
+                  <div class="stat-card">
+                    <span class="stat-number">{{ _rpt_hosts }}</span>
+                    <span class="stat-label">Hosts Audited</span>
+                  </div>
+                  {%- endif -%}
+                  <div class="stat-card">
+                    <span class="stat-number">{{ _rpt_queried }}</span>
+                    <span class="stat-label">Instances Queried</span>
+                  </div>
+                  <div class="stat-card">
+                    <span class="stat-number">{{ _rpt_standby }}</span>
+                    <span class="stat-label">Standby Databases</span>
+                  </div>
+                  <div class="stat-card">
+                    <span class="stat-number">{{ _rpt_skipped }}</span>
+                    <span class="stat-label">Skipped/Offline</span>
+                  </div>
+                </div>
+              </div>
+
+              {%- if _platform_breakdown_raw is defined and _platform_breakdown_raw.stdout is defined -%}
+              {%- set platforms = [] -%}
+              {%- for line in (_platform_breakdown_raw.stdout | default('') | trim).split('\n') -%}
+                {%- if '|' in line -%}
+                  {%- set p = line.split('|') -%}
+                  {%- if p | length >= 6 -%}
+                    {%- set _ = platforms.append({'name': p[0]|trim, 'environment': p[1]|trim, 'run_id': p[2]|trim, 'date': p[3]|trim, 'hosts': p[4]|trim, 'instances': p[5]|trim}) -%}
+                  {%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {%- if platforms | length > 0 -%}
+              <!-- Platform Coverage -->
+              <div class="section">
+                <div class="section-title">🌐 Platform & Environment Coverage</div>
+                {%- for plat in platforms -%}
+                <div class="platform-item platform-{{ plat.name | lower | replace('-', '') | replace('linux', '') }}">
+                  <b>{{ plat.name }} / {{ plat.environment }}:</b> {{ plat.hosts }} hosts, {{ plat.instances }} instances | Last audited: {{ plat.date }} (Run #{{ plat.run_id }})
+                </div>
+                {%- endfor -%}
+              </div>
+              {%- endif -%}
+              {%- endif -%}
+
+              {%- if _report_mode == 'all_hosts' and _ee_license_stats_raw is defined and _ee_license_stats_raw.stdout is defined -%}
+              {%- set ee_stats = [] -%}
+              {%- for line in (_ee_license_stats_raw.stdout | default('') | trim).split('\n') -%}
+                {%- if '|' in line -%}
+                  {%- set p = line.split('|') -%}
+                  {%- if p | length >= 7 -%}
+                    {%- set _ = ee_stats.append({
+                        'option': p[0]|trim,
+                        'enabled_inst': p[1]|trim,
+                        'inuse_inst': p[2]|trim,
+                        'enabled_hosts': p[3]|trim,
+                        'inuse_hosts': p[4]|trim,
+                        'ever_used_inst': p[5]|trim,
+                        'ever_used_hosts': p[6]|trim
+                    }) -%}
+                  {%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {%- if ee_stats | length > 0 -%}
+              <!-- EE License Overview -->
+              <div class="section">
+                <div class="section-title">📋 Oracle EE Extra-Cost Options Overview</div>
+                <div class="summary-box">
+                  <p><b>Overview:</b> The following Oracle Enterprise Edition extra-cost options have been detected as <b>enabled</b> or <b>in-use</b> across your environment.</p>
+                  <p style="font-size: 11px; color: #666; margin-top: 8px;">
+                    <b>Risk Levels:</b> 
+                    <span style="background: #c62828; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px;">!! RISK</span> = In-use NOW (active license exposure) | 
+                    <span style="background: #f57c00; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px;">!! WARN</span> = Enabled + Historical use only | 
+                    <span style="background: #78909c; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px;">~~ INFO</span> = Enabled, never used | 
+                    <span style="background: #fbc02d; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px;">~~ CHK</span> = Disabled but has history
+                  </p>
+                </div>
+                <table style="width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px;">
+                  <tr style="background: #37474f; color: white;">
+                    <th style="padding: 8px; text-align: left;">Option Name</th>
+                    <th style="padding: 8px; text-align: center;">Enabled<br><span style="font-size: 10px; font-weight: normal;">(hosts/instances)</span></th>
+                    <th style="padding: 8px; text-align: center;">In-Use Now<br><span style="font-size: 10px; font-weight: normal;">(hosts/instances)</span></th>
+                    <th style="padding: 8px; text-align: center;">Ever Used<br><span style="font-size: 10px; font-weight: normal;">(hosts/instances)</span></th>
+                    <th style="padding: 8px; text-align: center;">Risk Level</th>
+                  </tr>
+                  {%- for stat in ee_stats -%}
+                  {%- set inuse_now = (stat.inuse_inst | int > 0) -%}
+                  {%- set is_enabled = (stat.enabled_inst | int > 0) -%}
+                  {%- set has_history = (stat.ever_used_inst | int > 0) -%}
+                  {%- if inuse_now -%}
+                    {%- set row_style = 'background: #ffcdd2;' -%}
+                    {%- set risk_badge = '<span style="background: #c62828; color: white; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: bold;">!! RISK</span>' -%}
+                  {%- elif is_enabled and has_history -%}
+                    {%- set row_style = 'background: #ffe0b2;' -%}
+                    {%- set risk_badge = '<span style="background: #f57c00; color: white; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: bold;">!! WARN</span>' -%}
+                  {%- elif is_enabled -%}
+                    {%- set row_style = 'background: #f5f5f5;' -%}
+                    {%- set risk_badge = '<span style="background: #78909c; color: white; padding: 2px 8px; border-radius: 3px; font-size: 11px;">~~ INFO</span>' -%}
+                  {%- elif has_history -%}
+                    {%- set row_style = 'background: #fff9c4;' -%}
+                    {%- set risk_badge = '<span style="background: #fbc02d; color: white; padding: 2px 8px; border-radius: 3px; font-size: 11px;">~~ CHK</span>' -%}
+                  {%- else -%}
+                    {%- set row_style = '' -%}
+                    {%- set risk_badge = '<span style="color: #888;">-</span>' -%}
+                  {%- endif -%}
+                  <tr style="{{ row_style }}">
+                    <td style="padding: 6px 8px; border-bottom: 1px solid #e0e0e0;"><b>{{ stat.option }}</b></td>
+                    <td style="padding: 6px 8px; border-bottom: 1px solid #e0e0e0; text-align: center;">{{ stat.enabled_hosts }} / {{ stat.enabled_inst }}</td>
+                    <td style="padding: 6px 8px; border-bottom: 1px solid #e0e0e0; text-align: center;"><b>{{ stat.inuse_hosts }} / {{ stat.inuse_inst }}</b></td>
+                    <td style="padding: 6px 8px; border-bottom: 1px solid #e0e0e0; text-align: center;">{{ stat.ever_used_hosts }} / {{ stat.ever_used_inst }}</td>
+                    <td style="padding: 6px 8px; border-bottom: 1px solid #e0e0e0; text-align: center;">{{ risk_badge }}</td>
+                  </tr>
+                  {%- endfor -%}
+                </table>
+              </div>
+              {%- endif -%}
+              {%- endif -%}
+
+              {%- set vopts = [] -%}
+              {%- set raw_email_data = (_voption_raw.stdout | default('') | trim) -%}
+              {%- for line in raw_email_data.split('\n') -%}
+                {%- if '|' in line and line | trim | length > 0 -%}
+                  {%- set p = line.split('|') -%}
+                  {%- if p | length >= 9 -%}
+                    {%- set opt_name = p[0]|trim -%}
+                    {%- set hostname = p[1]|trim -%}
+                    {%- set sid = p[2]|trim -%}
+                    {%- set enabled_val = p[3]|trim | upper -%}
+                    {%- set inuse_val = p[4]|trim | upper -%}
+                    {%- set platform = p[5]|trim -%}
+                    {%- set environment = p[6]|trim -%}
+                    {%- set ever_used_val = p[7]|trim -%}
+                    {%- set _ = vopts.append({
+                        'name': opt_name,
+                        'host': hostname,
+                        'sid': sid,
+                        'enabled': enabled_val,
+                        'inuse': inuse_val,
+                        'platform': platform,
+                        'environment': environment,
+                        'ever_used': ever_used_val
+                    }) -%}
+                  {%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {%- set high_risk_options = [] -%}
+              {%- set warn_options = [] -%}
+              {%- set info_options = [] -%}
+              {%- for opt_name in ee_extra_options -%}
+                {%- set opt_count = namespace(enabled=0, inuse=0, ever_used=0) -%}
+                {%- for o in vopts -%}
+                  {# Case-insensitive name matching #}
+                  {%- if o.name == opt_name or (o.name | upper) == (opt_name | upper) -%}
+                    {# Normalize boolean checks - accept TRUE/Y/1 #}
+                    {%- if o.enabled in ['TRUE', 'Y', '1'] -%}{%- set opt_count.enabled = opt_count.enabled + 1 -%}{%- endif -%}
+                    {%- if o.inuse in ['Y', 'TRUE', '1'] -%}{%- set opt_count.inuse = opt_count.inuse + 1 -%}{%- endif -%}
+                    {%- if o.ever_used in ['1', 'Y', 'TRUE'] -%}{%- set opt_count.ever_used = opt_count.ever_used + 1 -%}{%- endif -%}
+                  {%- endif -%}
+                {%- endfor -%}
+                {%- if opt_count.inuse > 0 -%}
+                  {%- set _ = high_risk_options.append({'name': opt_name, 'enabled': opt_count.enabled, 'inuse': opt_count.inuse, 'ever_used': opt_count.ever_used}) -%}
+                {%- elif opt_count.enabled > 0 and opt_count.ever_used > 0 -%}
+                  {%- set _ = warn_options.append({'name': opt_name, 'enabled': opt_count.enabled, 'ever_used': opt_count.ever_used}) -%}
+                {%- elif opt_count.enabled > 0 -%}
+                  {%- set _ = info_options.append({'name': opt_name, 'enabled': opt_count.enabled}) -%}
+                {%- endif -%}
+              {%- endfor -%}
+
+              <!-- Key Findings -->
+              <div class="section">
+                <div class="section-title">⚠️ Key Findings</div>
+                {%- if raw_email_data | length == 0 -%}
+                <div style="background: #fff3e0; border-left: 4px solid #ff9800; padding: 12px 18px; margin: 10px 0; border-radius: 4px;">
+                  <b>⚠️ Data Validation Issue:</b> No EE extra-cost option data found in repository. This may indicate:<br>
+                  <ul style="margin: 8px 0; font-size: 12px;">
+                    <li>IS_EE_EXTRA column not set during collection</li>
+                    <li>No data collected yet (run collect_oracle_options.yml first)</li>
+                    <li>Run ID mismatch (verify RUN_ID: {{ _eff_run_id }})</li>
+                  </ul>
+                  See attached HTML report for detailed diagnostics.
+                </div>
+                {%- else -%}
+                {%- if high_risk_options | length > 0 -%}
+                <div style="background: #ffcdd2; border-left: 4px solid #c62828; padding: 12px 18px; margin: 10px 0; border-radius: 4px;">
+                  <p><span style="background: #c62828; color: white; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: bold;">!! RISK</span> <b>ACTIVE LICENSE EXPOSURE:</b> The following extra-cost options are <b>IN-USE NOW</b> (requires licensing or immediate remediation):</p>
+                  <ul style="margin-top: 8px;">
+                    {%- for opt in high_risk_options -%}
+                    <li><b>{{ opt.name }}</b> — In-Use on {{ opt.inuse }} instances</li>
+                    {%- endfor -%}
+                  </ul>
+                </div>
+                {%- endif -%}
+                {%- if warn_options | length > 0 -%}
+                <div style="background: #ffe0b2; border-left: 4px solid #f57c00; padding: 12px 18px; margin: 10px 0; border-radius: 4px;">
+                  <p><span style="background: #f57c00; color: white; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: bold;">!! WARN</span> <b>HISTORICAL USAGE:</b> Options enabled with past usage (Oracle may still bill):</p>
+                  <ul style="margin-top: 8px;">
+                    {%- for opt in warn_options -%}
+                    <li><b>{{ opt.name }}</b> — Enabled on {{ opt.enabled }} instances, historically used on {{ opt.ever_used }} instances</li>
+                    {%- endfor -%}
+                  </ul>
+                </div>
+                {%- endif -%}
+                {%- if info_options | length > 0 -%}
+                <div style="background: #f5f5f5; border-left: 4px solid #78909c; padding: 12px 18px; margin: 10px 0; border-radius: 4px;">
+                  <p><span style="background: #78909c; color: white; padding: 2px 8px; border-radius: 3px; font-size: 11px;">~~ INFO</span> <b>POTENTIAL FUTURE RISK:</b> Options enabled but never used:</p>
+                  <ul style="margin-top: 8px;">
+                    {%- for opt in info_options -%}
+                    <li><b>{{ opt.name }}</b> — Enabled on {{ opt.enabled }} instances (not yet used)</li>
+                    {%- endfor -%}
+                  </ul>
+                </div>
+                {%- endif -%}
+                {%- if high_risk_options | length == 0 and warn_options | length == 0 and info_options | length == 0 -%}
+                <p><span style="color: #4caf50; font-weight: 600;">✓ COMPLIANT:</span> No extra-cost options detected as enabled or in-use across audited instances.</p>
+                {%- else -%}
+                <div class="key-finding">
+                  <b>📋 Action Required:</b> Review detailed instance-level breakdowns in the attached reports to determine:
+                  <ul style="margin-top: 8px;">
+                    <li>Which specific databases and hosts are using each option</li>
+                    <li>Whether usage is intentional and licensed</li>
+                    <li>Opportunities to disable unused features</li>
+                    <li>Evidence requirements for license audit defense</li>
+                  </ul>
+                </div>
+                {%- endif -%}
+                {%- endif -%}
+              </div>
+
+              <!-- Attached Reports -->
+              <div class="section">
+                <div class="section-title">📄 Detailed Reports (Attached)</div>
+                <div class="attachment-box">
+                  <p><b>Two comprehensive report files are attached to this email:</b></p>
+                  <div class="attachment-item">
+                    <b>HTML Report:</b> Interactive format with collapsible sections, platform badges, and color-coded risk indicators. Open in web browser for best experience. Includes:
+                    <ul style="font-size: 12px; margin-top: 5px;">
+                      <li>Complete option-by-option analysis with instance-level details</li>
+                      <li>Partitioning evidence (tables, indexes, sizes)</li>
+                      <li>Compression usage breakdown</li>
+                      <li>TDE/Advanced Security implementation status</li>
+                      <li>In-Memory configuration details</li>
+                      <li>Active Data Guard and RAC verification</li>
+                    </ul>
+                  </div>
+                  <div class="attachment-item">
+                    <b>Text Report:</b> Plain-text version for quick terminal review, grep-able format, suitable for archival and version control.
+                  </div>
+                </div>
+              </div>
+
+              <!-- Next Steps -->
+              <div class="section">
+                <div class="section-title">🎯 Recommended Next Steps</div>
+                <ol>
+                  <li><b>Review Findings:</b> Open the HTML attachment and examine the "High-Risk EE Options" section for detailed instance-level data</li>
+                  <li><b>Verify Licensing:</b> Cross-reference detected options with Oracle license agreements and procurement records</li>
+                  <li><b>Evidence Collection:</b> Use the detailed evidence sections (partitioning tables, compression details, etc.) for audit defense documentation</li>
+                  <li><b>Remediation Planning:</b> For any unlicensed options detected as in-use, coordinate with application teams to disable or procure licenses</li>
+                  <li><b>Schedule Re-scan:</b> Plan weekly/monthly audits to monitor compliance status and detect configuration drift</li>
+                </ol>
+              </div>
+            </div>
+            
+            <div class="footer">
+              <p><b>Oracle License Audit Automation</b></p>
+              <p>Report Generated: {{ _report_timestamp | replace('_', ' ') | replace('-', ':', 2) }} by {{ lookup('pipe','whoami') }}@{{ lookup('pipe','hostname') }}</p>
+              <p>Data Collection Date: {{ _rpt_date }}</p>
+              <p style="margin-top: 10px;">For questions or issues, contact the DBA Automation Team</p>
+            </div>
+          </body>
+          </html>
+        attach:
+          - "{{ report_output_dir | default('/tmp') }}/oracle_audit_{{ _report_timestamp }}.html"
+          - "{{ report_output_dir | default('/tmp') }}/oracle_audit_{{ _report_timestamp }}.txt"
+      when: send_summary_email | bool
+

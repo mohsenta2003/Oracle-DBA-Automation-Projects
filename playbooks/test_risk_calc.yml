@@ -1,0 +1,112 @@
+---
+- name: Test risk calculation logic
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: no
+  
+  vars_files:
+    - ../vars/repo_config.yml
+  
+  vars:
+    _eff_run_id: "81,101,121"
+    _nl: "\n"
+    
+    ee_extra_options:
+      - "Active Data Guard"
+      - "Partitioning"
+      - "In-Memory Column Store"
+  
+  tasks:
+    - name: Fetch voption rows
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500 WRAP OFF TRIMSPOOL ON
+          WITH host_latest_run AS (
+            SELECT i.hostname, MAX(i.run_id) AS run_id
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i
+            WHERE i.run_id IN ({{ _eff_run_id }})
+            GROUP BY i.hostname
+          ),
+          historical_usage AS (
+            SELECT 
+              vh.hostname, vh.sid, vh.option_name,
+              MAX(CASE WHEN vh.is_inuse = 'Y' THEN 1 ELSE 0 END) AS ever_used,
+              MAX(CASE WHEN vh.is_inuse = 'Y' THEN vh.run_id END) AS last_used_run
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_VOPTION vh
+            WHERE vh.is_ee_extra = 'Y'
+            GROUP BY vh.hostname, vh.sid, vh.option_name
+          ),
+          voption_with_instance AS (
+            SELECT v.option_name, v.hostname, v.sid, v.option_enabled, v.is_inuse, v.run_id, i.os_type, i.region
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_VOPTION v
+            JOIN host_latest_run hlr ON hlr.hostname = v.hostname AND hlr.run_id = v.run_id
+            JOIN {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i ON i.hostname = hlr.hostname AND i.run_id = hlr.run_id AND i.sid = v.sid
+            WHERE v.is_ee_extra = 'Y'
+          )
+          SELECT 
+            vi.option_name || '|' || vi.hostname || '|' || vi.sid || '|' || vi.option_enabled || '|' || vi.is_inuse || '|' ||
+            CASE WHEN UPPER(vi.os_type) = 'AIX' THEN 'AIX' ELSE 'US-Linux' END || '|' ||
+            CASE WHEN UPPER(vi.hostname) LIKE 'CRLNXP%' THEN 'Production' ELSE 'Test' END || '|' ||
+            NVL(TO_CHAR(h.ever_used), '0') || '|' || NVL(TO_CHAR(h.last_used_run), 'NEVER') AS result
+          FROM voption_with_instance vi
+          LEFT JOIN historical_usage h ON h.hostname = vi.hostname AND h.sid = vi.sid AND h.option_name = vi.option_name
+          WHERE ROWNUM <= 100
+          ORDER BY vi.option_name;
+          EXIT;
+          EOSQL
+      register: _voption_raw
+      changed_when: false
+      become: false
+
+    - name: Test EXACT risk calculation logic from report
+      ansible.builtin.set_fact:
+        _test_result: >-
+          {%- set vopts = [] -%}
+          {%- set unique_instances = [] -%}
+          {%- for line in (_voption_raw.stdout | default('') | trim).split('\n') -%}
+            {%- if '|' in line -%}
+              {%- set p = line.split('|') -%}
+              {%- if p | length >= 9 -%}
+                {%- set _ = vopts.append({'name': p[0]|trim, 'host': p[1]|trim, 'sid': p[2]|trim, 'enabled': p[3]|trim, 'inuse': p[4]|trim, 'platform': p[5]|trim, 'environment': p[6]|trim, 'ever_used': p[7]|trim, 'last_used_date': p[8]|trim}) -%}
+                {%- set inst_key = p[1]|trim ~ '|' ~ p[2]|trim -%}
+                {%- if inst_key not in unique_instances -%}{%- set _ = unique_instances.append(inst_key) -%}{%- endif -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- set n = unique_instances | length -%}
+          Total vopts parsed: {{ vopts | length }}{{ _nl }}
+          Unique instances: {{ n }}{{ _nl }}{{ _nl }}
+          {%- for opt_name in ee_extra_options -%}
+            Testing: {{ opt_name }}{{ _nl }}
+            {%- set opt_vopts = [] -%}
+            {%- for o in vopts -%}
+              {%- if o.name == opt_name or (o.name | upper) == (opt_name | upper) -%}
+                {%- set _ = opt_vopts.append(o) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            - Matched {{ opt_vopts | length }} records{{ _nl }}
+            {%- if opt_vopts | length > 0 -%}
+              {%- set en_tot = namespace(v=0) -%}{%- set iu_tot = namespace(v=0) -%}{%- set ev_tot = namespace(v=0) -%}
+              {%- set en_list = [] -%}{%- set iu_list = [] -%}{%- set ev_list = [] -%}
+              {%- for o in opt_vopts -%}
+                {%- set inst_key = o.host ~ '|' ~ o.sid -%}
+                {%- if (o.enabled | upper in ['TRUE', 'Y', '1']) and inst_key not in en_list -%}{%- set en_tot.v = en_tot.v + 1 -%}{%- set _ = en_list.append(inst_key) -%}{%- endif -%}
+                {%- if (o.inuse | upper in ['Y', 'TRUE', '1']) and inst_key not in iu_list -%}{%- set iu_tot.v = iu_tot.v + 1 -%}{%- set _ = iu_list.append(inst_key) -%}{%- endif -%}
+                {%- if (o.ever_used | string in ['1', 'Y', 'TRUE']) and inst_key not in ev_list -%}{%- set ev_tot.v = ev_tot.v + 1 -%}{%- set _ = ev_list.append(inst_key) -%}{%- endif -%}
+              {%- endfor -%}
+              - enabled={{ en_tot.v }}/{{ n }}  in-use={{ iu_tot.v }}/{{ n }}  ever-used={{ ev_tot.v }}{{ _nl }}
+              {%- if (en_tot.v > 0 and iu_tot.v > 0) or (en_tot.v > 0 and ev_tot.v > 0) -%}{%- set risk = '!! RISK' -%}
+              {%- elif iu_tot.v > 0 or ev_tot.v > 0 -%}{%- set risk = '~~ CHK' -%}
+              {%- else -%}{%- set risk = '' -%}{%- endif -%}
+              - RISK="{{ risk }}"{{ _nl }}
+              - First record: enabled={{ opt_vopts[0].enabled }} inuse={{ opt_vopts[0].inuse }} ever_used={{ opt_vopts[0].ever_used }}{{ _nl }}
+            {%- endif -%}
+            {{ _nl }}
+          {%- endfor -%}
+
+    - name: Show results
+      ansible.builtin.debug:
+        msg: "{{ _test_result }}"

@@ -1,0 +1,120 @@
+ORACLE LOG SYNC: LOGICAL FLOW MAP
+=================================
+
+This document visualizes the two execution paths of the Oracle Log Sync solution:
+1. ANSIBLE PLAYBOOK FLOW (Interactive or Scheduled from Control Node)
+2. STANDALONE SCRIPT FLOW (Deployed to AIX target, can be run manually)
+
+NOTE: Crontab is configured MANUALLY on the control node.
+      The playbook does NOT auto-configure any crontab.
+
+--------------------------------------------------------------------------------
+1. ANSIBLE PLAYBOOK FLOW (playbooks/sync_oracle_logs.yml)
+--------------------------------------------------------------------------------
+Triggered by: Administrator (Interactive) OR Control Node Crontab (Scheduled)
+
+[ START ]
+    |
+    v
+[ VALIDATION PHASE ]
+    |-- Check 'nfs_log_path' is set
+    |-- Gather Facts (Date/Time, OS Type)
+    |-- Check NFS Mount & Disk Space
+    v
+[ DISCOVERY PHASE ]
+    |-- Detect Oracle User (from 'ora_pmon' process)
+    |-- Detect Instances (filter out 'skip_instances')
+    |-- Build ORACLE_HOME map (from /etc/oratab)
+    |-- Detect Listeners (from 'tnslsnr' processes)
+    |-- Get ADR Base (via SQL*Plus from first instance)
+    v
+[ SYNC LOOP: INSTANCES ] (sync_instance_logs.yml)
+    |  Skipped if: job_type = 'report_only'
+    |  For each Instance:
+    |    |-- 1. Discover Paths (SQL*: v$diag_info, v$parameter)
+    |    |      (Fallback: 'find' command if SQL fails)
+    |    |-- 2. Sync Alert Logs  (if sync_alert_logs=true)
+    |    |-- 3. Sync Audit Logs  (if sync_audit_logs=true)
+    |    |-- 4. STATE MANAGEMENT:
+    |    |      |-- Update 'sync_state.json' (Last Sync Time)
+    |    |      |-- Append to 'sync_history.log' (File Audit)
+    |    |-- 5. COLLECT METRICS (Lag, Size, Audit Count)
+    v
+[ SYNC LOOP: LISTENERS ] (sync_listener_logs.yml)
+    |  Skipped if: job_type = 'report_only' OR sync_listener_logs=false
+    |  For each Listener:
+    |    |-- 1. Discover Paths (ADR structure or 'find')
+    |    |-- 2. Sync Trace/Alert Logs
+    |    |-- 3. STATE MANAGEMENT (sync_state.json + sync_history.log)
+    |    |-- 4. COLLECT METRICS (Lag, Size)
+    v
+[ REPORTING PHASE ] (generate_report.yml)
+    |  Skipped if: job_type = 'sync_only'
+    |-- Create Summary Report (txt)
+    |-- Create HTML Dashboard (index.html)
+    |-- Create Detailed Job Reports (job_detail.html)
+    |-- Append to Daily Execution Summary
+    v
+[ POST-RUN SUMMARY ] (Always displayed)
+    |-- Quick Sync Summary: instances, listeners, file counts
+    |-- Destination path
+    |-- Report/Dashboard location (if generated)
+    v
+[ CRON CONFIG ] (If setup_cron=true)
+    |  Does NOT modify any crontab!
+    |-- Deploy sync script to target host
+    |-- Display recommended crontab entries (Options A/B/C)
+    |-- User copies and adds to control node crontab manually
+    v
+[ END ]
+
+
+--------------------------------------------------------------------------------
+2. STANDALONE SCRIPT FLOW (oracle_log_sync.sh on AIX target)
+--------------------------------------------------------------------------------
+Triggered by: Manual execution on AIX (optional, for standalone use)
+Deployed by: ansible-playbook ... -e "setup_cron=true"
+
+[ START ]
+    |
+    v
+[ INIT ]
+    |-- Load User Profile (~/.profile)
+    |-- Check NFS Mount
+    |-- Detect Oracle Environment
+    v
+[ INSTANCE LOOP ]
+    |-- Skip blocked instances (skip_instances)
+    |-- Discover Paths (SQL*Plus -> Fallback: adrci)
+    |-- CONDITIONAL SYNC:
+    |     |-- Sync Alert Logs (If sync_alert_logs=true at deploy time)
+    |     |-- Sync Audit Logs (If sync_audit_logs=true at deploy time)
+    v
+[ LISTENER LOOP ]
+    |-- Discover Paths (Standard Path -> Fallback: adrci)
+    |-- CONDITIONAL SYNC:
+    |     |-- Sync Listener Logs (If sync_listener_logs=true at deploy time)
+    v
+[ MAINTENANCE ]
+    |-- Cleanup Old Logs (retention_days)
+    |-- Compress Old Logs (gzip > 1 day)
+    v
+[ LOGGING ]
+    |-- Append status to local log file
+    v
+[ END ]
+
+
+--------------------------------------------------------------------------------
+3. SCHEDULING REFERENCE (Control Node Crontab)
+--------------------------------------------------------------------------------
+
+Option A: Sync every 15 min (fast, no reports)
+  */15 * * * * cd /path/to/project && ansible-playbook playbooks/sync_oracle_logs.yml -e "job_type=sync_only" -l hosts
+
+Option B: Full run with reports (hourly)
+  0 * * * * cd /path/to/project && ansible-playbook playbooks/sync_oracle_logs.yml -e "job_type=full" -l hosts
+
+Option C: Combined (sync often + report hourly)
+  */15 * * * * cd /path/to/project && ansible-playbook playbooks/sync_oracle_logs.yml -e "job_type=sync_only" -l hosts
+  0 * * * *   cd /path/to/project && ansible-playbook playbooks/sync_oracle_logs.yml -e "job_type=report_only" -l hosts

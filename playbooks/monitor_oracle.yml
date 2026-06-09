@@ -1,0 +1,49 @@
+---
+# ================================================================================
+# Oracle Database Monitoring Playbook - MULTI-INSTANCE SUPPORT
+# ================================================================================
+#
+# This playbook automatically detects and monitors ALL database instances
+# running on each target host.
+#
+# BASIC USAGE:
+#   ansible-playbook playbooks/monitor_oracle.yml --limit us_lnx_test
+#   ansible-playbook playbooks/monitor_oracle.yml --limit crlnxd2201
+#
+# MULTIPLE GROUPS:
+#   ansible-playbook playbooks/monitor_oracle.yml --limit "us_lnx_prod:us_lnx_test"
+#   ansible-playbook playbooks/monitor_oracle.yml --limit "eu_nl_lnx_prod:eu_uk_lnx_prod"
+#
+# SPECIFIC INSTANCE (on multi-instance hosts):
+#   ansible-playbook playbooks/monitor_oracle.yml --limit crlnxd2201 -e "db_sid=ORCL1"
+#
+# MONITORING INCLUDES:
+#   - Database status and version
+#   - SGA/PGA memory usage
+#   - Tablespace utilization (in GB/TB)
+#   - Active sessions
+#   - Alert log review
+#   - Listener status (once per host)
+#
+# AVAILABLE INVENTORY GROUPS:
+#   EU:  eu_nl_lnx_nonprod, eu_nl_lnx_prod, eu_uk_lnx_nonprod, eu_uk_lnx_prod
+#        eu_nl_lnx_nonprod_g, eu_nl_lnx_prod_g (grid users)
+#        eu_aix_nonprod, eu_aix_prod
+#   US:  us_lnx_prod, us_lnx_model, us_lnx_test
+#   TLP: tlp_lnx_prod, tlp_lnx_nonprod, tlp_aix_prod, tlp_aix_nonprod
+#
+# AUTO-DETECTION:
+#   - Oracle user detected from PMON process owner
+#   - ORACLE_HOME resolved from /etc/oratab for each instance
+#   - All running instances processed automatically
+#
+# REPORTS:
+#   Saved to: reports/YYYY-MM-DD/hostname/monitor_<SID>.txt
+# ================================================================================
+
+- name: Oracle database monitoring
+  hosts: all
+  become: no
+  gather_facts: no
+  roles:
+    - oracle_monitor

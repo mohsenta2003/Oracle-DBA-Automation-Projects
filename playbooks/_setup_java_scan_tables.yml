@@ -1,0 +1,433 @@
+﻿---
+# playbooks/_setup_java_scan_tables.yml
+#
+# One-shot playbook to create/upgrade Java scan repository schema.
+#
+# Pattern matches EE-extra setup playbook:
+#   1. Create tables (idempotent)
+#   2. Add missing columns for existing environments (idempotent upgrades)
+#   3. Create indexes
+#   4. Create reporting views
+#   5. Verify objects
+#
+# Core tables:
+#   {{ repo_schema | upper }}.JAVA_SCAN_RUNS
+#   {{ repo_schema | upper }}.JAVA_SCAN_SERVERS
+#   {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS
+#   {{ repo_schema | upper }}.JAVA_VERSION_REFERENCE   (latest known JDK per track)
+#
+# Reporting views:
+#   {{ repo_schema | upper }}.JAVA_SCAN_LATEST_VW
+#   {{ repo_schema | upper }}.JAVA_SCAN_SUMMARY_VW
+#   {{ repo_schema | upper }}.JAVA_SCAN_ORACLE_VW
+#   {{ repo_schema | upper }}.JAVA_SCAN_OUTDATED_VW
+#   {{ repo_schema | upper }}.JAVA_SCAN_TREND_VW
+#   {{ repo_schema | upper }}.JAVA_SCAN_GAP_VW         (installed vs reference)
+#
+# Usage:
+#   ansible-playbook playbooks/_setup_java_scan_tables.yml -i "localhost," -c local \
+#     -e "repo_password=<pwd>"
+
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars_files:
+    - ../vars/java_scanner_config.yml
+
+  vars:
+    _conn_string: "{{ repo_tns_alias if (repo_tns_alias | default('')) else '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=' ~ repo_host ~ ')(PORT=' ~ repo_port ~ '))(CONNECT_DATA=(' ~ ('SERVICE_NAME=' ~ repo_service if (repo_service | default('')) else 'SID=' ~ repo_sid) ~ ')))' }}"
+
+  tasks:
+
+    - name: Validate required runtime variables
+      ansible.builtin.assert:
+        that:
+          - repo_user | default('') | trim | length > 0
+          - repo_schema | default('') | trim | length > 0
+          - repo_password | default('') | trim | length > 0
+        fail_msg: >-
+          Missing required repository variables. Provide at runtime, e.g.
+          -e "repo_password=<pwd>" (and optionally repo_user/repo_schema/repo_tns_alias).
+        success_msg: "Repository runtime variables look valid."
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 1 — Test connection
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Test repository database connection
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          SELECT 'CONNECTION_OK' FROM DUAL;
+          EXIT;
+          EOSQL
+      register: _conn_test
+      changed_when: false
+      failed_when: "'CONNECTION_OK' not in _conn_test.stdout"
+
+    - name: Show connection status
+      ansible.builtin.debug:
+        msg: "Repository connection SUCCESSFUL: {{ repo_user }}@{{ repo_tns_alias if (repo_tns_alias | default('')) else (repo_host ~ ':' ~ repo_port ~ '/' ~ repo_sid) }}"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 2 — Create tables (idempotent)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Create JAVA_SCAN_* tables (idempotent)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          BEGIN
+
+            BEGIN
+              EXECUTE IMMEDIATE '
+                CREATE TABLE {{ repo_schema | upper }}.JAVA_SCAN_RUNS (
+                  RUN_ID          NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                  RUN_DATE        DATE          DEFAULT SYSDATE,
+                  DATA_AS_OF      DATE,
+                  RUN_LABEL       VARCHAR2(256),
+                  TRIGGERED_BY    VARCHAR2(128),
+                  CONTROLLER_HOST VARCHAR2(256),
+                  TOTAL_HOSTS     NUMBER,
+                  TOTAL_INSTALLS  NUMBER,
+                  NOTES           VARCHAR2(1000),
+                  LAST_UPDATED    DATE DEFAULT SYSDATE
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+            END;
+
+            BEGIN
+              EXECUTE IMMEDIATE '
+                CREATE TABLE {{ repo_schema | upper }}.JAVA_SCAN_SERVERS (
+                  SERVER_ID      NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                  RUN_ID         NUMBER        NOT NULL,
+                  HOSTNAME       VARCHAR2(256) NOT NULL,
+                  IP_ADDRESS     VARCHAR2(64),
+                  OS_TYPE        VARCHAR2(32),
+                  OS_VERSION     VARCHAR2(128),
+                  OS_KERNEL      VARCHAR2(128),
+                  CPU_COUNT      NUMBER,
+                  RAM_MB         NUMBER,
+                  REGION         VARCHAR2(32),
+                  HOST_TIMEZONE  VARCHAR2(64),
+                  JAVA_COUNT     NUMBER,
+                  SCAN_STATUS    VARCHAR2(32),
+                  SCAN_ERROR     VARCHAR2(512),
+                  SCAN_NOTES     VARCHAR2(512),
+                  LAST_UPDATED   DATE DEFAULT SYSDATE
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+            END;
+
+            BEGIN
+              EXECUTE IMMEDIATE '
+                CREATE TABLE {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS (
+                  INSTALL_ID          NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                  RUN_ID              NUMBER        NOT NULL,
+                  SERVER_ID           NUMBER,
+                  HOSTNAME            VARCHAR2(256) NOT NULL,
+                  REGION              VARCHAR2(32),
+                  JAVA_TYPE           VARCHAR2(64),
+                  JAVA_VENDOR         VARCHAR2(128),
+                  JAVA_VERSION        VARCHAR2(64),
+                  JAVA_MAJOR          NUMBER,
+                  JAVA_EDITION        VARCHAR2(16),
+                  BUILD_INFO          VARCHAR2(512),
+                  JAVA_BIN_PATH       VARCHAR2(512) NOT NULL,
+                  JAVA_HOME           VARCHAR2(512),
+                  SYMLINK_TARGET      VARCHAR2(512),
+                  INSTALL_CONTEXT     VARCHAR2(64),
+                  INSTALL_SOURCE      VARCHAR2(64),
+                  IS_DEFAULT_PATH     VARCHAR2(1) DEFAULT ''N'',
+                  RELATED_ORACLE_HOME VARCHAR2(512),
+                  RELATED_ORACLE_SID  VARCHAR2(64),
+                  FILE_OWNER          VARCHAR2(128),
+                  FILE_GROUP          VARCHAR2(128),
+                  FILE_PERMISSIONS    VARCHAR2(32),
+                  FILE_LAST_MODIFIED  VARCHAR2(64),
+                  ARCH_BITS           NUMBER,
+                  SCAN_DATE           DATE DEFAULT SYSDATE,
+                  LAST_UPDATED        DATE DEFAULT SYSDATE
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+            END;
+
+            -- Reference table: latest known JDK per (vendor, major) track
+            BEGIN
+              EXECUTE IMMEDIATE '
+                CREATE TABLE {{ repo_schema | upper }}.JAVA_VERSION_REFERENCE (
+                  TRACK_KEY      VARCHAR2(64)  PRIMARY KEY,
+                  VENDOR         VARCHAR2(64)  NOT NULL,
+                  MAJOR          NUMBER        NOT NULL,
+                  LATEST_VERSION VARCHAR2(64)  NOT NULL,
+                  RELEASE_DATE   DATE,
+                  EOL_DATE       DATE,
+                  NOTES          VARCHAR2(512),
+                  UPDATED_AT     TIMESTAMP DEFAULT SYSTIMESTAMP
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+            END;
+
+          END;
+          /
+          EXIT;
+          EOSQL
+      register: _create_result
+      changed_when: true
+
+    - name: Show CREATE output
+      ansible.builtin.debug:
+        msg: "{{ _create_result.stdout_lines }}"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 2.5 — Upgrade existing tables (add missing columns)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Add missing columns to existing JAVA_SCAN tables (idempotent)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          BEGIN
+            -- JAVA_SCAN_SERVERS upgrades
+            BEGIN EXECUTE IMMEDIATE 'ALTER TABLE {{ repo_schema | upper }}.JAVA_SCAN_SERVERS ADD (RAM_MB NUMBER)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-1430 THEN NULL; ELSE RAISE; END IF; END;
+            BEGIN EXECUTE IMMEDIATE 'ALTER TABLE {{ repo_schema | upper }}.JAVA_SCAN_SERVERS ADD (SCAN_ERROR VARCHAR2(512))';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-1430 THEN NULL; ELSE RAISE; END IF; END;
+            BEGIN EXECUTE IMMEDIATE 'ALTER TABLE {{ repo_schema | upper }}.JAVA_SCAN_SERVERS ADD (SCAN_NOTES VARCHAR2(512))';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-1430 THEN NULL; ELSE RAISE; END IF; END;
+
+            -- JAVA_SCAN_INSTALLS upgrades
+            BEGIN EXECUTE IMMEDIATE 'ALTER TABLE {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS ADD (REGION VARCHAR2(32))';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-1430 THEN NULL; ELSE RAISE; END IF; END;
+            BEGIN EXECUTE IMMEDIATE 'ALTER TABLE {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS ADD (JAVA_VENDOR VARCHAR2(128))';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-1430 THEN NULL; ELSE RAISE; END IF; END;
+            BEGIN EXECUTE IMMEDIATE 'ALTER TABLE {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS ADD (SYMLINK_TARGET VARCHAR2(512))';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-1430 THEN NULL; ELSE RAISE; END IF; END;
+            BEGIN EXECUTE IMMEDIATE 'ALTER TABLE {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS ADD (IS_DEFAULT_PATH VARCHAR2(1) DEFAULT ''N'')';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-1430 THEN NULL; ELSE RAISE; END IF; END;
+            BEGIN EXECUTE IMMEDIATE 'ALTER TABLE {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS ADD (RELATED_ORACLE_HOME VARCHAR2(512))';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-1430 THEN NULL; ELSE RAISE; END IF; END;
+            BEGIN EXECUTE IMMEDIATE 'ALTER TABLE {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS ADD (RELATED_ORACLE_SID VARCHAR2(64))';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-1430 THEN NULL; ELSE RAISE; END IF; END;
+            BEGIN EXECUTE IMMEDIATE 'ALTER TABLE {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS ADD (FILE_GROUP VARCHAR2(128))';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-1430 THEN NULL; ELSE RAISE; END IF; END;
+            BEGIN EXECUTE IMMEDIATE 'ALTER TABLE {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS ADD (ARCH_BITS NUMBER)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-1430 THEN NULL; ELSE RAISE; END IF; END;
+          END;
+          /
+          EXIT;
+          EOSQL
+      changed_when: false
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 3 — Create indexes
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Create performance indexes
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          BEGIN
+            BEGIN EXECUTE IMMEDIATE 'CREATE INDEX JSCAN_RUNS_IDX1 ON {{ repo_schema | upper }}.JAVA_SCAN_RUNS(RUN_DATE)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            BEGIN EXECUTE IMMEDIATE 'CREATE INDEX JSCAN_RUNS_IDX2 ON {{ repo_schema | upper }}.JAVA_SCAN_RUNS(RUN_LABEL)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+
+            BEGIN EXECUTE IMMEDIATE 'CREATE INDEX JSCAN_SERVERS_IDX1 ON {{ repo_schema | upper }}.JAVA_SCAN_SERVERS(RUN_ID, HOSTNAME)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            BEGIN EXECUTE IMMEDIATE 'CREATE INDEX JSCAN_SERVERS_IDX2 ON {{ repo_schema | upper }}.JAVA_SCAN_SERVERS(HOSTNAME)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            BEGIN EXECUTE IMMEDIATE 'CREATE INDEX JSCAN_SERVERS_IDX3 ON {{ repo_schema | upper }}.JAVA_SCAN_SERVERS(REGION, SCAN_STATUS)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+
+            BEGIN EXECUTE IMMEDIATE 'CREATE INDEX JSCAN_INSTALLS_IDX1 ON {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS(RUN_ID, HOSTNAME)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            BEGIN EXECUTE IMMEDIATE 'CREATE INDEX JSCAN_INSTALLS_IDX2 ON {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS(JAVA_MAJOR, JAVA_TYPE)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            BEGIN EXECUTE IMMEDIATE 'CREATE INDEX JSCAN_INSTALLS_IDX3 ON {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS(INSTALL_CONTEXT)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            BEGIN EXECUTE IMMEDIATE 'CREATE INDEX JSCAN_INSTALLS_IDX4 ON {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS(RELATED_ORACLE_SID)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            BEGIN EXECUTE IMMEDIATE 'CREATE INDEX JSCAN_INSTALLS_IDX5 ON {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS(IS_DEFAULT_PATH)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+
+            BEGIN EXECUTE IMMEDIATE 'CREATE INDEX JVERREF_IDX1 ON {{ repo_schema | upper }}.JAVA_VERSION_REFERENCE(VENDOR, MAJOR)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+          END;
+          /
+          EXIT;
+          EOSQL
+      changed_when: true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 4 — Create reporting views
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Create reporting views
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+
+          CREATE OR REPLACE VIEW {{ repo_schema | upper }}.JAVA_SCAN_LATEST_VW AS
+          SELECT
+            r.RUN_ID,
+            r.RUN_DATE,
+            r.RUN_LABEL,
+            i.HOSTNAME,
+            s.IP_ADDRESS,
+            s.OS_TYPE,
+            s.OS_VERSION,
+            s.REGION,
+            i.JAVA_TYPE,
+            i.JAVA_VENDOR,
+            i.JAVA_VERSION,
+            i.JAVA_MAJOR,
+            i.JAVA_EDITION,
+            i.BUILD_INFO,
+            i.JAVA_BIN_PATH,
+            i.JAVA_HOME,
+            i.INSTALL_CONTEXT,
+            i.INSTALL_SOURCE,
+            i.IS_DEFAULT_PATH,
+            i.RELATED_ORACLE_HOME,
+            i.RELATED_ORACLE_SID,
+            i.FILE_OWNER,
+            i.FILE_GROUP,
+            i.FILE_PERMISSIONS,
+            i.FILE_LAST_MODIFIED,
+            i.ARCH_BITS,
+            i.SCAN_DATE
+          FROM {{ repo_schema | upper }}.JAVA_SCAN_RUNS r
+          JOIN {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS i ON i.RUN_ID = r.RUN_ID
+          LEFT JOIN {{ repo_schema | upper }}.JAVA_SCAN_SERVERS s
+                 ON s.RUN_ID = i.RUN_ID AND s.HOSTNAME = i.HOSTNAME
+          WHERE r.RUN_ID = (SELECT MAX(RUN_ID) FROM {{ repo_schema | upper }}.JAVA_SCAN_RUNS);
+
+          CREATE OR REPLACE VIEW {{ repo_schema | upper }}.JAVA_SCAN_SUMMARY_VW AS
+          SELECT
+            HOSTNAME,
+            REGION,
+            JAVA_TYPE,
+            JAVA_VENDOR,
+            JAVA_VERSION,
+            JAVA_MAJOR,
+            INSTALL_CONTEXT,
+            COUNT(*) AS INSTALL_COUNT,
+            SUM(CASE WHEN IS_DEFAULT_PATH = 'Y' THEN 1 ELSE 0 END) AS DEFAULT_PATH_COUNT
+          FROM {{ repo_schema | upper }}.JAVA_SCAN_LATEST_VW
+          GROUP BY HOSTNAME, REGION, JAVA_TYPE, JAVA_VENDOR, JAVA_VERSION, JAVA_MAJOR, INSTALL_CONTEXT
+          ORDER BY HOSTNAME, JAVA_MAJOR, JAVA_TYPE;
+
+          CREATE OR REPLACE VIEW {{ repo_schema | upper }}.JAVA_SCAN_ORACLE_VW AS
+          SELECT *
+          FROM {{ repo_schema | upper }}.JAVA_SCAN_LATEST_VW
+          WHERE INSTALL_CONTEXT LIKE 'Oracle%'
+          ORDER BY HOSTNAME, JAVA_VERSION;
+
+          CREATE OR REPLACE VIEW {{ repo_schema | upper }}.JAVA_SCAN_OUTDATED_VW AS
+          SELECT
+            HOSTNAME,
+            REGION,
+            JAVA_TYPE,
+            JAVA_VENDOR,
+            JAVA_VERSION,
+            JAVA_MAJOR,
+            INSTALL_CONTEXT,
+            JAVA_BIN_PATH,
+            FILE_OWNER,
+            CASE
+              WHEN JAVA_MAJOR < 8 THEN 'CRITICAL - End of Life'
+              WHEN JAVA_MAJOR = 8 THEN 'WARNING - Java 8'
+              WHEN JAVA_MAJOR < 11 THEN 'WARNING - Below LTS Java 11'
+              ELSE 'OK'
+            END AS PATCH_RISK
+          FROM {{ repo_schema | upper }}.JAVA_SCAN_LATEST_VW
+          WHERE JAVA_MAJOR < 11
+          ORDER BY JAVA_MAJOR, HOSTNAME;
+
+          CREATE OR REPLACE VIEW {{ repo_schema | upper }}.JAVA_SCAN_TREND_VW AS
+          SELECT
+            r.RUN_DATE,
+            i.JAVA_MAJOR,
+            i.JAVA_TYPE,
+            i.INSTALL_CONTEXT,
+            COUNT(*) AS INSTALL_COUNT,
+            COUNT(DISTINCT i.HOSTNAME) AS HOST_COUNT
+          FROM {{ repo_schema | upper }}.JAVA_SCAN_RUNS r
+          JOIN {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS i ON i.RUN_ID = r.RUN_ID
+          GROUP BY r.RUN_DATE, i.JAVA_MAJOR, i.JAVA_TYPE, i.INSTALL_CONTEXT
+          ORDER BY r.RUN_DATE, i.JAVA_MAJOR;
+
+          CREATE OR REPLACE VIEW {{ repo_schema | upper }}.JAVA_SCAN_GAP_VW AS
+          SELECT
+            i.RUN_ID,
+            i.HOSTNAME,
+            i.REGION,
+            i.JAVA_TYPE,
+            i.JAVA_MAJOR,
+            i.JAVA_VERSION,
+            r.LATEST_VERSION       AS REFERENCE_LATEST,
+            r.RELEASE_DATE         AS REFERENCE_RELEASED,
+            r.EOL_DATE             AS REFERENCE_EOL,
+            i.INSTALL_CONTEXT,
+            i.RELATED_ORACLE_HOME  AS APPLICATION,
+            i.FILE_OWNER,
+            i.JAVA_BIN_PATH,
+            CASE
+              WHEN r.LATEST_VERSION IS NULL                  THEN 'UNKNOWN'
+              WHEN i.JAVA_VERSION  =  r.LATEST_VERSION       THEN 'CURRENT'
+              WHEN r.EOL_DATE      <  TRUNC(SYSDATE)         THEN 'EOL'
+              ELSE 'BEHIND'
+            END AS GAP_STATUS
+          FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS i
+          LEFT JOIN {{ repo_schema | upper }}.JAVA_VERSION_REFERENCE r
+            ON UPPER(r.VENDOR) = UPPER(i.JAVA_TYPE)
+           AND r.MAJOR = i.JAVA_MAJOR;
+
+          EXIT;
+          EOSQL
+      register: _view_result
+      changed_when: true
+      failed_when: "'ORA-' in _view_result.stdout or 'SP2-' in _view_result.stdout"
+
+    - name: Show view creation status
+      ansible.builtin.debug:
+        msg: "Reporting views created: LATEST_VW, SUMMARY_VW, ORACLE_VW, OUTDATED_VW, TREND_VW, GAP_VW"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 5 — Verify objects
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Verify tables and views
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET LINESIZE 120 PAGESIZE 100 FEEDBACK OFF
+          SELECT '--- TABLES ---' FROM dual;
+          SELECT table_name
+          FROM user_tables
+          WHERE table_name LIKE 'JAVA_SCAN_%' OR table_name = 'JAVA_VERSION_REFERENCE'
+          ORDER BY table_name;
+          SELECT '--- VIEWS ---' FROM dual;
+          SELECT view_name
+          FROM user_views
+          WHERE view_name LIKE 'JAVA_SCAN_%'
+          ORDER BY view_name;
+          SELECT '--- REFERENCE ROWS ---' FROM dual;
+          SELECT 'JAVA_VERSION_REFERENCE rows=' || COUNT(*) FROM {{ repo_schema | upper }}.JAVA_VERSION_REFERENCE;
+          EXIT;
+          EOSQL
+      register: _verify_result
+      changed_when: false
+      failed_when: "'ORA-' in _verify_result.stdout or 'SP2-' in _verify_result.stdout"
+
+    - name: Show verification output
+      ansible.builtin.debug:
+        msg: "{{ _verify_result.stdout_lines }}"

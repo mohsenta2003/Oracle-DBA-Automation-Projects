@@ -1,0 +1,82 @@
+# Task: Oracle Log Sync Integration for AIX
+
+## Completed Tasks
+
+- [x] Research existing log sync implementation
+    - [x] List project directory structure
+    - [x] Inspect `playbooks/sync_oracle_logs.yml`
+    - [x] Inspect `roles/oracle_log_sync/tasks/main.yml`
+    - [x] Inspect sub-tasks in `roles/oracle_log_sync/tasks/`
+    - [x] Inspect default variables in `roles/oracle_log_sync/defaults/main.yml`
+    - [x] Identify failure points and structural issues in tasks
+    - [x] Analyze `setup_cron.yml` for robustness
+- [x] Design and propose changes/improvements
+    - [x] Create implementation plan
+    - [x] Update implementation plan with fixes and cron enhancements
+- [x] Revert and combine discovery solutions
+    - [x] Update `setup_cron.yml` to use previous discovery with fallback
+    - [x] Update `implementation_plan.md` with analysis
+- [x] Verify implementation
+    - [x] Update walkthrough
+- [x] Fix log collection failure (`fetch` replaced with `archive`)
+    - [x] Correct inverted/convoluted `use_nfs` conditional
+    - [x] Replace `fetch` with `shell` (tar) + `fetch` sequence
+- [x] Fix silent discovery failures (Missing `LIBPATH`/Env vars)
+- [x] Implement robust fallback ('find' command) for alert/audit logs
+- [x] Optimize for ELK (Exclude `.trc`/`.trm` files)
+- [x] Fix empty listener logs (Target base directory, handle missing `trace` dir)
+- [x] Implement file-level reporting (List synced files in report)
+- [x] Implement history reporting (Append reports to `history.log`)
+- [x] Implement per-instance history reporting (Separate log for each SID)
+- [x] Update README with new features (ELK extraction, Reports, History)
+- [x] Fix empty listener report (Move result recording outside block)
+- [x] Document Instance Filtering in `README.md`
+- [x] Implement Instance Filtering (`-MGMTDB`, `+ASM`)
+    - [x] Add `skip_instances` to `defaults/main.yml`
+    - [x] Update `main.yml` to filter detected instances
+    - [x] Update `setup_cron.yml` to filter instances in shell script
+- [x] Fix undefined variable errors when tasks are skipped (`is defined` checks and initialization)
+- [x] Fix YAML syntax errors in `main.yml` and `sync_instance_logs.yml`
+- [x] Repair broken ASCII map in `README.md`
+- [x] Reconcile User Context (AIX 'oracle' vs Control 'svcoarp')
+    - [x] Audit `generate_report.yml` for `svcoarp` compatibility on control node
+    - [x] Audit `main.yml` user detection for AD account nuances
+    - [x] Verify `setup_cron.yml` remains strictly `oracle`-centric on AIX
+- [x] Optimize Multi-Server Integration
+    - [x] Ensure hostname-based subdirectories are robust
+    - [x] Verify rsync options for concurrent sync safety
+- [x] Implement Professional Enhancements
+    - [x] Add Role Metadata (`meta/main.yml`)
+    - [x] Create Log Maintenance Playbook (`playbooks/maintain_logs.yml`)
+    - [x] Implement HTML Status Dashboard (`templates/dashboard.html.j2` + `generate_report.yml`)
+        - [x] Restructure directory to `log_sync_jobs`
+        - [x] Add direct file links to HTML Dashboard
+    - [x] Implement Advanced Metrics & Reporting
+        - [x] Collect Lag, Size, Audit Counts
+        - [x] Interactive Dashboard (Search/Sort)
+        - [x] Detailed Job Reports (HTML)
+- [x] Implement Force Resync Option (`force_resync=true`)
+    - [x] Add defaults variable
+    - [x] Implement `-I` (ignore times) logic in `main.yml`
+    - [x] Document in README
+- [x] Verified Sync Reporting (Source vs Destination)
+    - [x] Collect NFS Destination Metrics in `sync_instance_logs.yml`
+    - [x] Collect NFS Destination Metrics in `sync_listener_logs.yml`
+    - [x] Update Job Detail Report with Comparison Table
+    - [x] Update Dashboard Lag Logic (uses NFS mtime)
+- [x] Implement State Management (Modern Approach)
+    - [x] Implement `sync_state.json` for Instance Logs (Base Time + Last Sync)
+    - [x] Implement `sync_history.log` for Listener Logs
+    - [x] Implement `sync_state.json` for Listener Logs
+- [x] Agile Mode & Selective Sync
+    - [x] Implement `job_type` variable (sync_only, report_only, full)
+    - [x] Expose Granular Sync Variables (sync_alert, sync_listener, sync_audit)
+    - [x] Optimize Cron Job to use `job_type=sync_only`
+- [x] Verify and Finalize
+    - [x] Create test inventory
+    - [x] Update README with UI/UX features and Agile Mode usage
+    - [x] Finalize walkthrough
+- [x] Refactor Cron Setup for Control Node
+    - [x] Remove auto cron deployment on AIX targets
+    - [x] Output recommended crontab entries as text (Options A/B/C)
+    - [x] Update README with manual cron instructions

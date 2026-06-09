@@ -1,0 +1,3 @@
+---
+# vars file for oracle_log_sync
+# These can be overridden at playbook or inventory level

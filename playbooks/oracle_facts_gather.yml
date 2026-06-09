@@ -1,0 +1,133 @@
+---
+# ================================================================================
+# Oracle Database Facts with cx_Oracle Modules
+# ================================================================================
+#
+# This playbook uses the ansible-oracle-modules to gather comprehensive
+# facts about Oracle databases.
+#
+# PREREQUISITES:
+#   - cx_Oracle Python library installed
+#   - Network connectivity to Oracle listener
+#   - System or DBA credentials
+#
+# USAGE:
+#   # Gather database facts
+#   ansible-playbook playbooks/oracle_facts_gather.yml --limit crlnxd2201 \
+#     -e "db_service=ORCL"
+#
+#   # Gather facts and save to file
+#   ansible-playbook playbooks/oracle_facts_gather.yml --limit crlnxd2201 \
+#     -e "db_service=ORCL" \
+#     -e "save_facts=true"
+#
+#   # Gather Grid Infrastructure facts (no database connection needed)
+#   ansible-playbook playbooks/oracle_facts_gather.yml --limit crlnxd2201 \
+#     -e "gather_gi_facts=true"
+# ================================================================================
+
+- name: Oracle Facts Gathering (cx_Oracle Module)
+  hosts: all
+  become: no
+  gather_facts: yes
+  
+  vars:
+    # Connection defaults
+    db_hostname: "{{ inventory_hostname }}"
+    db_port: 1521
+    db_service: "{{ db_sid | default('ORCL') }}"
+    db_user: "{{ oracle_dba_user | default('system') }}"
+    db_password: "{{ oracle_dba_password | default('') }}"
+    db_mode: normal
+    save_facts: false
+    gather_gi_facts: false
+
+  environment:
+    ORACLE_HOME: "{{ oracle_home | default('/u01/app/oracle/product/19.0.0/dbhome_1') }}"
+    LD_LIBRARY_PATH: "{{ oracle_home | default('/u01/app/oracle/product/19.0.0/dbhome_1') }}/lib"
+
+  tasks:
+    # ============================================
+    # Gather Database Facts
+    # ============================================
+    - name: Gather Oracle database facts
+      oracle_facts:
+        hostname: "{{ db_hostname }}"
+        port: "{{ db_port }}"
+        service_name: "{{ db_service }}"
+        user: "{{ db_user }}"
+        password: "{{ db_password }}"
+        mode: "{{ db_mode }}"
+      when: not gather_gi_facts
+      register: db_facts
+
+    - name: Display database facts
+      ansible.builtin.debug:
+        var: db_facts
+      when: 
+        - not gather_gi_facts
+        - db_facts is defined
+
+    # ============================================
+    # Gather Grid Infrastructure Facts
+    # ============================================
+    - name: Gather Grid Infrastructure facts
+      oracle_gi_facts:
+      when: gather_gi_facts
+      register: gi_facts
+
+    - name: Display GI facts
+      ansible.builtin.debug:
+        var: gi_facts
+      when: 
+        - gather_gi_facts
+        - gi_facts is defined
+
+    # ============================================
+    # Save Facts to File
+    # ============================================
+    - name: Create reports directory
+      ansible.builtin.file:
+        path: "reports/{{ ansible_date_time.date }}/{{ inventory_hostname }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: no
+      when: save_facts | bool
+
+    - name: Save database facts to file
+      ansible.builtin.copy:
+        content: |
+          ================================================================================
+          ORACLE DATABASE FACTS - {{ inventory_hostname }}
+          ================================================================================
+          Generated: {{ ansible_date_time.iso8601 }}
+          Service:   {{ db_service }}
+          ================================================================================
+          
+          {{ db_facts | to_nice_yaml }}
+        dest: "reports/{{ ansible_date_time.date }}/{{ inventory_hostname }}/facts_{{ db_service }}.txt"
+      delegate_to: localhost
+      become: no
+      when: 
+        - save_facts | bool
+        - not gather_gi_facts
+        - db_facts is defined
+
+    - name: Save GI facts to file
+      ansible.builtin.copy:
+        content: |
+          ================================================================================
+          ORACLE GRID INFRASTRUCTURE FACTS - {{ inventory_hostname }}
+          ================================================================================
+          Generated: {{ ansible_date_time.iso8601 }}
+          ================================================================================
+          
+          {{ gi_facts | to_nice_yaml }}
+        dest: "reports/{{ ansible_date_time.date }}/{{ inventory_hostname }}/gi_facts.txt"
+      delegate_to: localhost
+      become: no
+      when: 
+        - save_facts | bool
+        - gather_gi_facts
+        - gi_facts is defined

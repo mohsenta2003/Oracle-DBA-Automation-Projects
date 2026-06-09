@@ -1,0 +1,378 @@
+---
+# Sync logs for a specific Oracle instance
+# Variables: current_sid, _oracle_user, oracle_home_map, nfs_log_path
+#
+
+- name: "{{ current_sid }} - Initialize log variables"
+  ansible.builtin.set_fact:
+    alert_log_dir: ""
+    audit_log_dir: ""
+    adr_base: ""
+
+- name: "{{ current_sid }} - Set ORACLE_HOME for instance"
+  ansible.builtin.set_fact:
+    current_oracle_home: "{{ oracle_home_map[current_sid] | default('') }}"
+
+- name: "{{ current_sid }} - Skip if no ORACLE_HOME found"
+  ansible.builtin.debug:
+    msg: "WARNING: No ORACLE_HOME found for {{ current_sid }} in /etc/oratab - skipping"
+  when: current_oracle_home == ''
+
+- name: "{{ current_sid }} - Get diagnostic dest from database"
+  ansible.builtin.shell:
+    cmd: |
+      # Source profile for environment variables
+      if [ -f ~/.profile ]; then . ~/.profile; fi
+      
+      export ORACLE_HOME={{ current_oracle_home }}
+      export ORACLE_SID={{ current_sid }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export LIBPATH=$ORACLE_HOME/lib:$LIBPATH
+      export LD_LIBRARY_PATH=$ORACLE_HOME/lib:$LD_LIBRARY_PATH
+      
+      echo "SET HEADING OFF
+      SET FEEDBACK OFF
+      SELECT value FROM v\$diag_info WHERE name = 'Diag Trace';
+      EXIT;" | $ORACLE_HOME/bin/sqlplus -s / as sysdba
+    args:
+      stdin: ""
+  register: diag_trace_result
+  changed_when: false
+  failed_when: false
+  when: current_oracle_home != ''
+
+- name: "{{ current_sid }} - Debug Diag Trace failure"
+  ansible.builtin.debug:
+    msg: "SQLPlus Failed for {{ current_sid }}: {{ diag_trace_result.stderr | default('Unknown error') }} (RC: {{ diag_trace_result.rc | default('N/A') }})"
+  when:
+    - current_oracle_home != ''
+    - diag_trace_result.rc is defined
+    - diag_trace_result.rc != 0
+
+- name: "{{ current_sid }} - Set alert log directory"
+  ansible.builtin.set_fact:
+    alert_log_dir: "{{ diag_trace_result.stdout | trim }}"
+  when:
+    - current_oracle_home != ''
+    - diag_trace_result.rc is defined
+    - diag_trace_result.rc == 0
+
+- name: "{{ current_sid }} - Fallback: Find alert log directory (if SQL/ADRCI failed)"
+  ansible.builtin.shell:
+    cmd: |
+      # Search for alert_<SID>.log in common bases (case-insensitive via grep)
+      # Using /u01 /u02 /opt /oracle and current_oracle_home/.. as search paths
+      BASE_PATH="{{ current_oracle_home }}/.."
+      find /u01 /u02 /opt /oracle "$BASE_PATH" -type f -name "*log" 2>/dev/null | grep -i "/alert_{{ current_sid }}\.log$" | head -1 | xargs dirname
+  register: find_alert_result
+  changed_when: false
+  when:
+    - current_oracle_home != ''
+    - alert_log_dir | default('') == ''
+
+- name: "{{ current_sid }} - Set alert log directory (Fallback)"
+  ansible.builtin.set_fact:
+    alert_log_dir: "{{ find_alert_result.stdout | trim }}"
+  when:
+    - current_oracle_home != ''
+    - find_alert_result.rc is defined
+    - find_alert_result.stdout | trim != ''
+
+- name: "{{ current_sid }} - Debug Alert Fallback"
+  ansible.builtin.debug:
+    msg: "Fallback find for {{ current_sid }} result: {{ find_alert_result.stdout | default('EMPTY') }}"
+  when:
+    - current_oracle_home != ''
+    - alert_log_dir | default('') == ''
+
+- name: "{{ current_sid }} - Get audit file dest"
+  ansible.builtin.shell:
+    cmd: |
+      if [ -f ~/.profile ]; then . ~/.profile; fi
+      export ORACLE_HOME={{ current_oracle_home }}
+      export ORACLE_SID={{ current_sid }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export LIBPATH=$ORACLE_HOME/lib:$LIBPATH
+      export LD_LIBRARY_PATH=$ORACLE_HOME/lib:$LD_LIBRARY_PATH
+      
+      echo "SET HEADING OFF
+      SET FEEDBACK OFF
+      SELECT value FROM v\$parameter WHERE name = 'audit_file_dest';
+      EXIT;" | $ORACLE_HOME/bin/sqlplus -s / as sysdba
+    args:
+      stdin: ""
+  register: audit_dest_result
+  changed_when: false
+  failed_when: false
+  when: current_oracle_home != ''
+
+- name: "{{ current_sid }} - Set audit log directory"
+  ansible.builtin.set_fact:
+    audit_log_dir: "{{ audit_dest_result.stdout | trim }}"
+  when:
+    - current_oracle_home != ''
+    - audit_dest_result.rc is defined
+    - audit_dest_result.rc == 0
+
+- name: "{{ current_sid }} - Fallback: Find audit log directory (if SQL failed)"
+  ansible.builtin.shell:
+    cmd: |
+      # Common audit locations
+      find {{ current_oracle_home }}/rdbms/audit /u01/app/oracle/admin/{{ current_sid }}/adump -maxdepth 2 -type d 2>/dev/null | head -1
+  register: find_audit_result
+  changed_when: false
+  when:
+    - current_oracle_home != ''
+    - audit_log_dir | default('') == ''
+
+- name: "{{ current_sid }} - Set audit log directory (Fallback)"
+  ansible.builtin.set_fact:
+    audit_log_dir: "{{ find_audit_result.stdout | trim }}"
+  when:
+    - current_oracle_home != ''
+    - find_audit_result.rc is defined
+    - find_audit_result.stdout | trim != ''
+
+- name: "{{ current_sid }} - Get ADR base"
+  ansible.builtin.shell:
+    cmd: |
+      if [ -f ~/.profile ]; then . ~/.profile; fi
+      export ORACLE_HOME={{ current_oracle_home }}
+      export ORACLE_SID={{ current_sid }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export LIBPATH=$ORACLE_HOME/lib:$LIBPATH
+      export LD_LIBRARY_PATH=$ORACLE_HOME/lib:$LD_LIBRARY_PATH
+      
+      echo "SET HEADING OFF
+      SET FEEDBACK OFF
+      SELECT value FROM v\$diag_info WHERE name = 'ADR Base';
+      EXIT;" | $ORACLE_HOME/bin/sqlplus -s / as sysdba
+    args:
+      stdin: ""
+  register: adr_base_result
+  changed_when: false
+  failed_when: false
+  when: current_oracle_home != ''
+
+- name: "{{ current_sid }} - Set ADR base"
+  ansible.builtin.set_fact:
+    adr_base: "{{ adr_base_result.stdout | trim }}"
+  when:
+    - current_oracle_home != ''
+    - adr_base_result.rc is defined
+    - adr_base_result.rc == 0
+
+- name: "{{ current_sid }} - Display discovered log paths"
+  ansible.builtin.debug:
+    msg: |
+      Instance: {{ current_sid }}
+      ORACLE_HOME: {{ current_oracle_home }}
+      Alert Log Dir: {{ alert_log_dir | default('NOT FOUND') }}
+      Audit Log Dir: {{ audit_log_dir | default('NOT FOUND') }}
+      ADR Base: {{ adr_base | default('NOT FOUND') }}
+  when: current_oracle_home != ''
+
+- name: "{{ current_sid }} - Create NFS directories"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "{{ nfs_log_path }}/{{ inventory_hostname }}/{{ current_sid }}/alert"
+    - "{{ nfs_log_path }}/{{ inventory_hostname }}/{{ current_sid }}/audit"
+    - "{{ nfs_log_path }}/{{ inventory_hostname }}/{{ current_sid }}/trace"
+  when: current_oracle_home != ''
+
+- name: "{{ current_sid }} - Sync alert logs to NFS"
+  ansible.builtin.shell:
+    cmd: |
+      if [ -d "{{ alert_log_dir }}" ]; then
+        {% if sync_mode == 'incremental' %}
+        rsync {{ rsync_incremental_options }} \
+        {% else %}
+        rsync {{ rsync_options }} \
+        {% endif %}
+          --include='alert_*.log' \
+          --include='alert_*.xml' \
+          --exclude='*' \
+          "{{ alert_log_dir }}/" \
+          "{{ nfs_log_path }}/{{ inventory_hostname }}/{{ current_sid }}/alert/"
+        echo "SYNC_SUCCESS: Alert logs synced"
+      else
+        echo "SKIP: Alert log directory not found"
+      fi
+  register: alert_sync_result
+  changed_when: "'SYNC_SUCCESS' in alert_sync_result.stdout"
+  failed_when: false
+  when:
+    - current_oracle_home != ''
+    - sync_alert_logs | bool
+    - alert_log_dir is defined
+    - alert_log_dir | default('') != ''
+    - job_type in ['full', 'sync_only']
+
+- name: "{{ current_sid }} - Sync audit logs to NFS"
+  ansible.builtin.shell:
+    cmd: |
+      if [ -d "{{ audit_log_dir }}" ]; then
+        {% if sync_mode == 'incremental' %}
+        rsync {{ rsync_incremental_options }} \
+        {% else %}
+        rsync {{ rsync_options }} \
+        {% endif %}
+          --include='*.aud' \
+          --include='*.xml' \
+          --exclude='*' \
+          "{{ audit_log_dir }}/" \
+          "{{ nfs_log_path }}/{{ inventory_hostname }}/{{ current_sid }}/audit/"
+        echo "SYNC_SUCCESS: Audit logs synced"
+      else
+        echo "SKIP: Audit log directory not found"
+      fi
+  register: audit_sync_result
+  changed_when: "'SYNC_SUCCESS' in audit_sync_result.stdout"
+  failed_when: false
+  when:
+    - current_oracle_home != ''
+    - sync_audit_logs | bool
+    - audit_log_dir is defined
+    - audit_log_dir | default('') != ''
+    - job_type in ['full', 'sync_only']
+
+- name: "{{ current_sid }} - Sync recent trace files to NFS"
+  ansible.builtin.shell:
+    cmd: |
+      if [ -d "{{ alert_log_dir }}" ]; then
+        # Only sync trace files modified in last 7 days
+        find "{{ alert_log_dir }}" -name "*.trc" -mtime -7 -exec rsync -avz {} \
+          "{{ nfs_log_path }}/{{ inventory_hostname }}/{{ current_sid }}/trace/" \;
+        echo "SYNC_SUCCESS: Recent trace files synced"
+      fi
+  register: trace_sync_result
+  changed_when: "'SYNC_SUCCESS' in trace_sync_result.stdout"
+  failed_when: false
+  when:
+    - current_oracle_home != ''
+    - sync_alert_logs | bool
+    - alert_log_dir is defined
+    - job_type in ['full', 'sync_only']
+
+# ============================================
+# Update Sync Manifest (State Management)
+# ============================================
+- name: "{{ current_sid }} - Check for existing sync state"
+  ansible.builtin.stat:
+    path: "{{ nfs_log_path }}/{{ inventory_hostname }}/{{ current_sid }}/sync_state.json"
+  register: sync_state_file
+
+- name: "{{ current_sid }} - Consolidate synced file list for manifest"
+  ansible.builtin.set_fact:
+    _current_synced_files: >-
+      {{
+        (alert_sync_result.stdout_lines | default([]) + 
+         audit_sync_result.stdout_lines | default([]) + 
+         trace_sync_result.stdout_lines | default([])) 
+        | reject('search', 'building file list') 
+        | reject('search', 'files...') 
+        | reject('search', 'files to consider') 
+        | reject('search', 'sending incremental file list') 
+        | reject('search', 'SYNC_SUCCESS') 
+        | reject('search', 'sent') 
+        | reject('search', 'wrote') 
+        | reject('search', 'total size') 
+        | reject('match', '^\\s') 
+        | reject('match', '^\\./$') 
+        | reject('match', '^$') 
+        | list
+      }}
+
+- name: "{{ current_sid }} - Read existing sync state"
+  ansible.builtin.slurp:
+    src: "{{ nfs_log_path }}/{{ inventory_hostname }}/{{ current_sid }}/sync_state.json"
+  register: existing_sync_state
+  when: 
+    - sync_state_file.stat.exists
+    - _current_synced_files | length > 0
+  ignore_errors: true
+
+- name: "{{ current_sid }} - Parse existing sync state"
+  ansible.builtin.set_fact:
+    _sync_state_data: "{{ existing_sync_state.content | b64decode | from_json }}"
+  when: 
+    - sync_state_file.stat.exists
+    - existing_sync_state.content is defined
+  ignore_errors: true
+
+- name: "{{ current_sid }} - Define new sync state"
+  ansible.builtin.set_fact:
+    _new_sync_state:
+      created_at: "{{ (_sync_state_data | default({})).created_at | default(ansible_date_time.iso8601) }}"
+      updated_at: "{{ ansible_date_time.iso8601 }}"
+      instance: "{{ current_sid }}"
+      host: "{{ inventory_hostname }}"
+      sync_mode: "{{ sync_mode }}"
+      last_batch_count: "{{ _current_synced_files | length }}"
+  when: _current_synced_files | length > 0 or not sync_state_file.stat.exists
+
+- name: "{{ current_sid }} - Write sync state to NFS"
+  ansible.builtin.copy:
+    dest: "{{ nfs_log_path }}/{{ inventory_hostname }}/{{ current_sid }}/sync_state.json"
+    content: "{{ _new_sync_state | to_nice_json }}"
+    mode: '0644'
+  when: _current_synced_files | length > 0 or not sync_state_file.stat.exists
+
+- name: "{{ current_sid }} - Update Sync History File on NFS"
+  ansible.builtin.shell:
+    cmd: |
+      TIMESTAMP="{{ ansible_date_time.iso8601 }}"
+      MANIFEST="{{ nfs_log_path }}/{{ inventory_hostname }}/{{ current_sid }}/sync_history.log"
+      
+      # Append new file entries
+      {% for file in _current_synced_files %}
+      echo "{{ file }} | $TIMESTAMP" >> "$MANIFEST"
+      {% endfor %}
+  changed_when: false
+  when: _current_synced_files | length > 0
+
+# ============================================
+# Metric Collection (Advanced Reporting)
+# ============================================
+- name: "{{ current_sid }} - Collect Alert Log Metrics (Source)"
+  ansible.builtin.stat:
+    path: "{{ alert_log_dir }}/alert_{{ current_sid }}.log"
+  register: alert_log_stat
+  ignore_errors: true
+  when: alert_log_dir is defined
+
+- name: "{{ current_sid }} - Collect Alert Log Metrics (NFS Destination)"
+  ansible.builtin.stat:
+    path: "{{ nfs_log_path }}/{{ inventory_hostname }}/{{ current_sid }}/alert/alert_{{ current_sid }}.log"
+  register: nfs_alert_stat
+  ignore_errors: true
+  when: alert_log_dir is defined
+
+- name: "{{ current_sid }} - Collect Audit Log Count"
+  ansible.builtin.shell:
+    cmd: "ls -1U {{ audit_log_dir }}/*.aud 2>/dev/null | wc -l"
+  register: audit_file_count
+  ignore_errors: true
+  changed_when: false
+  when: audit_log_dir is defined
+
+- name: "{{ current_sid }} - Record sync status"
+  ansible.builtin.set_fact:
+    instance_sync_results: "{{ instance_sync_results | default([]) + [{
+      'sid': current_sid,
+      'alert_sync': alert_sync_result.stdout | default('N/A'),
+      'audit_sync': audit_sync_result.stdout | default('N/A'),
+      'alert_dir': alert_log_dir | default('N/A'),
+      'audit_dir': audit_log_dir | default('N/A'),
+      'alert_files': alert_sync_result.stdout_lines | default([]) | reject('search', 'building file list') | reject('search', 'files...') | reject('search', 'files to consider') | reject('search', 'sending incremental file list') | reject('search', 'SYNC_SUCCESS') | reject('search', 'sent') | reject('search', 'wrote') | reject('search', 'total size') | reject('match', '^\\s') | reject('match', '^\\./$') | reject('match', '^$') | list,
+      'audit_files': audit_sync_result.stdout_lines | default([]) | reject('search', 'building file list') | reject('search', 'files...') | reject('search', 'files to consider') | reject('search', 'sending incremental file list') | reject('search', 'SYNC_SUCCESS') | reject('search', 'sent') | reject('search', 'wrote') | reject('search', 'total size') | reject('match', '^\\s') | reject('match', '^\\./$') | reject('match', '^$') | list,
+      'check_alert_mtime': alert_log_stat.stat.mtime | default(0),
+      'check_alert_size': alert_log_stat.stat.size | default(0),
+      'nfs_alert_mtime': nfs_alert_stat.stat.mtime | default(0),
+      'nfs_alert_size': nfs_alert_stat.stat.size | default(0),
+      'check_audit_count': audit_file_count.stdout | default('0') | trim
+      }] }}"
+  when: current_oracle_home != ''

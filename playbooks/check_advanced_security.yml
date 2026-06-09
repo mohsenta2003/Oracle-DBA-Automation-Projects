@@ -1,0 +1,6 @@
+---
+- name: Check Oracle Advanced Security Features
+  hosts: all
+  gather_facts: no
+  roles:
+    - role: ../roles/oracle_security_check

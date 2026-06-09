@@ -1,0 +1,61 @@
+---
+# Dedicated playbook for cleaning up old logs locally and remotely
+# Usage: ansible-playbook playbooks/maintain_logs.yml -e "nfs_log_path=/nfs/oracle_logs log_retention_days=180"
+
+- name: Maintain Oracle Logs
+  hosts: all
+  gather_facts: false
+  vars:
+    log_retention_days: 180  # Default to 6 months
+    nfs_log_path_base: "{{ nfs_log_path | default('/nfs/oracle_logs') }}"
+
+  tasks:
+    # ---------------------------------------------------------
+    # Remote Cleanup (On the Target/NFS server)
+    # ---------------------------------------------------------
+    # This assumes the target host has write access to its own folder on the NFS share
+    # or that we are running this against the NFS server itself.
+    # Usually, we run against the DB servers, which mount the NFS.
+    
+    - name: Verify NFS path variable
+      ansible.builtin.fail:
+        msg: "nfs_log_path is not defined. Use -e 'nfs_log_path=/path'"
+      when: nfs_log_path is not defined
+
+    - name: Cleanup old logs for this host on NFS (Remote)
+      ansible.builtin.shell:
+        cmd: "find {{ nfs_log_path }}/{{ inventory_hostname }} -type f -mtime +{{ log_retention_days }} -delete"
+      ignore_errors: true
+      register: cleanup_result
+      # Use delegate_to if the cleanup should happen on headers/management server
+      # delegate_to: nfs_server_hostname 
+
+    - name: Report Remote Cleanup
+      ansible.builtin.debug:
+        msg: "Executed cleanup on {{ inventory_hostname }}: {{ cleanup_result.cmd }}"
+
+    # ---------------------------------------------------------
+    # Local Report Cleanup (On Controller)
+    # ---------------------------------------------------------
+    - name: Cleanup old local reports (Controller)
+      ansible.builtin.find:
+        paths: "reports/"
+        file_type: directory
+        age: "{{ log_retention_days }}d"
+        recurse: no
+      register: old_reports
+      delegate_to: localhost
+      run_once: true
+
+    - name: Remove old local reports
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      with_items: "{{ old_reports.files }}"
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Report Local Cleanup
+      ansible.builtin.debug:
+        msg: "Cleaned up {{ old_reports.matched }} old report directories locally."
+      run_once: true

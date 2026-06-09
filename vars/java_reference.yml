@@ -1,0 +1,122 @@
+---
+# Java/JDK reference data — edit this file to keep "latest known" versions current.
+# Used by playbooks/update_java_reference.yml to MERGE into JAVA_VERSION_REFERENCE.
+#
+# TRACK_KEY must be unique. Convention: "<VENDOR>-<MAJOR>".
+# RELEASE_DATE / EOL_DATE in YYYY-MM-DD (or empty).
+# Sources: oracle.com/java/technologies/java-se-support-roadmap, adoptium.net,
+#          endoflife.date/java. Update periodically.
+
+java_reference:
+  # ── Oracle JDK (commercial, Java SE) ───────────────────────────────────────
+  - track_key: "ORACLE-7"
+    vendor: "Oracle JDK"
+    major: 7
+    latest_version: "1.7.0_461"
+    release_date: "2025-04-15"
+    eol_date: "2022-07-01"
+    notes: "Extended support only. EOL for public updates."
+  - track_key: "ORACLE-8"
+    vendor: "Oracle JDK"
+    major: 8
+    latest_version: "1.8.0_491"
+    release_date: "2026-04-21"
+    eol_date: "2030-12-31"
+    notes: "LTS. Premier support extended."
+  - track_key: "ORACLE-11"
+    vendor: "Oracle JDK"
+    major: 11
+    latest_version: "11.0.27"
+    release_date: "2026-04-15"
+    eol_date: "2032-01-31"
+    notes: "LTS."
+  - track_key: "ORACLE-17"
+    vendor: "Oracle JDK"
+    major: 17
+    latest_version: "17.0.15"
+    release_date: "2026-04-15"
+    eol_date: "2029-09-30"
+    notes: "LTS."
+  - track_key: "ORACLE-21"
+    vendor: "Oracle JDK"
+    major: 21
+    latest_version: "21.0.7"
+    release_date: "2026-04-15"
+    eol_date: "2031-09-30"
+    notes: "LTS."
+  - track_key: "ORACLE-25"
+    vendor: "Oracle JDK"
+    major: 25
+    latest_version: "25.0.2"
+    release_date: "2026-01-21"
+    eol_date: ""
+    notes: "Latest LTS (Sep 2025)."
+
+  # ── OpenJDK (Temurin / Adoptium / RH OpenJDK) ─────────────────────────────
+  - track_key: "OPENJDK-7"
+    vendor: "OpenJDK"
+    major: 7
+    latest_version: "1.7.0_352"
+    release_date: "2022-07-19"
+    eol_date: "2020-07-01"
+    notes: "EOL. RH legacy build."
+  - track_key: "OPENJDK-8"
+    vendor: "OpenJDK"
+    major: 8
+    latest_version: "1.8.0_492"
+    release_date: "2026-04-15"
+    eol_date: "2026-11-30"
+    notes: "Adoptium Temurin / RH builds."
+  - track_key: "OPENJDK-11"
+    vendor: "OpenJDK"
+    major: 11
+    latest_version: "11.0.27"
+    release_date: "2026-04-15"
+    eol_date: "2027-10-31"
+    notes: "Adoptium Temurin."
+  - track_key: "OPENJDK-17"
+    vendor: "OpenJDK"
+    major: 17
+    latest_version: "17.0.15"
+    release_date: "2026-04-15"
+    eol_date: "2027-10-31"
+    notes: "Adoptium Temurin."
+  - track_key: "OPENJDK-21"
+    vendor: "OpenJDK"
+    major: 21
+    latest_version: "21.0.7"
+    release_date: "2026-04-15"
+    eol_date: "2028-09-30"
+    notes: "Adoptium Temurin."
+
+  # ── IBM JDK / Semeru ──────────────────────────────────────────────────────
+  - track_key: "IBM-8"
+    vendor: "IBM JDK"
+    major: 8
+    latest_version: "1.8.0_441"
+    release_date: "2025-10-15"
+    eol_date: "2026-04-30"
+    notes: "IBM Semeru / J9."
+
+  # ── Amazon Corretto ───────────────────────────────────────────────────────
+  - track_key: "CORRETTO-8"
+    vendor: "Amazon Corretto"
+    major: 8
+    latest_version: "1.8.0_452"
+    release_date: "2026-04-15"
+    eol_date: "2026-11-30"
+    notes: ""
+  - track_key: "CORRETTO-11"
+    vendor: "Amazon Corretto"
+    major: 11
+    latest_version: "11.0.27"
+    release_date: "2026-04-15"
+    eol_date: "2027-10-31"
+    notes: ""
+  - track_key: "CORRETTO-17"
+    vendor: "Amazon Corretto"
+    major: 17
+    latest_version: "17.0.15"
+    release_date: "2026-04-15"
+    eol_date: "2027-10-31"
+    notes: ""

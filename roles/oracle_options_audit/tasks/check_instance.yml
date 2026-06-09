@@ -1,0 +1,949 @@
+---
+# roles/oracle_options_audit/tasks/check_instance.yml
+# Per-instance data collection — called from main.yml via loop
+# Loop variable: current_sid
+
+- name: "{{ current_sid }} - Resolve ORACLE_HOME"
+  ansible.builtin.set_fact:
+    _cur_home: "{{ _oratab_map[current_sid] | default(_oratab_map.values() | first) }}"
+
+- name: "{{ current_sid }} - Show instance info"
+  ansible.builtin.debug:
+    msg: "Auditing options: SID={{ current_sid }} | HOME={{ _cur_home }}"
+
+# ============================================
+# Step 1: DB status + names
+# ============================================
+- name: "{{ current_sid }} - Get DB status, role, names"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _cur_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SET LINESIZE 500
+      SELECT i.status || '|' ||
+             d.database_role || '|' ||
+             i.host_name || '|' ||
+             i.version || '|' ||
+             d.open_mode || '|' ||
+             TO_CHAR(d.dbid) || '|' ||
+             d.name || '|' ||
+             d.db_unique_name
+      FROM v$instance i, v$database d;
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: _inst_status
+  changed_when: false
+  failed_when: false
+
+- name: "{{ current_sid }} - Parse DB status"
+  ansible.builtin.set_fact:
+    _cur_db_status:      "{{ (_inst_status.stdout | default('UNKNOWN||||||||') | trim).split('|')[0] | trim }}"
+    _cur_db_role:        "{{ (_inst_status.stdout | default('UNKNOWN||||||||') | trim).split('|')[1] | trim }}"
+    _cur_db_open_mode:   "{{ (_inst_status.stdout | default('UNKNOWN||||||||') | trim).split('|')[4] | trim }}"
+    _cur_dbid:           "{{ (_inst_status.stdout | default('UNKNOWN||||||||') | trim).split('|')[5] | trim }}"
+    _cur_db_name:        "{{ (_inst_status.stdout | default('UNKNOWN||||||||') | trim).split('|')[6] | trim }}"
+    _cur_db_unique_name: "{{ (_inst_status.stdout | default('UNKNOWN||||||||') | trim).split('|')[7] | trim }}"
+    _cur_version_full:   "{{ (_inst_status.stdout | default('UNKNOWN||||||||') | trim).split('|')[3] | trim }}"
+
+- name: "{{ current_sid }} - Derive version major and standby flag"
+  ansible.builtin.set_fact:
+    _cur_version_major: "{{ _cur_version_full.split('.')[0] | default('0') | int }}"
+    _cur_is_standby:    "{{ _cur_db_role in ['PHYSICAL STANDBY','LOGICAL STANDBY','SNAPSHOT STANDBY'] or _cur_db_open_mode is not search('READ') }}"
+    _cur_is_12c_plus:   "{{ (_cur_version_full.split('.')[0] | default('0') | int) >= 12 }}"
+
+# ============================================
+# Step 2: Get patch info (dba_registry_sqlpatch — 12.2+)
+# Falls back gracefully on 11g
+# ============================================
+- name: "{{ current_sid }} - Get patch level"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _cur_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SET LINESIZE 500
+      {% if _cur_is_12c_plus | bool %}
+      SELECT NVL(TO_CHAR(MAX(PATCH_ID)),'') || '|' ||
+             NVL(MAX(DESCRIPTION),'') || '|' ||
+             NVL(TO_CHAR(MAX(ACTION_TIME),'YYYY-MM-DD'),'')
+      FROM   DBA_REGISTRY_SQLPATCH
+      WHERE  STATUS = 'SUCCESS';
+      {% else %}
+      SELECT '' || '|' || '' || '|' '' FROM DUAL;
+      {% endif %}
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: _inst_patch
+  changed_when: false
+  failed_when: false
+  when: not (_cur_is_standby | bool)
+
+- name: "{{ current_sid }} - Get OPatch version"
+  ansible.builtin.shell:
+    cmd: "{{ _cur_home }}/OPatch/opatch version 2>/dev/null | grep 'OPatch Version' | awk '{print $NF}'"
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: _inst_opatch
+  changed_when: false
+  failed_when: false
+  when: not (_cur_is_standby | bool)
+
+- name: "{{ current_sid }} - Parse patch info"
+  ansible.builtin.set_fact:
+    _cur_patch_id:      "{{ (_inst_patch.stdout | default('||') | trim).split('|')[0] | trim }}"
+    _cur_patch_level:   "{{ (_inst_patch.stdout | default('||') | trim).split('|')[1] | trim }}"
+    _cur_patch_date:    "{{ (_inst_patch.stdout | default('||') | trim).split('|')[2] | trim }}"
+    _cur_opatch_ver:    "{{ _inst_opatch.stdout | default('') | trim }}"
+  when: not (_cur_is_standby | bool)
+
+- name: "{{ current_sid }} - Set empty patch info for standby"
+  ansible.builtin.set_fact:
+    _cur_patch_id:    ""
+    _cur_patch_level: ""
+    _cur_patch_date:  ""
+    _cur_opatch_ver:  ""
+  when: _cur_is_standby | bool
+
+# ============================================
+# Step 3: DB total size
+# ============================================
+- name: "{{ current_sid }} - Get DB total size"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _cur_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SELECT NVL(TO_CHAR(ROUND(SUM(bytes)/1073741824,4)),'0') FROM dba_data_files;
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: _inst_size
+  changed_when: false
+  failed_when: false
+  when: not (_cur_is_standby | bool)
+
+# ============================================
+# Step 4: Collect all v$option rows
+# ============================================
+- name: "{{ current_sid }} - Collect v$option"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _cur_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SET LINESIZE 500
+      SELECT PARAMETER || '|' || VALUE FROM v$option ORDER BY PARAMETER;
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: _inst_voption
+  changed_when: false
+  failed_when: >-
+    'ORA-' in (_inst_voption.stdout | default('')) or
+    'ORA-' in (_inst_voption.stderr | default(''))
+
+# ── For standby: detect if Active Data Guard is in use (open READ ONLY) ──────
+- name: "{{ current_sid }} - Collect ADG status on standby"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _cur_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 WRAP OFF TRIMSPOOL ON
+      SELECT d.db_unique_name || '|' ||
+             d.database_role || '|' ||
+             d.open_mode || '|' ||
+             NVL(p.value,'') || '|' ||
+             NVL(TO_CHAR(s.applied_scn),'')
+      FROM v$database d
+      CROSS JOIN (SELECT value FROM v$parameter WHERE name='fal_server') p
+      LEFT JOIN (SELECT MAX(applied_scn) applied_scn FROM v$archive_dest_status
+                 WHERE status='VALID' AND db_unique_name IS NOT NULL) s ON 1=1;
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: _inst_adg_standby
+  changed_when: false
+  failed_when: false
+  when: _cur_is_standby | bool
+
+# ============================================
+# Step 5: Feature refresh then collect
+# ============================================
+- name: "{{ current_sid }} - Refresh feature usage statistics"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _cur_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      BEGIN
+        DBMS_FEATURE_USAGE_INTERNAL.exec_db_usage_sampling(SYSDATE);
+      END;
+      /
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: _feat_refresh
+  changed_when: false
+  failed_when: >-
+    'ORA-' in (_feat_refresh.stdout | default('')) or
+    'ORA-' in (_feat_refresh.stderr | default(''))
+  when: not (_cur_is_standby | bool)
+
+- name: "{{ current_sid }} - Collect dba_feature_usage_statistics"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _cur_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SET LINESIZE 600
+      SET WRAP OFF
+      SET TRIMSPOOL ON
+      {% set kw_filter = ee_feature_keywords | default([]) | map('regex_replace', "^(.*)$", "NAME LIKE '%\\1%'") | join(' OR ') %}
+      {% if _cur_is_12c_plus | bool %}
+      SELECT
+        NAME || '|' ||
+        VERSION || '|' ||
+        TO_CHAR(DETECTED_USAGES) || '|' ||
+        NVL(CURRENTLY_USED,'') || '|' ||
+        NVL(TO_CHAR(FIRST_USAGE_DATE,'YYYY-MM-DD'),'') || '|' ||
+        NVL(TO_CHAR(LAST_USAGE_DATE,'YYYY-MM-DD'),'') || '|' ||
+        NVL(TO_CHAR(LAST_SAMPLE_DATE,'YYYY-MM-DD'),'') || '|' ||
+        NVL(TO_CHAR(AUX_COUNT),'')
+      FROM DBA_FEATURE_USAGE_STATISTICS
+      WHERE DBID = (SELECT DBID FROM V$DATABASE)
+      AND ({{ kw_filter }})
+      ORDER BY NAME;
+      {% else %}
+      SELECT
+        NAME || '|' ||
+        VERSION || '|' ||
+        TO_CHAR(DETECTED_USAGES) || '|' ||
+        '' || '|' ||
+        NVL(TO_CHAR(FIRST_USAGE_DATE,'YYYY-MM-DD'),'') || '|' ||
+        '' || '|' ||
+        NVL(TO_CHAR(LAST_SAMPLE_DATE,'YYYY-MM-DD'),'') || '|' ||
+        NVL(TO_CHAR(AUX_COUNT),'')
+      FROM DBA_FEATURE_USAGE_STATISTICS
+      WHERE DBID = (SELECT DBID FROM V$DATABASE)
+      AND ({{ kw_filter }})
+      ORDER BY NAME;
+      {% endif %}
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: _inst_features
+  changed_when: false
+  failed_when: >-
+    'ORA-' in (_inst_features.stdout | default('')) or
+    'ORA-' in (_inst_features.stderr | default(''))
+  when: not (_cur_is_standby | bool)
+
+# ============================================
+# Step 6: Per-category detail evidence queries
+# ============================================
+
+# ── Partitioning ─────────────────────────────────────────────────────────────
+# Auto-detect if Partitioning is actively being used
+- name: "{{ current_sid }} - Check if Partitioning is in use"
+  ansible.builtin.set_fact:
+    _cur_partitioning_in_use: >-
+      {%- set found = namespace(value=false) -%}
+      {%- for line in (_inst_features.stdout | default('')).splitlines() -%}
+        {%- set parts = line.split('|') -%}
+        {%- if parts | length >= 4 and 'Partitioning' in parts[0] -%}
+          {%- set currently_used = parts[3] | default('') | upper -%}
+          {%- set detected_usages = parts[2] | default('0') | int -%}
+          {%- if currently_used == 'TRUE' or detected_usages > 0 -%}
+            {%- set found.value = true -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ found.value }}
+  when: not (_cur_is_standby | bool)
+
+- name: "{{ current_sid }} - Collect partitioned object evidence"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _cur_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SET LINESIZE 600
+      SET WRAP OFF
+      SET TRIMSPOOL ON
+      {% if _cur_is_12c_plus | bool %}
+      SELECT pt.owner || '|' ||
+             pt.table_name || '|' ||
+             pt.partitioning_type || '|' ||
+             NVL(pt.subpartitioning_type,'NONE') || '|' ||
+             TO_CHAR(pt.partition_count) || '|' ||
+             NVL((SELECT LISTAGG(pkc.column_name,',') WITHIN GROUP (ORDER BY pkc.column_position)
+                  FROM dba_part_key_columns pkc
+                  WHERE pkc.owner = pt.owner AND pkc.name = pt.table_name
+                  AND pkc.object_type = 'TABLE'), 'N/A') || '|' ||
+             NVL(TO_CHAR(ROUND(NVL(seg.size_gb,0),4)),'0')
+      FROM dba_part_tables pt
+      JOIN dba_users u ON pt.owner = u.username
+      LEFT JOIN (SELECT owner, segment_name,
+                        ROUND(SUM(bytes)/1073741824,4) AS size_gb
+                 FROM dba_segments
+                 WHERE segment_type IN ('TABLE PARTITION','TABLE SUBPARTITION')
+                 GROUP BY owner, segment_name) seg
+        ON seg.owner = pt.owner AND seg.segment_name = pt.table_name
+      WHERE u.oracle_maintained = 'N'
+      ORDER BY pt.owner, pt.table_name;
+      {% else %}
+      SELECT pt.owner || '|' ||
+             pt.table_name || '|' ||
+             pt.partitioning_type || '|' ||
+             NVL(pt.subpartitioning_type,'NONE') || '|' ||
+             TO_CHAR(pt.partition_count) || '|' ||
+             NVL((SELECT LISTAGG(pkc.column_name,',') WITHIN GROUP (ORDER BY pkc.column_position)
+                  FROM dba_part_key_columns pkc
+                  WHERE pkc.owner = pt.owner AND pkc.name = pt.table_name
+                  AND pkc.object_type = 'TABLE'), 'N/A') || '|' ||
+             NVL(TO_CHAR(ROUND(NVL(seg.size_gb,0),4)),'0')
+      FROM dba_part_tables pt
+      LEFT JOIN (SELECT owner, segment_name,
+                        ROUND(SUM(bytes)/1073741824,4) AS size_gb
+                 FROM dba_segments
+                 WHERE segment_type IN ('TABLE PARTITION','TABLE SUBPARTITION')
+                 GROUP BY owner, segment_name) seg
+        ON seg.owner = pt.owner AND seg.segment_name = pt.table_name
+      WHERE pt.owner NOT IN ('SYS','SYSTEM','DBSNMP','SYSMAN','OUTLN','MDSYS',
+        'ORDSYS','EXFSYS','DMSYS','WMSYS','CTXSYS','ANONYMOUS','XDB',
+        'ORDPLUGINS','OLAPSYS','PUBLIC','LBACSYS','OJVMSYS')
+      ORDER BY pt.owner, pt.table_name;
+      {% endif %}
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: _inst_part
+  changed_when: false
+  failed_when: false
+  when: >-
+    not (_cur_is_standby | bool) and
+    ((collect_partitioning | default(true) | bool) or (_cur_partitioning_in_use | default(false) | bool))
+
+# ── Advanced Compression ─────────────────────────────────────────────────────
+# Auto-detect if Compression is actively being used
+- name: "{{ current_sid }} - Check if Compression is in use"
+  ansible.builtin.set_fact:
+    _cur_compression_in_use: >-
+      {%- set found = namespace(value=false) -%}
+      {%- for line in (_inst_features.stdout | default('')).splitlines() -%}
+        {%- set parts = line.split('|') -%}
+        {%- if parts | length >= 4 and ('Compression' in parts[0] or 'HCC' in parts[0]) -%}
+          {%- set currently_used = parts[3] | default('') | upper -%}
+          {%- set detected_usages = parts[2] | default('0') | int -%}
+          {%- if currently_used == 'TRUE' or detected_usages > 0 -%}
+            {%- set found.value = true -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ found.value }}
+  when: not (_cur_is_standby | bool)
+
+- name: "{{ current_sid }} - Collect compression evidence"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _cur_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SET LINESIZE 600
+      SET WRAP OFF
+      SET TRIMSPOOL ON
+      SELECT owner || '|' ||
+             table_name || '|' ||
+             'TABLE' || '|' ||
+             compression || '|' ||
+             NVL(compress_for,'') || '|' ||
+             NVL(TO_CHAR(ROUND(s.seg_bytes/1073741824,4)),'0')
+      FROM dba_tables t
+      JOIN (SELECT owner o, segment_name n, SUM(bytes) seg_bytes
+            FROM dba_segments WHERE segment_type LIKE 'TABLE%' GROUP BY owner, segment_name) s
+           ON s.o=t.owner AND s.n=t.table_name
+      WHERE compression='ENABLED'
+      AND   compress_for NOT IN ('BASIC','NONE')
+      AND   owner NOT IN ('SYS','SYSTEM','DBSNMP','SYSMAN','APEX_PUBLIC_USER',
+                          'OUTLN','XDB','ORDDATA','CTXSYS','MDSYS','WMSYS',
+                          'EXFSYS','DVSYS','LBACSYS','OLAPSYS','ORDSYS')
+      UNION ALL
+      SELECT tablespace_name || '|' ||
+             '(tablespace)' || '|' ||
+             'TABLESPACE' || '|' ||
+             compression || '|' ||
+             NVL(compress_for,'') || '|' ||
+             '0'
+      FROM dba_tablespaces
+      WHERE compression='ENABLED'
+      ORDER BY 1,2;
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: _inst_compress
+  changed_when: false
+  failed_when: false
+  when: >-
+    not (_cur_is_standby | bool) and
+    ((collect_compression | default(true) | bool) or (_cur_compression_in_use | default(false) | bool))
+
+# ── Advanced Security (TDE) ───────────────────────────────────────────────────
+# Auto-detect if Advanced Security/TDE is actively being used
+- name: "{{ current_sid }} - Check if Advanced Security is in use"
+  ansible.builtin.set_fact:
+    _cur_security_in_use: >-
+      {%- set found = namespace(value=false) -%}
+      {%- for line in (_inst_features.stdout | default('')).splitlines() -%}
+        {%- set parts = line.split('|') -%}
+        {%- if parts | length >= 4 and ('Encryption' in parts[0] or 'Advanced Security' in parts[0] or 'TDE' in parts[0] or 'Transparent Data Encryption' in parts[0]) -%}
+          {%- set currently_used = parts[3] | default('') | upper -%}
+          {%- set detected_usages = parts[2] | default('0') | int -%}
+          {%- if currently_used == 'TRUE' or detected_usages > 0 -%}
+            {%- set found.value = true -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ found.value }}
+  when: not (_cur_is_standby | bool)
+
+- name: "{{ current_sid }} - Collect TDE / Advanced Security evidence"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _cur_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SET LINESIZE 600
+      SET WRAP OFF
+      SET TRIMSPOOL ON
+      SELECT 'TABLESPACE' || '|' ||
+             t.tablespace_name || '|' ||
+             'N/A' || '|' ||
+             'YES' || '|' ||
+             'ENCRYPTED' || '|' ||
+             '0'
+      FROM dba_tablespaces t
+      WHERE t.encrypted = 'YES'
+      UNION ALL
+      SELECT 'COLUMN' || '|' ||
+             ec.owner || '|' ||
+             ec.table_name || '.' || ec.column_name || '|' ||
+             'YES' || '|' ||
+             ec.encryption_alg || '|' ||
+             '0'
+      FROM dba_encrypted_columns ec;
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: _inst_security
+  changed_when: false
+  failed_when: false
+  when: >-
+    not (_cur_is_standby | bool) and
+    ((collect_security | default(true) | bool) or (_cur_security_in_use | default(false) | bool))
+
+# ── In-Memory Column Store ────────────────────────────────────────────────────
+# Auto-detect if In-Memory is actively being used from feature stats
+# Match IS_INUSE logic: CURRENTLY_USED='TRUE' OR DETECTED_USAGES > 0
+- name: "{{ current_sid }} - Check if In-Memory is in use"
+  ansible.builtin.set_fact:
+    _cur_inmemory_in_use: >-
+      {%- set found = namespace(value=false) -%}
+      {%- for line in (_inst_features.stdout | default('')).splitlines() -%}
+        {%- set parts = line.split('|') -%}
+        {%- if parts | length >= 4 and 'In-Memory' in parts[0] -%}
+          {%- set currently_used = parts[3] | default('') | upper -%}
+          {%- set detected_usages = parts[2] | default('0') | int -%}
+          {%- if currently_used == 'TRUE' or detected_usages > 0 -%}
+            {%- set found.value = true -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ found.value }}
+  when: not (_cur_is_standby | bool) and (_cur_is_12c_plus | bool)
+
+- name: "{{ current_sid }} - Warning: In-Memory IS_INUSE=Y but collection disabled"
+  ansible.builtin.debug:
+    msg: |
+      ⚠️  WARNING: In-Memory feature shows CURRENTLY_USED=TRUE but collect_inmemory=false
+      Host: {{ inventory_hostname }} | SID: {{ current_sid }}
+      Evidence will be collected AUTOMATICALLY to ensure license audit compliance.
+  when: 
+    - not (_cur_is_standby | bool)
+    - (_cur_is_12c_plus | bool)
+    - (_cur_inmemory_in_use | default(false) | bool)
+    - not (collect_inmemory | default(true) | bool)
+
+- name: "{{ current_sid }} - Collect In-Memory object evidence"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _cur_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SET LINESIZE 600
+      SET WRAP OFF
+      SET TRIMSPOOL ON
+      -- Method 1: Tables configured with INMEMORY='ENABLED'
+      SELECT owner || '|' ||
+             table_name || '|' ||
+             inmemory || '|' ||
+             NVL(inmemory_priority,'') || '|' ||
+             NVL(inmemory_compression,'') || '|' ||
+             '0'
+      FROM dba_tables
+      WHERE inmemory='ENABLED'
+      AND owner NOT IN ('SYS','SYSTEM','DBSNMP','SYSMAN','APEX_PUBLIC_USER',
+                        'OUTLN','XDB','ORDDATA','CTXSYS','MDSYS','WMSYS',
+                        'EXFSYS','DVSYS','LBACSYS','OLAPSYS','ORDSYS')
+      UNION
+      -- Method 2: Segments actually populated in IM area (may not be configured but used)
+      SELECT owner || '|' ||
+             segment_name || '|' ||
+             'POPULATED' || '|' ||
+             'ACTIVE' || '|' ||
+             '' || '|' ||
+             TO_CHAR(ROUND(inmemory_size/1073741824,4))
+      FROM v\$im_segments
+      WHERE owner NOT IN ('SYS','SYSTEM','DBSNMP','SYSMAN','APEX_PUBLIC_USER',
+                          'OUTLN','XDB','ORDDATA','CTXSYS','MDSYS','WMSYS',
+                          'EXFSYS','DVSYS','LBACSYS','OLAPSYS','ORDSYS')
+      ORDER BY 1, 2;
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: _inst_inmem
+  changed_when: false
+  failed_when: false
+  when: >-
+    not (_cur_is_standby | bool) and (_cur_is_12c_plus | bool) and
+    ((collect_inmemory | default(true) | bool) or (_cur_inmemory_in_use | default(false) | bool))
+
+# ── Multitenant / PDB count ───────────────────────────────────────────────────
+- name: "{{ current_sid }} - Collect PDB evidence"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _cur_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SET LINESIZE 600
+      SET WRAP OFF
+      SET TRIMSPOOL ON
+      SELECT con_id || '|' ||
+             name || '|' ||
+             open_mode || '|' ||
+             NVL(restricted,'NO') || '|' ||
+             NVL(TO_CHAR(creation_time,'YYYY-MM-DD'),'')
+      FROM v$pdbs
+      ORDER BY con_id;
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: _inst_pdbs
+  changed_when: false
+  failed_when: false
+  when: not (_cur_is_standby | bool) and (_cur_is_12c_plus | bool) and (collect_pdbs | default(true) | bool)
+
+# ── Active Data Guard (standby open for read) ─────────────────────────────────
+- name: "{{ current_sid }} - Collect Active Data Guard evidence"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _cur_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SET LINESIZE 600
+      SET WRAP OFF
+      SET TRIMSPOOL ON
+      SELECT d.db_unique_name || '|' ||
+             d.database_role || '|' ||
+             d.open_mode || '|' ||
+             NVL(p.value,'') || '|' ||
+             ''
+      FROM v$database d
+      CROSS JOIN (SELECT value FROM v$parameter WHERE name='fal_server') p;
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: _inst_adg_primary
+  changed_when: false
+  failed_when: false
+  when: false  # Disabled - ADG evidence collected from standby side only
+
+# ── RAC node info ─────────────────────────────────────────────────────────────
+- name: "{{ current_sid }} - Collect RAC node evidence"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _cur_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SET LINESIZE 600
+      SET WRAP OFF
+      SET TRIMSPOOL ON
+      SELECT inst_id || '|' || instance_name || '|' || host_name || '|' || status
+      FROM gv$instance
+      ORDER BY inst_id;
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: _inst_rac
+  changed_when: false
+  failed_when: false
+  when: not (_cur_is_standby | bool) and (collect_rac | default(true) | bool)
+
+# ── Parse all detail rows into lists ─────────────────────────────────────────
+- name: "{{ current_sid }} - Parse detail rows"
+  ansible.builtin.set_fact:
+    _cur_part_rows: >-
+      {%- set rows = [] -%}
+      {%- for line in (_inst_part.stdout | default('') | trim).split('\n') -%}
+        {%- if '|' in line -%}
+          {%- set p = line.split('|') -%}
+          {%- if p | length >= 6 -%}
+            {%- set _ = rows.append({'owner': p[0]|trim, 'table_name': p[1]|trim,
+              'part_type': p[2]|trim, 'subpart_type': p[3]|trim,
+              'part_count': p[4]|trim, 'part_key': p[5]|trim, 'size_gb': p[6]|default('')|trim}) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ rows }}
+    _cur_compress_rows: >-
+      {%- set rows = [] -%}
+      {%- for line in (_inst_compress.stdout | default('') | trim).split('\n') -%}
+        {%- if '|' in line -%}
+          {%- set p = line.split('|') -%}
+          {%- if p | length >= 5 -%}
+            {%- set _ = rows.append({'owner': p[0]|trim, 'object_name': p[1]|trim,
+              'object_type': p[2]|trim, 'compression': p[3]|trim,
+              'compress_for': p[4]|trim, 'size_gb': p[5]|default('')|trim}) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ rows }}
+    _cur_security_rows: >-
+      {%- set rows = [] -%}
+      {%- for line in (_inst_security.stdout | default('') | trim).split('\n') -%}
+        {%- if '|' in line -%}
+          {%- set p = line.split('|') -%}
+          {%- if p | length >= 5 -%}
+            {%- set _ = rows.append({'object_type': p[0]|trim, 'owner_or_ts': p[1]|trim,
+              'object_name': p[2]|trim, 'encrypted': p[3]|trim,
+              'algorithm': p[4]|trim, 'size_gb': p[5]|default('')|trim}) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ rows }}
+    _cur_inmem_rows: >-
+      {%- set rows = [] -%}
+      {%- for line in (_inst_inmem.stdout | default('') | trim).split('\n') -%}
+        {%- if '|' in line -%}
+          {%- set p = line.split('|') -%}
+          {%- if p | length >= 5 -%}
+            {%- set _ = rows.append({'owner': p[0]|trim, 'table_name': p[1]|trim,
+              'inmemory': p[2]|trim, 'priority': p[3]|trim,
+              'compression': p[4]|trim, 'size_gb': p[5]|default('')|trim}) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ rows }}
+    _cur_pdb_rows: >-
+      {%- set rows = [] -%}
+      {%- for line in (_inst_pdbs.stdout | default('') | trim).split('\n') -%}
+        {%- if '|' in line -%}
+          {%- set p = line.split('|') -%}
+          {%- if p | length >= 4 -%}
+            {%- set _ = rows.append({'con_id': p[0]|trim, 'name': p[1]|trim,
+              'open_mode': p[2]|trim, 'restricted': p[3]|trim,
+              'creation_date': p[4]|default('')|trim}) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ rows }}
+    _cur_adg_rows:      []  # ADG collected from standby side
+    _cur_rac_rows: >-
+      {%- set rows = [] -%}
+      {%- for line in (_inst_rac.stdout | default('') | trim).split('\n') -%}
+        {%- if '|' in line -%}
+          {%- set p = line.split('|') -%}
+          {%- if p | length >= 4 -%}
+            {%- set _ = rows.append({'inst_id': p[0]|trim, 'instance_name': p[1]|trim,
+              'host_name': p[2]|trim, 'status': p[3]|trim}) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ rows }}
+  when: not (_cur_is_standby | bool)
+
+- name: "{{ current_sid }} - Set empty detail rows for standby (except ADG)"
+  ansible.builtin.set_fact:
+    _cur_part_rows:     []
+    _cur_compress_rows: []
+    _cur_security_rows: []
+    _cur_inmem_rows:    []
+    _cur_pdb_rows:      []
+    _cur_rac_rows:      []
+    _cur_partitioning_in_use: false
+    _cur_compression_in_use: false
+    _cur_security_in_use: false
+    _cur_inmemory_in_use: false
+  when: _cur_is_standby | bool
+
+- name: "{{ current_sid }} - Parse ADG evidence from standby"
+  ansible.builtin.set_fact:
+    _cur_adg_rows: >-
+      {%- set rows = [] -%}
+      {%- for line in (_inst_adg_standby.stdout | default('') | trim).split('\n') -%}
+        {%- if '|' in line -%}
+          {%- set p = line.split('|') -%}
+          {%- if p | length >= 4 -%}
+            {%- set db_role = p[1]|trim|upper -%}
+            {%- set open_mode = p[2]|trim|upper -%}
+            {%- if db_role == 'PHYSICAL STANDBY' and 'READ ONLY' in open_mode -%}
+              {%- set _ = rows.append({'db_unique_name': p[0]|trim, 'db_role': p[1]|trim,
+                'open_mode': p[2]|trim, 'fal_server': p[3]|trim,
+                'applied_scn': p[4]|default('')|trim}) -%}
+            {%- endif -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ rows }}
+  when: _cur_is_standby | bool and (collect_adg | default(true) | bool)
+
+# ============================================
+# Step 7: Parse collected rows into lists
+# ============================================
+- name: "{{ current_sid }} - Parse v$option rows into list"
+  ansible.builtin.set_fact:
+    _cur_voption_rows: >-
+      {%- set rows = [] -%}
+      {%- for line in (_inst_voption.stdout | default('') | trim).split('\n') -%}
+        {%- if '|' in line -%}
+          {%- set parts = line.split('|') -%}
+          {%- if parts | length >= 2 -%}
+            {%- set opt_name = parts[0] | trim -%}
+            {%- set _ = rows.append({'name': opt_name, 'enabled': parts[1] | trim, 'is_ee_extra': 'Y' if opt_name in ee_extra_options else 'N'}) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ rows }}
+
+- name: "{{ current_sid }} - Parse feature rows into list"
+  ansible.builtin.set_fact:
+    _cur_feature_rows: >-
+      {%- set rows = [] -%}
+      {%- for line in (_inst_features.stdout | default('') | trim).split('\n') -%}
+        {%- if '|' in line -%}
+          {%- set parts = line.split('|') -%}
+          {%- if parts | length >= 4 -%}
+            {%- set _ = rows.append({
+              'name':             parts[0] | trim,
+              'version':          parts[1] | trim,
+              'detected_usages':  parts[2] | trim | int,
+              'currently_used':   parts[3] | trim,
+              'first_usage_date': parts[4] | default('') | trim,
+              'last_usage_date':  parts[5] | default('') | trim,
+              'last_sample_date': parts[6] | default('') | trim,
+              'aux_count':        parts[7] | default('') | trim
+            }) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ rows }}
+  when: not (_cur_is_standby | bool)
+
+- name: "{{ current_sid }} - Flag IS_INUSE on voption rows from feature usage (primary)"
+  ansible.builtin.set_fact:
+    _cur_voption_rows: >-
+      {%- set result = [] -%}
+      {%- for opt in _cur_voption_rows | default([]) -%}
+        {%- set usage = namespace(found=false) -%}
+        {%- set opt_lower = opt.name | lower -%}
+        {%- for feat in _cur_feature_rows | default([]) -%}
+          {%- set feat_lower = feat.name | lower -%}
+          {%- if (opt_lower in feat_lower or feat_lower in opt_lower) and
+               (feat.currently_used | upper == 'TRUE' or feat.detected_usages | int > 0) -%}
+            {%- set usage.found = true -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- set _ = result.append(opt | combine({'is_inuse': 'Y' if usage.found else 'N'})) -%}
+      {%- endfor -%}
+      {{ result }}
+  when: not (_cur_is_standby | bool)
+
+- name: "{{ current_sid }} - Flag IS_INUSE for ADG on standby (open READ ONLY = Active Data Guard)"
+  ansible.builtin.set_fact:
+    _cur_voption_rows: >-
+      {%- set adg_line = (_inst_adg_standby.stdout | default('') | trim) -%}
+      {%- set open_mode = adg_line.split('|')[2] | default('') | trim | upper -%}
+      {%- set db_role = adg_line.split('|')[1] | default('') | trim | upper -%}
+      {%- set adg_inuse = (db_role == 'PHYSICAL STANDBY' and 'READ ONLY' in open_mode) -%}
+      {%- set result = [] -%}
+      {%- for opt in _cur_voption_rows | default([]) -%}
+        {%- if opt.name == 'Active Data Guard' -%}
+          {%- set _ = result.append(opt | combine({'is_inuse': 'Y' if adg_inuse else 'N'})) -%}
+        {%- else -%}
+          {%- set _ = result.append(opt | combine({'is_inuse': 'N'})) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ result }}
+    _cur_feature_rows:  []
+  when: _cur_is_standby | bool
+
+# Track if In-Memory evidence was auto-collected due to usage detection
+- name: "{{ current_sid }} - Track In-Memory auto-collection status"
+  ansible.builtin.set_fact:
+    _cur_inmem_autocollected: >-
+      {{
+        (_cur_inmemory_in_use | default(false) | bool) and
+        not (collect_inmemory | default(true) | bool) and
+        (_cur_inmem_rows | default([]) | length > 0)
+      }}
+  when: not (_cur_is_standby | bool) and (_cur_is_12c_plus | bool)
+
+- name: "{{ current_sid }} - Set default for auto-collection tracking"
+  ansible.builtin.set_fact:
+    _cur_inmem_autocollected: false
+  when: _cur_is_standby | bool or not (_cur_is_12c_plus | bool)
+
+# ── Debug: Show evidence collection counts ──
+- name: "{{ current_sid }} - DEBUG: Evidence collection summary"
+  ansible.builtin.debug:
+    msg:
+      - "====== {{ current_sid }} Evidence Collection Summary ======"
+      - "Partitioning rows:  {{ _cur_part_rows | default([]) | length }} {% if _cur_partitioning_in_use | default(false) %}[IN USE]{% endif %}"
+      - "Compression rows:   {{ _cur_compress_rows | default([]) | length }} {% if _cur_compression_in_use | default(false) %}[IN USE]{% endif %}"
+      - "Security/TDE rows:  {{ _cur_security_rows | default([]) | length }} {% if _cur_security_in_use | default(false) %}[IN USE]{% endif %}"
+      - "In-Memory rows:     {{ _cur_inmem_rows | default([]) | length }} {% if _cur_inmemory_in_use | default(false) %}[IN USE]{% endif %}"
+      - "PDB rows:           {{ _cur_pdb_rows | default([]) | length }}"
+      - "ADG rows:           {{ _cur_adg_rows | default([]) | length }}"
+      - "RAC rows:           {{ _cur_rac_rows | default([]) | length }}"
+      - "---"
+      - "Auto-detection: Part={{ _cur_partitioning_in_use | default(false) }} Comp={{ _cur_compression_in_use | default(false) }} Sec={{ _cur_security_in_use | default(false) }} IM={{ _cur_inmemory_in_use | default(false) }}"
+      - "IM Auto-collected:  {{ _cur_inmem_autocollected | default(false) }}"
+      - "---"
+      - "INTERPRETATION: 'IN USE' means feature usage stats show DETECTED_USAGES > 0 or CURRENTLY_USED=TRUE"
+      - "                If evidence rows = 0 but [IN USE], feature was used historically but no current objects exist"
+      - "                This is VALID - Oracle tracks usage history even after objects are dropped/disabled"
+  when: not (_cur_is_standby | bool)
+
+# ============================================
+# Step 7: Append to host-level results list
+# ============================================
+- name: "{{ current_sid }} - Append to audit results"
+  ansible.builtin.set_fact:
+    _audit_instance_results: >-
+      {{ _audit_instance_results | default([]) + [{
+        'sid':            current_sid,
+        'dbid':           _cur_dbid | default('NULL'),
+        'db_name':        _cur_db_name | default(''),
+        'db_unique_name': _cur_db_unique_name | default(''),
+        'oracle_version': _cur_version_full | default(''),
+        'version_major':  _cur_version_major | default('NULL'),
+        'db_role':        _cur_db_role | default('UNKNOWN'),
+        'open_mode':      _cur_db_open_mode | default('UNKNOWN'),
+        'is_standby':     _cur_is_standby | default(false) | bool,
+        'skipped':        false,
+        'skip_reason':    '',
+        'os_type':        _host_os_type | default(''),
+        'os_version':     _host_os_version | default(''),
+        'os_kernel':      _host_os_kernel | default(''),
+        'cpu_count':      _host_cpu_count | default('NULL'),
+        'host_timezone':  _host_timezone | default(''),
+        'region':         _host_region | default('UNKNOWN'),
+        'db_patch_id':    _cur_patch_id | default('NULL'),
+        'db_patch_level': _cur_patch_level | default(''),
+        'db_patch_date':  _cur_patch_date | default(''),
+        'opatch_version': _cur_opatch_ver | default(''),
+        'db_total_size_gb': _inst_size.stdout | default('0') | trim,
+        'oracle_user':    _oracle_user | default(''),
+        'oracle_home':    _cur_home | default(''),
+        'voption_rows':   _cur_voption_rows | default([]),
+        'feature_rows':   _cur_feature_rows | default([]),
+        'part_rows':      _cur_part_rows     | default([]),
+        'compress_rows':  _cur_compress_rows | default([]),
+        'security_rows':  _cur_security_rows | default([]),
+        'inmem_rows':     _cur_inmem_rows     | default([]),
+        'pdb_rows':       _cur_pdb_rows       | default([]),
+        'adg_rows':       _cur_adg_rows       | default([]),
+        'rac_rows':       _cur_rac_rows       | default([]),
+        'inmem_autocollected': _cur_inmem_autocollected | default(false) | bool
+      }] }}
+
+- name: "{{ current_sid }} - Console summary"
+  ansible.builtin.debug:
+    msg: >-
+      {{ current_sid }} | {{ _cur_db_role }} | {{ _cur_version_full }}
+      | v$option rows: {{ _cur_voption_rows | default([]) | length }}
+      | features: {{ _cur_feature_rows | default([]) | length }}
+      | inmem evidence: {{ _cur_inmem_rows | default([]) | length }}
+      {{ ' [AUTO-COLLECTED]' if (_cur_inmem_autocollected | default(false) | bool) else '' }}
+      | feature rows: {{ _cur_feature_rows | default([]) | length }}
+      | standby: {{ _cur_is_standby }}

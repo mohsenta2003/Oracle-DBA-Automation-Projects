@@ -1,0 +1,1761 @@
+---
+# playbooks/report_java_scan_run.yml
+#
+# Generate a Java scan report from data already stored in the repository DB
+# (without scanning target hosts again).
+#
+# Standard flow matches license report style:
+#   1) list available runs
+#   2) resolve report RUN_ID
+#   3) generate summary sections from repository tables/views
+#
+# Usage:
+#   ansible-playbook playbooks/report_java_scan_run.yml -i inv_key.yml -e "repo_password=<pwd>"
+#   ansible-playbook playbooks/report_java_scan_run.yml -i inv_key.yml -e "report_run_id=12 repo_password=<pwd>"
+#   ansible-playbook playbooks/report_java_scan_run.yml -i inv_key.yml -e "list_runs_only=true repo_password=<pwd>"
+#   ansible-playbook playbooks/report_java_scan_run.yml -i inv_key.yml -e "send_summary_email=false repo_password=<pwd>"
+#   ansible-playbook playbooks/report_java_scan_run.yml -i inv_key.yml -e "report_output_dir=/tmp repo_password=<pwd>"
+
+- name: Java Footprint Audit - Report from DB
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  environment:
+    NLS_LANG: AMERICAN_AMERICA.AL32UTF8
+
+  vars_files:
+    - ../vars/java_scanner_config.yml
+
+  vars:
+    report_run_id: ""
+    list_runs_only: false
+    send_summary_email: "{{ send_summary_email | default(true) }}"
+    _conn: "{{ repo_tns_alias if (repo_tns_alias | default('')) else '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=' ~ repo_host ~ ')(PORT=' ~ repo_port ~ '))(CONNECT_DATA=(' ~ ('SERVICE_NAME=' ~ repo_service if (repo_service | default('')) else 'SID=' ~ repo_sid) ~ ')))' }}"
+
+  tasks:
+    - name: Validate required runtime variables
+      ansible.builtin.assert:
+        that:
+          - repo_user | default('') | trim | length > 0
+          - repo_schema | default('') | trim | length > 0
+          - repo_password | default('') | trim | length > 0
+        fail_msg: >-
+          Missing required repository variables. Provide at runtime, e.g.
+          -e "repo_password=<pwd>".
+
+    - name: Define newline helper
+      ansible.builtin.set_fact:
+        _nl: "\n"
+
+    - name: Ensure report log directory exists
+      ansible.builtin.file:
+        path: "{{ report_output_dir | default(log_dir) }}"
+        state: directory
+
+    # 1) List runs
+    - name: List available Java scan runs
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING ON FEEDBACK OFF PAGESIZE 50 LINESIZE 170
+          SET COLSEP '|'
+          COLUMN RUN_ID    FORMAT 999999
+          COLUMN RUN_LABEL FORMAT A36
+          COLUMN RUN_DATE  FORMAT A19
+          COLUMN HOSTS     FORMAT 99999
+          COLUMN INSTALLS  FORMAT 999999
+          SELECT RUN_ID,
+                 SUBSTR(RUN_LABEL,1,36) AS RUN_LABEL,
+                 TO_CHAR(RUN_DATE,'YYYY-MM-DD HH24:MI:SS') AS RUN_DATE,
+                 NVL(TOTAL_HOSTS,0) AS HOSTS,
+                 NVL(TOTAL_INSTALLS,0) AS INSTALLS
+          FROM {{ repo_schema | upper }}.JAVA_SCAN_RUNS
+          ORDER BY RUN_ID DESC
+          FETCH FIRST 30 ROWS ONLY;
+          EXIT;
+          EOSQL
+      register: _run_list
+      changed_when: false
+
+    - name: Show available Java scan runs
+      ansible.builtin.debug:
+        msg: "{{ _run_list.stdout_lines }}"
+
+    - name: Stop here if list_runs_only=true
+      ansible.builtin.meta: end_play
+      when: list_runs_only | bool
+
+    # 2) Resolve RUN_ID
+    - name: Resolve latest RUN_ID when not provided
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          SELECT TO_CHAR(MAX(RUN_ID)) FROM {{ repo_schema | upper }}.JAVA_SCAN_RUNS;
+          EXIT;
+          EOSQL
+      register: _latest_run
+      changed_when: false
+      when: report_run_id == ""
+
+    - name: Set effective RUN_ID
+      ansible.builtin.set_fact:
+        _eff_run_id: "{{ report_run_id if report_run_id != '' else (_latest_run.stdout | trim) }}"
+
+    - name: Fail if no run exists
+      ansible.builtin.fail:
+        msg: "No rows found in {{ repo_schema | upper }}.JAVA_SCAN_RUNS. Run collection first."
+      when: _eff_run_id == "" or _eff_run_id == "0" or _eff_run_id == "None"
+
+    # When report_run_id is empty (default), the report aggregates the LATEST
+    # RUN_ID per host across all scan runs — so a mop-up scan automatically
+    # supersedes the same host's prior data without needing manual merge.
+    # When report_run_id is provided, only that single run is reported.
+    - name: Build install filter SQL (latest-per-host vs single-run)
+      vars:
+        # Optional host filter. Accepts either:
+        #   -e "host_filter=crlnxp083,crlnxp140"          (comma list, exact match)
+        #   -e "host_filter=crlnxp%"                       (single SQL LIKE pattern, % allowed)
+        # Empty (default) = no host filter.
+        _hf_raw: "{{ host_filter | default('') | trim }}"
+        _hf_list: "{{ _hf_raw.split(',') | map('trim') | reject('equalto','') | list }}"
+        _hf_has_wild: "{{ '%' in _hf_raw or '_' in _hf_raw }}"
+        _hf_clause: >-
+          {%- if _hf_raw == '' -%}
+          {%- elif _hf_has_wild -%}
+           AND LOWER(HOSTNAME) LIKE LOWER('{{ _hf_raw }}')
+          {%- else -%}
+           AND ({% for h in _hf_list %}LOWER(HOSTNAME) = '{{ h | lower }}' OR LOWER(HOSTNAME) LIKE '{{ h | lower }}.%'{% if not loop.last %} OR {% endif %}{% endfor %})
+          {%- endif -%}
+        _hf_clause_i: >-
+          {%- if _hf_raw == '' -%}
+          {%- elif _hf_has_wild -%}
+           AND LOWER(i.HOSTNAME) LIKE LOWER('{{ _hf_raw }}')
+          {%- else -%}
+           AND ({% for h in _hf_list %}LOWER(i.HOSTNAME) = '{{ h | lower }}' OR LOWER(i.HOSTNAME) LIKE '{{ h | lower }}.%'{% if not loop.last %} OR {% endif %}{% endfor %})
+          {%- endif -%}
+      ansible.builtin.set_fact:
+        _install_where: >-
+          {%- if report_run_id != '' -%}
+          RUN_ID = {{ report_run_id }}{{ _hf_clause }}
+          {%- else -%}
+          (RUN_ID, HOSTNAME) IN (SELECT MAX(RUN_ID), HOSTNAME FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS GROUP BY HOSTNAME){{ _hf_clause }}
+          {%- endif -%}
+        _install_where_i: >-
+          {%- if report_run_id != '' -%}
+          i.RUN_ID = {{ report_run_id }}{{ _hf_clause_i }}
+          {%- else -%}
+          (i.RUN_ID, i.HOSTNAME) IN (SELECT MAX(RUN_ID), HOSTNAME FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS GROUP BY HOSTNAME){{ _hf_clause_i }}
+          {%- endif -%}
+        _report_mode: "{{ 'single' if report_run_id != '' else 'latest_per_host' }}"
+        _host_filter_active: "{{ _hf_raw }}"
+        # Env-tier sort key: PROD (lnxp) -> MODEL (lnxm) -> TEST (lnxt) -> Other.
+        # Use the qualified form when the query references a table alias.
+        _env_case:   "CASE WHEN LOWER(HOSTNAME)   LIKE '%lnxp%' THEN 1 WHEN LOWER(HOSTNAME)   LIKE '%lnxm%' THEN 2 WHEN LOWER(HOSTNAME)   LIKE '%lnxt%' THEN 3 ELSE 4 END"
+        _env_case_i: "CASE WHEN LOWER(i.HOSTNAME) LIKE '%lnxp%' THEN 1 WHEN LOWER(i.HOSTNAME) LIKE '%lnxm%' THEN 2 WHEN LOWER(i.HOSTNAME) LIKE '%lnxt%' THEN 3 ELSE 4 END"
+        # Friendly tier label for the row tag column
+        _env_label_case: "CASE WHEN LOWER(HOSTNAME) LIKE '%lnxp%' THEN 'PROD' WHEN LOWER(HOSTNAME) LIKE '%lnxm%' THEN 'MODEL' WHEN LOWER(HOSTNAME) LIKE '%lnxt%' THEN 'TEST' ELSE 'OTHER' END"
+        # Product version pulled from the install path (Oracle DB home, OPatch, OEM Agent, Grid)
+        _prod_ver_expr: |-
+          COALESCE(
+            REGEXP_SUBSTR(JAVA_BIN_PATH, '/product/([0-9][0-9.]+)', 1, 1, NULL, 1),
+            REGEXP_SUBSTR(JAVA_BIN_PATH, '/agent([0-9][0-9a-z._]+)/', 1, 1, NULL, 1),
+            REGEXP_SUBSTR(JAVA_BIN_PATH, '/agent_([0-9][0-9._]+)', 1, 1, NULL, 1),
+            REGEXP_SUBSTR(JAVA_BIN_PATH, '/grid/([0-9][0-9.]+)', 1, 1, NULL, 1),
+            REGEXP_SUBSTR(JAVA_BIN_PATH, '/oms([0-9][0-9.]+)', 1, 1, NULL, 1),
+            ''
+          )
+
+    - name: Show report mode
+      ansible.builtin.debug:
+        msg: >-
+          Java report mode = {{ _report_mode }} —
+          {% if _report_mode == 'single' %}only RUN_ID={{ report_run_id }}
+          {% else %}aggregating latest RUN_ID per host (covers mop-up runs automatically){% endif %}
+
+    - name: Show host filter (if active)
+      ansible.builtin.debug:
+        msg:
+          - "host_filter input: {{ _host_filter_active | default('(none)') }}"
+          - "rendered SQL WHERE: {{ _install_where_i }}"
+      when: _host_filter_active | default('') | length > 0
+
+    # 3) Collect report sections — header is synthesized from filtered installs
+    - name: Fetch run header
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500
+          SELECT
+            CASE WHEN MIN(i.RUN_ID) = MAX(i.RUN_ID)
+                 THEN TO_CHAR(MIN(i.RUN_ID))
+                 ELSE TO_CHAR(MIN(i.RUN_ID)) || '-' || TO_CHAR(MAX(i.RUN_ID))
+            END || '|' ||
+            CASE WHEN MIN(i.RUN_ID) = MAX(i.RUN_ID)
+                 THEN NVL(MAX(r.RUN_LABEL),'')
+                 ELSE 'Latest scan per host (' || TO_CHAR(COUNT(DISTINCT i.RUN_ID)) || ' runs merged)'
+            END || '|' ||
+            TO_CHAR(MAX(r.RUN_DATE),'YYYY-MM-DD HH24:MI:SS') || '|' ||
+            TO_CHAR(COUNT(DISTINCT i.HOSTNAME)) || '|' ||
+            TO_CHAR(COUNT(*))
+          FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS i
+          LEFT JOIN {{ repo_schema | upper }}.JAVA_SCAN_RUNS r ON r.RUN_ID = i.RUN_ID
+          WHERE {{ _install_where_i }};
+          EXIT;
+          EOSQL
+      register: _run_hdr_raw
+      changed_when: false
+
+    - name: Parse run header
+      ansible.builtin.set_fact:
+        _hdr: "{{ (_run_hdr_raw.stdout | trim).split('|') }}"
+
+    - name: Fetch by-context summary
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500
+          SELECT RPAD(NVL(INSTALL_CONTEXT,'UNKNOWN'),20) || ' | ' ||
+                 LPAD(TO_CHAR(COUNT(*)),8)
+          FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS
+          WHERE {{ _install_where }}
+          GROUP BY INSTALL_CONTEXT
+          ORDER BY COUNT(*) DESC, INSTALL_CONTEXT;
+          EXIT;
+          EOSQL
+      register: _ctx_summary
+      changed_when: false
+
+    - name: Fetch Java version summary
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500
+          SELECT RPAD(NVL(JAVA_VERSION,'UNKNOWN'),18) || ' | ' ||
+                 RPAD(NVL(JAVA_TYPE,'UNKNOWN'),16) || ' | ' ||
+                 LPAD(TO_CHAR(COUNT(*)),6)
+          FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS
+          WHERE {{ _install_where }}
+          GROUP BY JAVA_VERSION, JAVA_TYPE
+          ORDER BY COUNT(*) DESC, JAVA_VERSION;
+          EXIT;
+          EOSQL
+      register: _ver_summary
+      changed_when: false
+
+    - name: Fetch outdated inventory (Java < 11)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500
+          SELECT RPAD(HOSTNAME,30) || ' | ' ||
+                 RPAD(NVL(JAVA_VERSION,'UNKNOWN'),15) || ' | ' ||
+                 LPAD(NVL(TO_CHAR(JAVA_MAJOR),'0'),2) || ' | ' ||
+                 RPAD(NVL(INSTALL_CONTEXT,'UNKNOWN'),14) || ' | ' ||
+                 SUBSTR(JAVA_BIN_PATH,1,120)
+          FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS
+          WHERE {{ _install_where }}
+            AND NVL(JAVA_MAJOR,0) < 11
+          ORDER BY {{ _env_case }}, HOSTNAME, JAVA_MAJOR, JAVA_VERSION;
+          EXIT;
+          EOSQL
+      register: _old_java
+      changed_when: false
+
+    - name: Build final report text
+      ansible.builtin.set_fact:
+        _report_text: |
+          ================================================
+          JAVA FOOTPRINT AUDIT REPORT
+          ================================================
+          RUN_ID      : {{ _hdr[0] | default(_eff_run_id) }}
+          RUN_LABEL   : {{ _hdr[1] | default('') }}
+          RUN_DATE    : {{ _hdr[2] | default('') }}
+          TOTAL_HOSTS : {{ _hdr[3] | default('0') }}
+          TOTAL_JAVA  : {{ _hdr[4] | default('0') }}
+
+          -----------------------------------------------
+          BY INSTALL CONTEXT
+          -----------------------------------------------
+          {% if (_ctx_summary.stdout_lines | default([])) | length == 0 %}
+          No rows.
+          {% else %}
+          {{ _ctx_summary.stdout_lines | join(_nl) }}
+          {% endif %}
+
+          -----------------------------------------------
+          BY JAVA VERSION / TYPE
+          -----------------------------------------------
+          {% if (_ver_summary.stdout_lines | default([])) | length == 0 %}
+          No rows.
+          {% else %}
+          {{ _ver_summary.stdout_lines | join(_nl) }}
+          {% endif %}
+
+          -----------------------------------------------
+          OUTDATED JAVA (MAJOR < 11)
+          -----------------------------------------------
+          {% if (_old_java.stdout_lines | default([])) | length == 0 %}
+          None found.
+          {% else %}
+          {{ _old_java.stdout_lines | join(_nl) }}
+          {% endif %}
+
+          ================================================
+
+    - name: Set report file paths
+      ansible.builtin.set_fact:
+        _report_ts:    "{{ lookup('pipe','date +%Y%m%d_%H%M%S') }}"
+        _report_file:  "{{ (report_output_dir | default(log_dir)) }}/java_scan_report_run{{ _eff_run_id }}_{{ lookup('pipe','date +%Y%m%d_%H%M%S') }}.txt"
+
+    - name: Set HTML report file path
+      ansible.builtin.set_fact:
+        _report_html_file: "{{ (report_output_dir | default(log_dir)) }}/java_scan_report_run{{ _eff_run_id }}{{ ('_subset_' ~ (_host_filter_active | regex_replace('[^A-Za-z0-9._-]+','-'))) if (_host_filter_active | default('')) else '' }}_{{ _report_ts }}.html"
+
+    # Re-fetch summaries with structured pipe layout for HTML rendering
+    - name: Fetch by-context summary (pipe layout)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500
+          SELECT NVL(INSTALL_CONTEXT,'UNKNOWN') || '|' || TO_CHAR(COUNT(*))
+          FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS
+          WHERE {{ _install_where }}
+          GROUP BY INSTALL_CONTEXT
+          ORDER BY COUNT(*) DESC, INSTALL_CONTEXT;
+          EXIT;
+          EOSQL
+      register: _ctx_pipe
+      changed_when: false
+
+    - name: Fetch version summary (pipe layout)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 32767
+          SET LONG 32000 LONGCHUNKSIZE 32000
+          WITH base AS (
+            SELECT i.JAVA_VERSION, i.JAVA_TYPE, i.JAVA_MAJOR,
+                   i.HOSTNAME, i.RELATED_ORACLE_HOME, i.JAVA_BIN_PATH
+            FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS i
+            WHERE {{ _install_where_i }}
+          ),
+          ref_lookup AS (
+            SELECT b.JAVA_VERSION, b.JAVA_TYPE, b.JAVA_MAJOR,
+                   MAX(r.LATEST_VERSION) AS REF_LATEST,
+                   MAX(r.EOL_DATE)       AS REF_EOL
+            FROM base b
+            LEFT JOIN {{ repo_schema | upper }}.JAVA_VERSION_REFERENCE r
+              ON UPPER(r.VENDOR) = UPPER(b.JAVA_TYPE)
+             AND r.MAJOR = b.JAVA_MAJOR
+            GROUP BY b.JAVA_VERSION, b.JAVA_TYPE, b.JAVA_MAJOR
+          )
+          SELECT NVL(b.JAVA_VERSION,'UNKNOWN')   || '|' ||
+                 NVL(b.JAVA_TYPE,'UNKNOWN')      || '|' ||
+                 NVL(TO_CHAR(b.JAVA_MAJOR),'0')  || '|' ||
+                 TO_CHAR(COUNT(*))               || '|' ||
+                 TO_CHAR(COUNT(DISTINCT b.HOSTNAME)) || '|' ||
+                 SUBSTR(LISTAGG(DISTINCT b.HOSTNAME, ', ') WITHIN GROUP (ORDER BY {{ _env_case }}, b.HOSTNAME),1,2000) || '|' ||
+                 SUBSTR(LISTAGG(DISTINCT NVL(b.RELATED_ORACLE_HOME,'Unknown'), ', ') WITHIN GROUP (ORDER BY NVL(b.RELATED_ORACLE_HOME,'Unknown')),1,1000) || '|' ||
+                 CASE
+                   WHEN b.JAVA_VERSION IS NULL OR NVL(b.JAVA_MAJOR,0) = 0
+                     THEN 'Version string not parseable. Binary may be a wrapper, symlink, or restricted exec. Action: run "<path>/java -version" on the host to confirm. If the path is under an OPatch_b4_update_* dir or an EOL Oracle home, mark for cleanup or DB-upgrade project. Path hints: ' ||
+                          SUBSTR(LISTAGG(DISTINCT b.JAVA_BIN_PATH, '; ') WITHIN GROUP (ORDER BY b.JAVA_BIN_PATH),1,400)
+                   WHEN b.JAVA_MAJOR < 8
+                     THEN 'EOL major (Java ' || TO_CHAR(b.JAVA_MAJOR) || '). No security updates. Action: if inside an EOL Oracle home, plan DB upgrade/decommission; if OS package, run "rpm -q --whatrequires java-1.' || TO_CHAR(b.JAVA_MAJOR) || '.0-openjdk" and remove if no dependents.'
+                   WHEN MAX(rl.REF_LATEST) IS NULL
+                     THEN 'No reference entry found for ' || NVL(b.JAVA_TYPE,'?') || ' major ' || TO_CHAR(b.JAVA_MAJOR) || '. Action: add a track entry to vars/java_reference.yml so currency can be evaluated.'
+                   WHEN b.JAVA_VERSION = MAX(rl.REF_LATEST)
+                     THEN 'On latest known version (' || MAX(rl.REF_LATEST) || ') per JAVA_VERSION_REFERENCE.'
+                   ELSE 'Behind latest known. Action: update to ' || MAX(rl.REF_LATEST) || ' (per JAVA_VERSION_REFERENCE). For Oracle homes apply via JDK Bundle Patch (OPatch); for OS OpenJDK use dnf update.'
+                 END
+          FROM base b
+          LEFT JOIN ref_lookup rl
+            ON NVL(rl.JAVA_VERSION,'~') = NVL(b.JAVA_VERSION,'~')
+           AND NVL(rl.JAVA_TYPE,'~')    = NVL(b.JAVA_TYPE,'~')
+           AND NVL(rl.JAVA_MAJOR,-1)    = NVL(b.JAVA_MAJOR,-1)
+          GROUP BY b.JAVA_VERSION, b.JAVA_TYPE, b.JAVA_MAJOR
+          ORDER BY b.JAVA_MAJOR NULLS LAST, COUNT(*) DESC;
+          EXIT;
+          EOSQL
+      register: _ver_pipe
+      changed_when: false
+
+    - name: Fetch outdated installs (aggregated by finding, with action plan)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 32767
+          SET LONG 32000 LONGCHUNKSIZE 32000
+          WITH base AS (
+            SELECT i.INSTALL_ID, i.HOSTNAME, i.JAVA_VERSION, i.JAVA_MAJOR,
+                   i.INSTALL_CONTEXT, i.JAVA_TYPE, i.FILE_OWNER,
+                   i.RELATED_ORACLE_HOME, i.JAVA_BIN_PATH,
+                   NVL(i.RPM_OWNER,'') AS RPM_OWNER,
+                   {{ _env_label_case }} AS ENV_TIER,
+                   {{ _prod_ver_expr }}  AS PROD_VER
+            FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS i
+            WHERE {{ _install_where_i }}
+              AND NVL(i.JAVA_MAJOR,0) < 11
+          ),
+          matched AS (
+            SELECT b.*, r.RISK_TIER, r.ACTION_METHOD, r.OWNER AS RULE_OWNER,
+                   ROW_NUMBER() OVER (PARTITION BY b.INSTALL_ID ORDER BY NVL(r.PRIORITY,99999)) rn
+            FROM base b
+            LEFT JOIN {{ repo_schema | upper }}.JAVA_ACTION_RULES r
+              ON b.JAVA_BIN_PATH LIKE r.PATH_PATTERN
+             AND (r.JAVA_MAJOR_MIN IS NULL OR NVL(b.JAVA_MAJOR,0) >= r.JAVA_MAJOR_MIN)
+             AND (r.JAVA_MAJOR_MAX IS NULL OR NVL(b.JAVA_MAJOR,0) <= r.JAVA_MAJOR_MAX)
+          )
+          SELECT NVL(RISK_TIER,'UNCLASSIFIED')              || '|' ||
+                 ENV_TIER                                    || '|' ||
+                 TO_CHAR(COUNT(DISTINCT HOSTNAME))           || '|' ||
+                 SUBSTR(LISTAGG(DISTINCT HOSTNAME, ', ') WITHIN GROUP (ORDER BY HOSTNAME),1,1500) || '|' ||
+                 NVL(JAVA_VERSION,'UNKNOWN')                 || '|' ||
+                 NVL(TO_CHAR(JAVA_MAJOR),'0')                || '|' ||
+                 NVL(INSTALL_CONTEXT,'UNKNOWN')              || '|' ||
+                 NVL(JAVA_TYPE,'UNKNOWN')                    || '|' ||
+                 NVL(FILE_OWNER,'?')                         || '|' ||
+                 NVL(RELATED_ORACLE_HOME,'')                 || '|' ||
+                 NVL(PROD_VER,'')                            || '|' ||
+                 NVL(ACTION_METHOD,'(no rule matched)')      || '|' ||
+                 NVL(RULE_OWNER,'-')                         || '|' ||
+                 SUBSTR(MAX(JAVA_BIN_PATH),1,200)            || '|' ||
+                 SUBSTR(LISTAGG(DISTINCT CASE WHEN RPM_OWNER<>'' THEN RPM_OWNER END, ', ')
+                        WITHIN GROUP (ORDER BY RPM_OWNER),1,800)
+          FROM matched
+          WHERE rn = 1 OR rn IS NULL
+          GROUP BY RISK_TIER, ENV_TIER, JAVA_VERSION, JAVA_MAJOR, INSTALL_CONTEXT,
+                   JAVA_TYPE, FILE_OWNER, RELATED_ORACLE_HOME, PROD_VER,
+                   ACTION_METHOD, RULE_OWNER
+          ORDER BY CASE NVL(RISK_TIER,'UNCLASSIFIED')
+                     WHEN 'RED' THEN 1 WHEN 'YELLOW' THEN 2
+                     WHEN 'GREEN' THEN 3 WHEN 'INFO' THEN 4 ELSE 5 END,
+                   CASE ENV_TIER
+                     WHEN 'PROD' THEN 1 WHEN 'MODEL' THEN 2
+                     WHEN 'TEST' THEN 3 ELSE 4 END,
+                   NVL(JAVA_MAJOR,0),
+                   COUNT(DISTINCT HOSTNAME) DESC;
+          EXIT;
+          EOSQL
+      register: _old_pipe
+      changed_when: false
+
+    - name: Fetch by-application summary (pipe layout)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 32767
+          SET LONG 32000 LONGCHUNKSIZE 32000
+          SELECT NVL(RELATED_ORACLE_HOME,'Unknown') || '|' ||
+                 TO_CHAR(COUNT(*)) || '|' ||
+                 TO_CHAR(COUNT(DISTINCT HOSTNAME)) || '|' ||
+                 TO_CHAR(MIN(JAVA_MAJOR)) || '|' ||
+                 TO_CHAR(MAX(JAVA_MAJOR)) || '|' ||
+                 SUBSTR(LISTAGG(DISTINCT NVL(JAVA_VERSION,'UNKNOWN'), ', ') WITHIN GROUP (ORDER BY NVL(JAVA_VERSION,'UNKNOWN')), 1, 1500)
+          FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS
+          WHERE {{ _install_where }}
+          GROUP BY RELATED_ORACLE_HOME
+          ORDER BY COUNT(*) DESC, RELATED_ORACLE_HOME;
+          EXIT;
+          EOSQL
+      register: _app_pipe
+      changed_when: false
+
+    - name: Fetch by-owner summary (pipe layout)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500
+          SELECT NVL(FILE_OWNER,'unknown') || '|' ||
+                 NVL(FILE_GROUP,'') || '|' ||
+                 TO_CHAR(COUNT(*)) || '|' ||
+                 TO_CHAR(COUNT(DISTINCT HOSTNAME))
+          FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS
+          WHERE {{ _install_where }}
+          GROUP BY FILE_OWNER, FILE_GROUP
+          ORDER BY COUNT(*) DESC, FILE_OWNER;
+          EXIT;
+          EOSQL
+      register: _owner_pipe
+      changed_when: false
+
+    - name: Fetch outdated category summary (pipe layout)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 32767
+          SET LONG 32000 LONGCHUNKSIZE 32000
+          SELECT CASE
+                   WHEN NVL(JAVA_MAJOR,0) = 0 OR JAVA_MAJOR < 5 THEN 'Unknown / Pre-5'
+                   WHEN JAVA_MAJOR = 5 THEN 'Java 5 (CRITICAL EOL)'
+                   WHEN JAVA_MAJOR = 6 THEN 'Java 6 (CRITICAL EOL)'
+                   WHEN JAVA_MAJOR = 7 THEN 'Java 7 (EOL)'
+                   WHEN JAVA_MAJOR = 8 THEN 'Java 8 (Outdated - LTS legacy)'
+                   WHEN JAVA_MAJOR BETWEEN 9 AND 10 THEN 'Java 9-10 (Non-LTS, EOL)'
+                 END || '|' ||
+                 NVL(RELATED_ORACLE_HOME,'Unknown') || '|' ||
+                 TO_CHAR(COUNT(*)) || '|' ||
+                 TO_CHAR(COUNT(DISTINCT HOSTNAME)) || '|' ||
+                 SUBSTR(LISTAGG(DISTINCT NVL(JAVA_VERSION,'UNKNOWN'), ', ') WITHIN GROUP (ORDER BY NVL(JAVA_VERSION,'UNKNOWN')), 1, 800) || '|' ||
+                 SUBSTR(LISTAGG(DISTINCT HOSTNAME, ', ') WITHIN GROUP (ORDER BY {{ _env_case }}, HOSTNAME), 1, 1500)
+          FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS
+          WHERE {{ _install_where }}
+            AND NVL(JAVA_MAJOR,0) < 11
+          GROUP BY
+            CASE
+              WHEN NVL(JAVA_MAJOR,0) = 0 OR JAVA_MAJOR < 5 THEN 'Unknown / Pre-5'
+              WHEN JAVA_MAJOR = 5 THEN 'Java 5 (CRITICAL EOL)'
+              WHEN JAVA_MAJOR = 6 THEN 'Java 6 (CRITICAL EOL)'
+              WHEN JAVA_MAJOR = 7 THEN 'Java 7 (EOL)'
+              WHEN JAVA_MAJOR = 8 THEN 'Java 8 (Outdated - LTS legacy)'
+              WHEN JAVA_MAJOR BETWEEN 9 AND 10 THEN 'Java 9-10 (Non-LTS, EOL)'
+            END,
+            RELATED_ORACLE_HOME
+          ORDER BY MIN(NVL(JAVA_MAJOR,0)), COUNT(*) DESC;
+          EXIT;
+          EOSQL
+      register: _old_cat_pipe
+      changed_when: false
+
+    - name: Fetch reference gap analysis (pipe layout)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 32767
+          SET LONG 32000 LONGCHUNKSIZE 32000
+          DECLARE
+            v_cnt NUMBER;
+          BEGIN
+            SELECT COUNT(*) INTO v_cnt FROM USER_TABLES WHERE TABLE_NAME = 'JAVA_VERSION_REFERENCE';
+            IF v_cnt = 0 THEN
+              DBMS_OUTPUT.PUT_LINE('NO_REF_TABLE');
+            END IF;
+          END;
+          /
+          SELECT i.JAVA_TYPE || '|' ||
+                 TO_CHAR(i.JAVA_MAJOR) || '|' ||
+                 i.JAVA_VERSION || '|' ||
+                 NVL(r.LATEST_VERSION,'(no ref)') || '|' ||
+                 TO_CHAR(COUNT(*)) || '|' ||
+                 TO_CHAR(COUNT(DISTINCT i.HOSTNAME)) || '|' ||
+                 CASE
+                    WHEN r.LATEST_VERSION IS NULL THEN 'UNKNOWN'
+                    WHEN i.JAVA_VERSION = r.LATEST_VERSION THEN 'CURRENT'
+                    ELSE 'BEHIND'
+                 END || '|' ||
+                 SUBSTR(LISTAGG(DISTINCT NVL(i.RELATED_ORACLE_HOME,'Unknown'), ', ') WITHIN GROUP (ORDER BY NVL(i.RELATED_ORACLE_HOME,'Unknown')), 1, 800)
+          FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS i
+          LEFT JOIN {{ repo_schema | upper }}.JAVA_VERSION_REFERENCE r
+            ON UPPER(r.VENDOR) = UPPER(i.JAVA_TYPE)
+           AND r.MAJOR = i.JAVA_MAJOR
+          WHERE {{ _install_where_i }}
+          GROUP BY i.JAVA_TYPE, i.JAVA_MAJOR, i.JAVA_VERSION, r.LATEST_VERSION
+          ORDER BY i.JAVA_MAJOR NULLS LAST, COUNT(*) DESC;
+          EXIT;
+          EOSQL
+      register: _ref_gap_pipe
+      changed_when: false
+
+    - name: Fetch Action Plan summary (joined to JAVA_ACTION_RULES)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 32767
+          SET LONG 32000 LONGCHUNKSIZE 32000
+          DECLARE
+            v_cnt NUMBER;
+          BEGIN
+            SELECT COUNT(*) INTO v_cnt FROM USER_TABLES WHERE TABLE_NAME = 'JAVA_ACTION_RULES';
+            IF v_cnt = 0 THEN
+              DBMS_OUTPUT.PUT_LINE('NO_RULES_TABLE');
+            END IF;
+          END;
+          /
+          WITH matched AS (
+            SELECT i.INSTALL_ID, i.HOSTNAME, i.JAVA_MAJOR,
+                   r.RISK_TIER, r.ACTION_METHOD, r.OWNER, r.PRECHECK_NOTES,
+                   ROW_NUMBER() OVER (PARTITION BY i.INSTALL_ID ORDER BY r.PRIORITY) rn
+            FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS i
+            LEFT JOIN {{ repo_schema | upper }}.JAVA_ACTION_RULES r
+              ON i.JAVA_BIN_PATH LIKE r.PATH_PATTERN
+             AND (r.JAVA_MAJOR_MIN IS NULL OR NVL(i.JAVA_MAJOR,0) >= r.JAVA_MAJOR_MIN)
+             AND (r.JAVA_MAJOR_MAX IS NULL OR NVL(i.JAVA_MAJOR,0) <= r.JAVA_MAJOR_MAX)
+            WHERE {{ _install_where_i }}
+          )
+          SELECT NVL(RISK_TIER,'UNCLASSIFIED') || '|' ||
+                 NVL(ACTION_METHOD,'(no rule matched)') || '|' ||
+                 NVL(OWNER,'-') || '|' ||
+                 TO_CHAR(COUNT(*)) || '|' ||
+                 TO_CHAR(COUNT(DISTINCT HOSTNAME)) || '|' ||
+                 SUBSTR(NVL(MAX(PRECHECK_NOTES),''),1,400) || '|' ||
+                 SUBSTR(LISTAGG(DISTINCT HOSTNAME, ', ') WITHIN GROUP (ORDER BY HOSTNAME),1,4000)
+          FROM matched
+          WHERE rn = 1 OR rn IS NULL
+          GROUP BY RISK_TIER, ACTION_METHOD, OWNER
+          ORDER BY CASE NVL(RISK_TIER,'UNCLASSIFIED')
+                     WHEN 'RED' THEN 1
+                     WHEN 'YELLOW' THEN 2
+                     WHEN 'GREEN' THEN 3
+                     WHEN 'INFO' THEN 4
+                     ELSE 5 END,
+                   COUNT(*) DESC;
+          EXIT;
+          EOSQL
+      register: _action_pipe
+      changed_when: false
+
+    - name: Fetch Per-Host Action Plan (recommendation per host per finding)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 32767
+          SET LONG 32000 LONGCHUNKSIZE 32000
+          WITH base AS (
+            SELECT i.INSTALL_ID, i.HOSTNAME, i.JAVA_VERSION, i.JAVA_MAJOR,
+                   i.INSTALL_CONTEXT, i.JAVA_TYPE,
+                   i.RELATED_ORACLE_HOME, i.JAVA_BIN_PATH,
+                   NVL(i.IS_SYMLINK,'N')              AS IS_SYMLINK,
+                   NVL(i.RPM_OWNER,'')                AS RPM_OWNER,
+                   NVL(i.IS_ALTERNATIVES_DEFAULT,'N') AS IS_ALTERNATIVES_DEFAULT,
+                   NVL(i.LIVE_PROCS,0)                AS LIVE_PROCS,
+                   {{ _env_label_case }} AS ENV_TIER,
+                   {{ _prod_ver_expr }}  AS PROD_VER
+            FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS i
+            WHERE {{ _install_where_i }}
+          ),
+          matched AS (
+            SELECT b.*, r.RISK_TIER, r.ACTION_METHOD, r.OWNER AS RULE_OWNER,
+                   r.PRECHECK_NOTES,
+                   ROW_NUMBER() OVER (PARTITION BY b.INSTALL_ID
+                                      ORDER BY NVL(r.PRIORITY,99999)) rn
+            FROM base b
+            LEFT JOIN {{ repo_schema | upper }}.JAVA_ACTION_RULES r
+              ON b.JAVA_BIN_PATH LIKE r.PATH_PATTERN
+             AND (r.JAVA_MAJOR_MIN IS NULL OR NVL(b.JAVA_MAJOR,0) >= r.JAVA_MAJOR_MIN)
+             AND (r.JAVA_MAJOR_MAX IS NULL OR NVL(b.JAVA_MAJOR,0) <= r.JAVA_MAJOR_MAX)
+          ),
+          chosen AS (
+            SELECT * FROM matched WHERE rn = 1
+          ),
+          /* Aggregate per (host, recommendation) so two homes that need the
+             same action collapse to a single row, but two homes that need
+             DIFFERENT actions (e.g. different OPatch versions or different
+             JDK BPs) remain on separate rows for the DBA to verify. */
+          per_host AS (
+            SELECT HOSTNAME, ENV_TIER,
+                   NVL(RISK_TIER,'UNCLASSIFIED') AS RISK_TIER,
+                   NVL(ACTION_METHOD,'(no rule matched)') AS ACTION_METHOD,
+                   NVL(RULE_OWNER,'-') AS RULE_OWNER,
+                   NVL(PRECHECK_NOTES,'') AS PRECHECK_NOTES,
+                   NVL(INSTALL_CONTEXT,'UNKNOWN') AS INSTALL_CONTEXT,
+                   NVL(RELATED_ORACLE_HOME,'-') AS RELATED_ORACLE_HOME,
+                   NVL(PROD_VER,'') AS PROD_VER,
+                   COUNT(*) AS INSTALLS,
+                   SUBSTR(LISTAGG(DISTINCT JAVA_VERSION,', ')
+                          WITHIN GROUP (ORDER BY JAVA_VERSION),1,200) AS VERSIONS,
+                   SUBSTR(LISTAGG(DISTINCT JAVA_BIN_PATH, ' ;; ')
+                          WITHIN GROUP (ORDER BY JAVA_BIN_PATH),1,3000) AS JAVA_PATHS,
+                   SUM(NVL(LIVE_PROCS,0))                                            AS LIVE_PROCS_TOTAL,
+                   MAX(NVL(IS_ALTERNATIVES_DEFAULT,'N'))                             AS ANY_ALTS_DEFAULT,
+                   SUM(CASE WHEN RPM_OWNER IS NOT NULL AND RPM_OWNER<>'' THEN 1 ELSE 0 END) AS RPM_OWNED_COUNT,
+                   MAX(NVL(IS_SYMLINK,'N'))                                          AS ANY_SYMLINK,
+                   SUBSTR(LISTAGG(DISTINCT CASE WHEN RPM_OWNER IS NOT NULL AND RPM_OWNER<>''
+                                                THEN RPM_OWNER END, ', ')
+                          WITHIN GROUP (ORDER BY RPM_OWNER),1,1000)                  AS RPM_OWNERS
+            FROM chosen
+            GROUP BY HOSTNAME, ENV_TIER, RISK_TIER, ACTION_METHOD, RULE_OWNER,
+                     PRECHECK_NOTES, INSTALL_CONTEXT, RELATED_ORACLE_HOME, PROD_VER
+          )
+          SELECT HOSTNAME            || '|' ||
+                 ENV_TIER             || '|' ||
+                 RISK_TIER            || '|' ||
+                 ACTION_METHOD        || '|' ||
+                 RULE_OWNER           || '|' ||
+                 INSTALL_CONTEXT      || '|' ||
+                 RELATED_ORACLE_HOME  || '|' ||
+                 PROD_VER             || '|' ||
+                 TO_CHAR(INSTALLS)    || '|' ||
+                 VERSIONS             || '|' ||
+                 PRECHECK_NOTES       || '|' ||
+                 JAVA_PATHS           || '|' ||
+                 TO_CHAR(LIVE_PROCS_TOTAL) || '|' ||
+                 ANY_ALTS_DEFAULT     || '|' ||
+                 TO_CHAR(RPM_OWNED_COUNT)  || '|' ||
+                 ANY_SYMLINK          || '|' ||
+                 NVL(RPM_OWNERS,'')
+          FROM per_host
+          ORDER BY CASE ENV_TIER WHEN 'PROD' THEN 1 WHEN 'MODEL' THEN 2
+                                  WHEN 'TEST' THEN 3 ELSE 4 END,
+                   HOSTNAME,
+                   CASE RISK_TIER WHEN 'RED' THEN 1 WHEN 'YELLOW' THEN 2
+                                  WHEN 'GREEN' THEN 3 WHEN 'INFO' THEN 4
+                                  ELSE 5 END,
+                   ACTION_METHOD;
+          EXIT;
+          EOSQL
+      register: _per_host_pipe
+      changed_when: false
+
+    - name: Fetch host-level evidence (Tier 2 — runtime + env + legacy)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 32767
+          SET LONG 32000 LONGCHUNKSIZE 32000
+          /* one row per host on the latest run */
+          WITH latest AS (
+            SELECT HOSTNAME, MAX(RUN_ID) rid
+            FROM {{ repo_schema | upper }}.JAVA_HOST_EVIDENCE
+            GROUP BY HOSTNAME
+          )
+          SELECT e.HOSTNAME                                  || '|' ||
+                 TO_CHAR(NVL(e.RUNNING_PROC_COUNT,0))         || '|' ||
+                 SUBSTR(NVL(e.RUNNING_PROC_USERS,''),1,200)   || '|' ||
+                 SUBSTR(NVL(e.LISTENING_PORTS,''),1,200)      || '|' ||
+                 TO_CHAR(NVL(e.ENV_REFS_COUNT,0))             || '|' ||
+                 SUBSTR(NVL(e.ENV_REFS_FILES,''),1,800)       || '|' ||
+                 SUBSTR(NVL(e.SYSTEMD_UNITS,''),1,400)        || '|' ||
+                 SUBSTR(NVL(e.LEGACY_RPMS_PRESENT,''),1,200)  || '|' ||
+                 SUBSTR(NVL(e.ALTERNATIVES_TARGET,''),1,400)
+          FROM {{ repo_schema | upper }}.JAVA_HOST_EVIDENCE e
+          JOIN latest l ON l.HOSTNAME = e.HOSTNAME AND l.rid = e.RUN_ID
+          ORDER BY e.HOSTNAME;
+          EXIT;
+          EOSQL
+      register: _host_ev_pipe
+      changed_when: false
+      failed_when: false   # tolerate missing table on first run before DDL
+
+    - name: Build HTML report
+      ansible.builtin.set_fact:
+        _report_html: |
+          <!DOCTYPE html>
+          <html><head><meta charset="UTF-8"><title>Java Footprint Audit{{ ' - RUN ' ~ report_run_id if report_run_id != '' else ' - Latest per host' }}</title>
+          <style>
+            body { font-family: 'Segoe UI', Arial, sans-serif; font-size: 14px; color: #333; line-height: 1.55; max-width: 1000px; margin: 0 auto; }
+            .header { background: linear-gradient(135deg, #1565c0 0%, #0d47a1 100%); color: white; padding: 28px 30px; border-radius: 8px 8px 0 0; }
+            .header h1 { margin: 0 0 8px 0; font-size: 22px; font-weight: 600; }
+            .header p { margin: 4px 0; opacity: 0.95; font-size: 13px; }
+            .content { padding: 24px 30px; background: #fff; }
+            .section { margin-bottom: 24px; }
+            .section-title { color: #1565c0; font-size: 16px; font-weight: 600; margin-bottom: 10px; border-bottom: 2px solid #e3f2fd; padding-bottom: 6px; }
+            .summary-box { background: #f5f5f5; border-left: 4px solid #1565c0; padding: 12px 18px; margin: 10px 0; border-radius: 4px; }
+            .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 12px 0; }
+            .stat-card { background: white; border: 1px solid #e0e0e0; padding: 14px; text-align: center; border-radius: 6px; }
+            .stat-number { font-size: 26px; font-weight: 700; color: #1565c0; display: block; margin-bottom: 4px; }
+            .stat-label { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
+            table.t { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+            table.t th { background: #37474f; color: white; padding: 8px; text-align: left; }
+            table.t td { padding: 6px 8px; border-bottom: 1px solid #e0e0e0; }
+            tr.risk-high { background: #ffcdd2; }
+            tr.risk-warn { background: #ffe0b2; }
+            tr.risk-ok   { background: #e8f5e9; }
+            .badge { padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: bold; color: white; }
+            .b-risk { background: #c62828; }
+            .b-warn { background: #f57c00; }
+            .b-ok   { background: #2e7d32; }
+            .b-info { background: #78909c; }
+            .footer { background: #f5f5f5; padding: 16px; text-align: center; font-size: 11px; color: #999; border-radius: 0 0 8px 8px; }
+            code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-family: Consolas, monospace; font-size: 12px; }
+            a { color: #0d47a1; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+            .toc { background: #f5f7fa; border: 1px solid #e0e0e0; border-radius: 6px; padding: 10px 16px; margin: 6px 0 14px 0; font-size: 12px; }
+            .toc a { display: inline-block; margin-right: 14px; padding: 2px 0; }
+            .tier-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 12px 0; }
+            .tier-card { padding: 10px; border-radius: 6px; border: 1px solid #ddd; text-align: center; }
+            .tier-card.red { background: #ffebee; border-color: #ef9a9a; }
+            .tier-card.yellow { background: #fff8e1; border-color: #ffe082; }
+            .tier-card.green { background: #e8f5e9; border-color: #a5d6a7; }
+            .tier-card.info { background: #eceff1; border-color: #b0bec5; }
+            .tier-card b { display: block; font-size: 22px; }
+            .tier-card span { font-size: 11px; color: #555; text-transform: uppercase; letter-spacing: 0.4px; }
+            .narrative { font-size: 13px; line-height: 1.6; }
+            .narrative ol, .narrative ul { margin: 6px 0 6px 22px; }
+            .narrative li { margin: 4px 0; }
+            .host-link { font-family: Consolas, monospace; font-size: 11px; }
+            .host-link::after { content: '\00a0'; }
+          </style></head>
+          <body>
+            <div class="header">
+              <h1>&#9749; Java Footprint Audit Report</h1>
+              <p><b>Scope:</b> {{ 'Single RUN_ID = ' ~ report_run_id if report_run_id != '' else 'Latest scan per host (auto-merged across all runs)' }} &nbsp;|&nbsp; <b>Run(s):</b> {{ _hdr[0] | default(_eff_run_id) }} &nbsp;|&nbsp; <b>Label:</b> {{ _hdr[1] | default('') }} &nbsp;|&nbsp; <b>Latest Run Date:</b> {{ _hdr[2] | default('') }}</p>
+            </div>
+            <div class="content">
+
+              <div class="section">
+                <div class="section-title">&#128202; Executive Summary</div>
+                <div class="summary-box">
+                  <p><b>Purpose:</b> Inventory of Java (JDK/JRE) installations discovered across the infrastructure, including Oracle homes, OPatch, OS, and third-party agents. Highlights versions older than Java 11 (security/EOL risk) and maps each finding to its supported update method.</p>
+                </div>
+                <div class="stats-grid">
+                  <div class="stat-card"><span class="stat-number">{{ _hdr[3] | default('0') }}</span><span class="stat-label">Hosts Scanned</span></div>
+                  <div class="stat-card"><span class="stat-number">{{ _hdr[4] | default('0') }}</span><span class="stat-label">Java Installs</span></div>
+                  {%- set old_lines = (_old_pipe.stdout | default('') | trim).split('\n') | select('search','\\|') | list -%}
+                  <div class="stat-card"><span class="stat-number">{{ old_lines | length }}</span><span class="stat-label">Outdated Findings (&lt; 11)</span></div>
+                  {%- set ctx_lines = (_ctx_pipe.stdout | default('') | trim).split('\n') | select('search','\\|') | list -%}
+                  <div class="stat-card"><span class="stat-number">{{ ctx_lines | length }}</span><span class="stat-label">Install Contexts</span></div>
+                </div>
+                <div class="toc">
+                  <b>Jump to:</b>
+                  <a href="#sec-situation">&#127919; Situation &amp; Path to GREEN</a>
+                  <a href="#sec-action-plan">&#128296; Action Plan</a>
+                  <a href="#sec-per-host">&#127968; Per-Host Action Plan</a>
+                  <a href="#sec-ref-gap">&#128202; Reference Gap</a>
+                  <a href="#sec-version">&#128293; By Version</a>
+                  <a href="#sec-context">&#127760; By Context</a>
+                  <a href="#sec-app">&#129513; By Application</a>
+                  <a href="#sec-owner">&#128100; By Owner</a>
+                  <a href="#sec-cat">&#128737;&#65039; Outdated Cat.</a>
+                  <a href="#sec-detail">&#9888;&#65039; Outdated Detail</a>
+                </div>
+              </div>
+
+              {#- ─────────────── pre-compute aggregates for Situation block ─────────────── -#}
+              {%- set act_lines_pre = (_action_pipe.stdout | default('') | trim).split('\n') | select('search','\\|') | list -%}
+              {%- set act_rows_pre = act_lines_pre | map('split','|') | list -%}
+              {%- set red_actions    = act_rows_pre | selectattr(0,'equalto','RED')    | list -%}
+              {%- set yellow_actions = act_rows_pre | selectattr(0,'equalto','YELLOW') | list -%}
+              {%- set green_actions  = act_rows_pre | selectattr(0,'equalto','GREEN')  | list -%}
+              {%- set info_actions   = act_rows_pre | selectattr(0,'equalto','INFO')   | list -%}
+              {%- set red_installs    = red_actions    | map(attribute=3) | map('trim') | map('int') | sum -%}
+              {%- set yellow_installs = yellow_actions | map(attribute=3) | map('trim') | map('int') | sum -%}
+              {%- set green_installs  = green_actions  | map(attribute=3) | map('trim') | map('int') | sum -%}
+              {%- set info_installs   = info_actions   | map(attribute=3) | map('trim') | map('int') | sum -%}
+              {%- set red_hosts    = red_actions    | map(attribute=6) | map('trim') | map('split',', ') | sum(start=[]) | reject('equalto','') | unique | list -%}
+              {%- set yellow_hosts = yellow_actions | map(attribute=6) | map('trim') | map('split',', ') | sum(start=[]) | reject('equalto','') | unique | list -%}
+              {%- set green_hosts  = green_actions  | map(attribute=6) | map('trim') | map('split',', ') | sum(start=[]) | reject('equalto','') | unique | list -%}
+              {%- set info_hosts   = info_actions   | map(attribute=6) | map('trim') | map('split',', ') | sum(start=[]) | reject('equalto','') | unique | list -%}
+              {#- worst-state partition: each host bucketed into its most severe tier. Sum = total hosts. -#}
+              {%- set red_only    = red_hosts -%}
+              {%- set yellow_only = yellow_hosts | difference(red_hosts) -%}
+              {%- set green_only  = green_hosts | difference(red_hosts) | difference(yellow_hosts) -%}
+              {%- set info_only   = info_hosts | difference(red_hosts) | difference(yellow_hosts) | difference(green_hosts) -%}
+
+              <div class="section" id="sec-situation">
+                <div class="section-title">&#127919; Situation &amp; Path to GREEN</div>
+                <div class="summary-box" style="font-size:12px;">
+                  <b>Worst-state classification</b> &mdash; each host is bucketed into its <i>most severe</i> tier
+                  (sum = total hosts, no overlap). The smaller numbers in parentheses show how many host(s)
+                  the tier <b>touches in total</b> across all its actions &mdash; a typical host has Oracle homes
+                  (YELLOW) + Puppet/OS packages (GREEN) + OPatch-bundled JREs (INFO) simultaneously, so the
+                  touch counts overlap.
+                </div>
+                <div class="tier-cards">
+                  <div class="tier-card red">
+                    <b>{{ red_only | length }}</b><span>Worst: RED</span>
+                    <div style="font-size:11px; margin-top:4px;">{{ red_installs }} install(s)<br>{{ red_actions | length }} distinct action(s)<br><span style="color:#888;">(touches {{ red_hosts | length }}h)</span></div>
+                  </div>
+                  <div class="tier-card yellow">
+                    <b>{{ yellow_only | length }}</b><span>Worst: YELLOW</span>
+                    <div style="font-size:11px; margin-top:4px;">{{ yellow_installs }} install(s)<br>{{ yellow_actions | length }} distinct action(s)<br><span style="color:#888;">(touches {{ yellow_hosts | length }}h)</span></div>
+                  </div>
+                  <div class="tier-card green">
+                    <b>{{ green_only | length }}</b><span>Worst: GREEN</span>
+                    <div style="font-size:11px; margin-top:4px;">{{ green_installs }} install(s)<br>{{ green_actions | length }} distinct action(s)<br><span style="color:#888;">(touches {{ green_hosts | length }}h)</span></div>
+                  </div>
+                  <div class="tier-card info">
+                    <b>{{ info_only | length }}</b><span>INFO only</span>
+                    <div style="font-size:11px; margin-top:4px;">{{ info_installs }} install(s)<br>(parent-managed)<br><span style="color:#888;">(touches {{ info_hosts | length }}h)</span></div>
+                  </div>
+                </div>
+                <div class="summary-box narrative">
+                  <p><b>What we are looking at.</b>
+                    {{ _hdr[3] | default('0') }} host(s) carry {{ _hdr[4] | default('0') }} JDK install(s).
+                    Each install has been classified against <code>JAVA_ACTION_RULES</code> to identify the
+                    supported update method. Most open Java vulnerability tickets in the fleet trace back to
+                    one of these installations &mdash; closing them is the goal of this project.
+                  </p>
+                  <p><b>Path to all-GREEN &mdash; per domain:</b></p>
+                  <ol>
+                    {% if green_actions | length > 0 %}
+                    <li><b style="color:#2e7d32;">Domain: OS / agents (GREEN, {{ green_hosts | length }} host(s))</b> &mdash;
+                      Standard <code>dnf update java-*-openjdk</code>, removal of unused <code>java-1.6/1.7</code>,
+                      and cleanup of stale <code>OPatch_b4_update_*</code> backup directories.
+                      Owned by Linux/DBA. Can be scheduled in the next maintenance window using
+                      <a href="#sec-per-host">per-host plan</a> as the checklist.
+                    </li>
+                    {% endif %}
+                    {% if yellow_actions | length > 0 %}
+                    <li><b style="color:#ef6c00;">Domain: Oracle binaries (YELLOW, {{ yellow_hosts | length }} host(s))</b> &mdash;
+                      OPatch self-update across all <code>$ORACLE_HOME/OPatch</code> + <code>$GRID_HOME/OPatch</code> dirs
+                      (refresh of <b>p6880880</b>) clears the bundled-JRE findings without DB downtime.
+                      JDK Bundle Patch on each 19c DB and GI home (MOS 2843164.1 / 2118136.2) clears the rest, scheduled
+                      per change ticket. <b>Verification per home is required</b> &mdash; two homes at the same release can
+                      still need different BP artefacts due to one-off patch conflicts.
+                    </li>
+                    <li><b style="color:#ef6c00;">Domain: OEM (YELLOW)</b> &mdash;
+                      Coordinated OMS JDK BP + agent fleet update via <code>emcli</code>. OEM-admin owned; one
+                      change window covers the agent layer across the fleet.
+                    </li>
+                    {% endif %}
+                    {% if red_actions | length > 0 %}
+                    <li><b style="color:#c62828;">Domain: EOL Oracle homes (RED, {{ red_hosts | length }} host(s))</b> &mdash;
+                      No supported JDK patch path. Tracked as a separate database upgrade / decommission project.
+                      These will remain RED until the underlying DB is upgraded; this report only surfaces them.
+                    </li>
+                    {% endif %}
+                  </ol>
+                  <p style="font-size:12px; color:#555;">
+                    See <a href="#sec-action-plan">Action Plan</a> for the action-level rollup with hostnames,
+                    or <a href="#sec-per-host">Per-Host Action Plan</a> for the per-host checklist that DBAs
+                    can use directly. This is a recommendation report &mdash; nothing is auto-applied.
+                  </p>
+                </div>
+              </div>
+
+              <div class="section" id="sec-context">
+                <div class="section-title">&#127760; By Install Context</div>
+                <table class="t">
+                  <tr><th>Context</th><th style="text-align:center;">Installs</th></tr>
+                  {%- for line in ctx_lines -%}
+                  {%- set p = line.split('|') -%}
+                  <tr><td><b>{{ p[0] | trim }}</b></td><td style="text-align:center;">{{ p[1] | trim }}</td></tr>
+                  {%- endfor -%}
+                </table>
+              </div>
+
+              <div class="section" id="sec-version">
+                <div class="section-title">&#128293; By Java Version / Type</div>
+                <table class="t">
+                  <tr><th>Java Version</th><th>Type</th><th style="text-align:center;">Major</th><th style="text-align:center;">Count</th><th style="text-align:center;">Hosts</th><th>Applications</th><th style="text-align:center;">Status</th><th>Notes</th></tr>
+                  {%- set ver_lines = (_ver_pipe.stdout | default('') | trim).split('\n') | select('search','\\|') | list -%}
+                  {%- for line in ver_lines -%}
+                  {%- set p = line.split('|') -%}
+                  {%- set ver   = p[0] | trim -%}
+                  {%- set jtype = p[1] | trim -%}
+                  {%- set major = (p[2] | trim | int) -%}
+                  {%- set cnt   = p[3] | trim -%}
+                  {%- set hcnt  = p[4] | trim if (p | length) > 4 else '' -%}
+                  {%- set hlist = p[5] | trim if (p | length) > 5 else '' -%}
+                  {%- set alist = p[6] | trim if (p | length) > 6 else '' -%}
+                  {%- set notes = p[7] | trim if (p | length) > 7 else '' -%}
+                  {%- if major == 0 or major < 8 -%}
+                    {%- set rcls='risk-high' -%}{%- set bcls='b-risk' -%}{%- set blbl='UNKNOWN/EOL' -%}
+                  {%- elif major < 11 -%}
+                    {%- set rcls='risk-warn' -%}{%- set bcls='b-warn' -%}{%- set blbl='OUTDATED' -%}
+                  {%- elif major < 17 -%}
+                    {%- set rcls='risk-ok' -%}{%- set bcls='b-info' -%}{%- set blbl='SUPPORTED' -%}
+                  {%- else -%}
+                    {%- set rcls='risk-ok' -%}{%- set bcls='b-ok' -%}{%- set blbl='CURRENT' -%}
+                  {%- endif -%}
+                  <tr class="{{ rcls }}">
+                    <td><b>{{ ver }}</b></td>
+                    <td>{{ jtype }}</td>
+                    <td style="text-align:center;">{{ major if major > 0 else '-' }}</td>
+                    <td style="text-align:center;"><b>{{ cnt }}</b></td>
+                    <td style="text-align:center;">{{ hcnt }}</td>
+                    <td style="font-size:11px; max-width:280px; word-break:break-word;">{{ alist }}<br>
+                      <span style="color:#888; font-size:10px;">
+                        {%- set hlist_arr = hlist.split(', ') | reject('equalto','') | list -%}
+                        {%- for h in hlist_arr -%}<a class="host-link" href="#host-{{ h }}">{{ h }}</a>{%- if not loop.last -%}, {% endif -%}{%- endfor -%}
+                      </span>
+                    </td>
+                    <td style="text-align:center;"><span class="badge {{ bcls }}">{{ blbl }}</span></td>
+                    <td style="font-size:10px; color:#b71c1c; max-width:260px; word-break:break-word;">{{ notes }}</td>
+                  </tr>
+                  {%- endfor -%}
+                </table>
+              </div>
+
+              <div class="section" id="sec-app">
+                <div class="section-title">&#129513; By Application / Component</div>
+                <table class="t">
+                  <tr><th>Application</th><th style="text-align:center;">Installs</th><th style="text-align:center;">Hosts</th><th style="text-align:center;">JDK Major Range</th><th>JDK Versions Seen</th></tr>
+                  {%- set app_lines = (_app_pipe.stdout | default('') | trim).split('\n') | select('search','\\|') | list -%}
+                  {%- for line in app_lines -%}
+                  {%- set p = line.split('|') -%}
+                  {%- set mn = p[3] | trim if (p | length) > 3 else '' -%}
+                  {%- set mx = p[4] | trim if (p | length) > 4 else '' -%}
+                  {%- set vs = p[5] | trim if (p | length) > 5 else '' -%}
+                  {%- set rng = (mn ~ ' &ndash; ' ~ mx) if (mn != mx) else mn -%}
+                  <tr>
+                    <td><b>{{ p[0] | trim }}</b></td>
+                    <td style="text-align:center;">{{ p[1] | trim }}</td>
+                    <td style="text-align:center;">{{ p[2] | trim }}</td>
+                    <td style="text-align:center;">{{ rng }}</td>
+                    <td style="font-size:11px; max-width:320px; word-break:break-word;">{{ vs }}</td>
+                  </tr>
+                  {%- endfor -%}
+                </table>
+              </div>
+
+              <div class="section" id="sec-owner">
+                <div class="section-title">&#128100; By File Owner</div>
+                <table class="t">
+                  <tr><th>Owner</th><th>Group</th><th style="text-align:center;">Installs</th><th style="text-align:center;">Hosts</th></tr>
+                  {%- set own_lines = (_owner_pipe.stdout | default('') | trim).split('\n') | select('search','\\|') | list -%}
+                  {%- for line in own_lines -%}
+                  {%- set p = line.split('|') -%}
+                  <tr><td><b>{{ p[0] | trim }}</b></td><td>{{ p[1] | trim }}</td><td style="text-align:center;">{{ p[2] | trim }}</td><td style="text-align:center;">{{ p[3] | trim }}</td></tr>
+                  {%- endfor -%}
+                </table>
+              </div>
+
+              <div class="section" id="sec-cat">
+                <div class="section-title">&#128737;&#65039; Outdated Java &mdash; Summary by Category &amp; Application</div>
+                {%- set cat_lines = (_old_cat_pipe.stdout | default('') | trim).split('\n') | select('search','\\|') | list -%}
+                {%- if cat_lines | length == 0 -%}
+                <div class="summary-box"><b>No outdated Java found.</b></div>
+                {%- else -%}
+                <table class="t">
+                  <tr><th>Risk Category</th><th>Application</th><th style="text-align:center;">Installs</th><th style="text-align:center;">Hosts</th><th>Versions</th><th>Hostnames</th></tr>
+                  {%- for line in cat_lines -%}
+                  {%- set p = line.split('|') -%}
+                  {%- set cat = p[0] | trim -%}
+                  {%- if 'CRITICAL' in cat -%}{%- set rcls='risk-high' -%}
+                  {%- elif 'EOL' in cat or 'Pre-5' in cat -%}{%- set rcls='risk-high' -%}
+                  {%- else -%}{%- set rcls='risk-warn' -%}{%- endif -%}
+                  <tr class="{{ rcls }}">
+                    <td><b>{{ cat }}</b></td>
+                    <td>{{ p[1] | trim }}</td>
+                    <td style="text-align:center;"><b>{{ p[2] | trim }}</b></td>
+                    <td style="text-align:center;">{{ p[3] | trim }}</td>
+                    <td style="font-size:11px; max-width:240px; word-break:break-word;">{{ p[4] | trim }}</td>
+                    <td style="font-size:10px; color:#555; max-width:300px; word-break:break-word;">
+                      {%- set _ch = (p[5] | trim).split(', ') | reject('equalto','') | list -%}
+                      {%- for h in _ch -%}<a class="host-link" href="#host-{{ h }}">{{ h }}</a>{%- if not loop.last -%}, {% endif -%}{%- endfor -%}
+                    </td>
+                  </tr>
+                  {%- endfor -%}
+                </table>
+                {%- endif -%}
+              </div>
+
+              <div class="section" id="sec-ref-gap">
+                <div class="section-title">&#128202; Reference Gap Analysis (vs JAVA_VERSION_REFERENCE)</div>
+                {%- set gap_lines = (_ref_gap_pipe.stdout | default('') | trim).split('\n') | select('search','\\|') | list -%}
+                {%- if gap_lines | length == 0 -%}
+                <div class="summary-box"><b>No reference data available. Run <code>playbooks/update_java_reference.yml</code> to populate.</b></div>
+                {%- else -%}
+                <table class="t">
+                  <tr><th>Type</th><th style="text-align:center;">Major</th><th>Installed Version</th><th>Latest (Reference)</th><th style="text-align:center;">Installs</th><th style="text-align:center;">Hosts</th><th>Applications</th><th style="text-align:center;">Status</th></tr>
+                  {%- for line in gap_lines -%}
+                  {%- set p = line.split('|') -%}
+                  {%- set st = p[6] | trim if (p | length) > 6 else 'UNKNOWN' -%}
+                  {%- if st == 'CURRENT' -%}{%- set rcls='risk-ok' -%}{%- set bcls='b-ok' -%}
+                  {%- elif st == 'BEHIND' -%}{%- set rcls='risk-warn' -%}{%- set bcls='b-warn' -%}
+                  {%- else -%}{%- set rcls='risk-high' -%}{%- set bcls='b-risk' -%}{%- endif -%}
+                  <tr class="{{ rcls }}">
+                    <td>{{ p[0] | trim }}</td>
+                    <td style="text-align:center;">{{ p[1] | trim }}</td>
+                    <td><b>{{ p[2] | trim }}</b></td>
+                    <td>{{ p[3] | trim }}</td>
+                    <td style="text-align:center;">{{ p[4] | trim }}</td>
+                    <td style="text-align:center;">{{ p[5] | trim }}</td>
+                    <td style="font-size:11px;">{{ p[7] | trim if (p | length) > 7 else '' }}</td>
+                    <td style="text-align:center;"><span class="badge {{ bcls }}">{{ st }}</span></td>
+                  </tr>
+                  {%- endfor -%}
+                </table>
+                {%- endif -%}
+              </div>
+
+              <div class="section" id="sec-action-plan">
+                <div class="section-title">&#128296; Action Plan (Risk Tier &amp; Supported Update Method)</div>
+                <div class="summary-box" style="font-size:12px;">
+                  <b>Methodology:</b> Each install row is matched against
+                  <code>JAVA_ACTION_RULES</code> by its <code>JAVA_BIN_PATH</code>
+                  (and Java major version). The lowest-priority matching rule
+                  determines the supported update path &mdash; e.g. Oracle home
+                  JDK is updated only via <i>OPatch JDK Bundle Patch</i>, OS
+                  OpenJDK via <i>dnf update</i>, OEM components via their own
+                  bundle. Edit <code>vars/java_action_rules.yml</code> and re-run
+                  <code>playbooks/update_java_action_rules.yml</code> to refine.
+                  <br><b>Tiers:</b>
+                  <span class="badge b-ok">GREEN</span> safe to remediate via Ansible/OS pkg mgmt &nbsp;
+                  <span class="badge b-warn">YELLOW</span> vendor-supported update, requires DBA/OEM change window &nbsp;
+                  <span class="badge b-risk">RED</span> EOL &mdash; no JDK update path; upgrade or decommission &nbsp;
+                  <span class="badge b-info">INFO</span> updated via parent component
+                </div>
+                {%- set act_lines = (_action_pipe.stdout | default('') | trim).split('\n') | select('search','\\|') | list -%}
+                {%- if act_lines | length == 0 -%}
+                <div class="summary-box"><b>No action rules loaded. Run <code>playbooks/update_java_action_rules.yml</code> to populate.</b></div>
+                {%- else -%}
+                <table class="t">
+                  <tr><th style="text-align:center;">Tier</th><th>Action / Supported Method</th><th>Owner</th><th style="text-align:center;">Installs</th><th style="text-align:center;">Hosts</th><th>Hostnames (click for per-host plan)</th><th>Precheck Notes</th></tr>
+                  {%- for line in act_lines -%}
+                  {%- set p = line.split('|') -%}
+                  {%- set tier = p[0] | trim -%}
+                  {%- set hosts_list = (p[6] | trim if (p | length) > 6 else '').split(', ') | reject('equalto','') | list -%}
+                  {%- if tier == 'GREEN' -%}{%- set rcls='risk-ok' -%}{%- set bcls='b-ok' -%}
+                  {%- elif tier == 'YELLOW' -%}{%- set rcls='risk-warn' -%}{%- set bcls='b-warn' -%}
+                  {%- elif tier == 'RED' -%}{%- set rcls='risk-high' -%}{%- set bcls='b-risk' -%}
+                  {%- else -%}{%- set rcls='' -%}{%- set bcls='b-info' -%}{%- endif -%}
+                  <tr class="{{ rcls }}">
+                    <td style="text-align:center;"><span class="badge {{ bcls }}">{{ tier }}</span></td>
+                    <td><b>{{ p[1] | trim }}</b></td>
+                    <td>{{ p[2] | trim }}</td>
+                    <td style="text-align:center;"><b>{{ p[3] | trim }}</b></td>
+                    <td style="text-align:center;"><b>{{ p[4] | trim }}</b></td>
+                    <td style="font-size:11px; max-width:300px; word-break:break-word;">
+                      {%- for h in hosts_list -%}<a class="host-link" href="#host-{{ h }}">{{ h }}</a>{%- if not loop.last -%}, {% endif -%}{%- endfor -%}
+                    </td>
+                    <td style="font-size:11px; color:#555; max-width:300px; word-break:break-word;">{{ p[5] | trim if (p | length) > 5 else '' }}</td>
+                  </tr>
+                  {%- endfor -%}
+                </table>
+                {%- endif -%}
+              </div>
+
+              <div class="section" id="sec-per-host">
+                <div class="section-title">&#127968; Per-Host Action Plan (Path to GREEN)</div>
+                <div class="summary-box" style="font-size:12px;">
+                  <b>How to read this:</b> for each host, every distinct
+                  recommendation it needs is listed on its own row. Two
+                  ORACLE_HOMEs at the same release can still need
+                  <b>different</b> patch artefacts (different OPatch p6880880
+                  ZIP, different JDK Bundle Patch ID, conflicting one-off
+                  patches), so they are <b>not</b> merged. The DBA executing
+                  the change must verify the artefact for that specific home
+                  using the precheck note before opening a ticket. This is a
+                  <b>recommendation report</b> &mdash; nothing here is
+                  applied automatically.
+                </div>
+                {%- set host_lines = (_per_host_pipe.stdout | default('') | trim).split('\n') | select('search','\\|') | list -%}
+                {%- if host_lines | length == 0 -%}
+                <div class="summary-box"><b>No host data available. Ensure <code>JAVA_ACTION_RULES</code> is loaded and a scan has been run.</b></div>
+                {%- else -%}
+                {# Build host-level evidence map: hostname -> dict of fields #}
+                {%- set host_ev_map = {} -%}
+                {%- set ev_lines = (_host_ev_pipe.stdout | default('') | trim).split('\n') | select('search','\\|') | list -%}
+                {%- for el in ev_lines -%}
+                  {%- set ep = el.split('|') -%}
+                  {%- if (ep | length) >= 9 -%}
+                    {%- set _ = host_ev_map.update({ ep[0] | trim : {
+                          'proc_count': ep[1] | trim,
+                          'proc_users': ep[2] | trim,
+                          'lports':     ep[3] | trim,
+                          'env_count':  ep[4] | trim,
+                          'env_files':  ep[5] | trim,
+                          'sd_units':   ep[6] | trim,
+                          'legacy':     ep[7] | trim,
+                          'alts':       ep[8] | trim }}) -%}
+                  {%- endif -%}
+                {%- endfor -%}
+                {%- set host_groups = host_lines | map('split','|') | list | groupby(0) -%}
+                {%- for host, rows in host_groups -%}
+                {%- set first = rows[0] -%}
+                {%- set htier = first[1] | trim -%}
+                {%- set red_n    = (rows | selectattr(2,'equalto','RED')    | list) | length -%}
+                {%- set yellow_n = (rows | selectattr(2,'equalto','YELLOW') | list) | length -%}
+                {%- set green_n  = (rows | selectattr(2,'equalto','GREEN')  | list) | length -%}
+                {%- set info_n   = (rows | selectattr(2,'equalto','INFO')   | list) | length -%}
+                {%- if htier == 'PROD' -%}{%- set tcls='b-risk' -%}
+                {%- elif htier == 'MODEL' -%}{%- set tcls='b-warn' -%}
+                {%- elif htier == 'TEST' -%}{%- set tcls='b-info' -%}
+                {%- else -%}{%- set tcls='b-ok' -%}{%- endif -%}
+                <div id="host-{{ host }}" style="margin: 14px 0; border: 1px solid #cfd8dc; border-radius: 6px; overflow: hidden;">
+                  <div style="background: #eceff1; padding: 8px 12px; font-size: 13px;">
+                    <b style="font-size:14px;">{{ host }}</b>
+                    <span class="badge {{ tcls }}" style="margin-left:8px;">{{ htier }}</span>
+                    <span style="margin-left:14px; font-size:11px; color:#555;">
+                      {% if red_n > 0 %}<span class="badge b-risk">RED {{ red_n }}</span>&nbsp;{% endif %}
+                      {% if yellow_n > 0 %}<span class="badge b-warn">YELLOW {{ yellow_n }}</span>&nbsp;{% endif %}
+                      {% if green_n > 0 %}<span class="badge b-ok">GREEN {{ green_n }}</span>&nbsp;{% endif %}
+                      {% if info_n > 0 %}<span class="badge b-info">INFO {{ info_n }}</span>{% endif %}
+                    </span>
+                    <span style="float:right; font-size:11px; color:#555;">
+                      {{ rows | length }} action{{ '' if (rows | length) == 1 else 's' }} to reach GREEN
+                    </span>
+                  </div>
+                  {%- set hev = host_ev_map[host] | default({}) -%}
+                  {%- if hev -%}
+                  <div style="background:#f7f9fa; padding:6px 12px; font-size:11px; border-top:1px solid #e3e8eb; color:#374151;">
+                    <b style="color:#1f2937;">Evidence:</b>
+                    {%- set pc = hev.proc_count | default('0') | int -%}
+                    {%- set ec = hev.env_count  | default('0') | int -%}
+                    {%- set lg = hev.legacy     | default('') -%}
+                    {%- if pc > 0 -%}
+                      <span class="badge b-risk" style="margin-left:6px;">{{ pc }} live java proc{{ '' if pc==1 else 's' }}</span>
+                      {% if hev.proc_users %}<span style="margin-left:4px;">users: <code>{{ hev.proc_users }}</code></span>{% endif %}
+                    {%- else -%}
+                      <span class="badge b-ok" style="margin-left:6px;">0 live procs</span>
+                    {%- endif -%}
+                    {%- if hev.lports -%}
+                      <span style="margin-left:8px;">listening: <code>{{ hev.lports }}</code></span>
+                    {%- endif -%}
+                    {%- if ec > 0 -%}
+                      <span class="badge b-warn" style="margin-left:8px;" title="{{ hev.env_files }}">{{ ec }} env-file ref{{ '' if ec==1 else 's' }}</span>
+                    {%- endif -%}
+                    {%- if lg -%}
+                      <span class="badge b-risk" style="margin-left:8px;">legacy RPM: {{ lg }}</span>
+                    {%- endif -%}
+                    {%- if hev.sd_units -%}
+                      <span style="margin-left:8px;">systemd: <code style="font-size:10px;">{{ hev.sd_units }}</code></span>
+                    {%- endif -%}
+                    {%- if hev.alts -%}
+                      <span style="margin-left:8px;">/etc/alternatives/java &rarr; <code style="font-size:10px;">{{ hev.alts }}</code></span>
+                    {%- endif -%}
+                  </div>
+                  {%- endif -%}
+                  <table class="t" style="margin: 0;">
+                    <tr>
+                      <th style="text-align:center; width:70px;">Tier</th>
+                      <th>Recommended Action</th>
+                      <th>Owner</th>
+                      <th>Context / Oracle Home</th>
+                      <th style="text-align:center;">Prod Ver</th>
+                      <th style="text-align:center;">Installs</th>
+                      <th>Versions Found</th>
+                      <th>Java Path(s) &amp; Evidence</th>
+                      <th>Verify Before Apply</th>
+                    </tr>
+                    {%- for r in rows -%}
+                    {%- set rt   = r[2] | trim -%}
+                    {%- set act  = r[3] | trim -%}
+                    {%- set own  = r[4] | trim -%}
+                    {%- set ctx  = r[5] | trim -%}
+                    {%- set oh   = r[6] | trim -%}
+                    {%- set pv   = r[7] | trim -%}
+                    {%- set inst = r[8] | trim -%}
+                    {%- set vers = r[9] | trim -%}
+                    {%- set pchk = r[10] | trim if (r | length) > 10 else '' -%}
+                    {%- set jpaths = r[11] | trim if (r | length) > 11 else '' -%}
+                    {%- set live_total = (r[12] | trim | int) if (r | length) > 12 else 0 -%}
+                    {%- set any_alts   = (r[13] | trim) if (r | length) > 13 else 'N' -%}
+                    {%- set rpm_owned  = (r[14] | trim | int) if (r | length) > 14 else 0 -%}
+                    {%- set any_sym    = (r[15] | trim) if (r | length) > 15 else 'N' -%}
+                    {%- set rpm_owners = (r[16] | trim) if (r | length) > 16 else '' -%}
+                    {%- set inst_n     = (inst | int) -%}
+                    {%- if rt == 'RED' -%}{%- set rcls='risk-high' -%}{%- set rbcls='b-risk' -%}
+                    {%- elif rt == 'YELLOW' -%}{%- set rcls='risk-warn' -%}{%- set rbcls='b-warn' -%}
+                    {%- elif rt == 'GREEN' -%}{%- set rcls='risk-ok' -%}{%- set rbcls='b-ok' -%}
+                    {%- elif rt == 'INFO' -%}{%- set rcls='' -%}{%- set rbcls='b-info' -%}
+                    {%- else -%}{%- set rcls='risk-warn' -%}{%- set rbcls='b-warn' -%}{%- endif -%}
+                    <tr class="{{ rcls }}">
+                      <td style="text-align:center;"><span class="badge {{ rbcls }}">{{ rt }}</span></td>
+                      <td><b>{{ act }}</b></td>
+                      <td style="font-size:11px;">{{ own }}</td>
+                      <td style="font-size:11px; max-width:260px; word-break:break-word;">
+                        {{ ctx }}
+                        {% if oh != '-' and oh | length > 0 %}<br><code style="font-size:10px;">{{ oh }}</code>{% endif %}
+                      </td>
+                      <td style="text-align:center; font-family:Consolas,monospace; font-size:11px;">{{ pv if pv else '-' }}</td>
+                      <td style="text-align:center;"><b>{{ inst }}</b></td>
+                      <td style="font-size:11px; max-width:160px; word-break:break-word;">{{ vers }}</td>
+                      <td style="font-size:10px; max-width:380px;">
+                        {%- set _paths = jpaths.split(' ;; ') | reject('equalto','') | list -%}
+                        {%- for jp in _paths -%}
+                          <code style="display:block; word-break:break-all; margin:1px 0;">{{ jp }}</code>
+                        {%- endfor -%}
+                        {%- if rpm_owners -%}
+                          {%- for rp in rpm_owners.split(', ') | reject('equalto','') | list -%}
+                            <code style="display:block; word-break:break-all; margin:1px 0; color:#1565c0; background:#e3f2fd;" title="RPM package providing this java binary">&#128230; {{ rp }}</code>
+                          {%- endfor -%}
+                        {%- endif -%}
+                        <div style="margin-top:3px;">
+                          {%- if live_total > 0 -%}
+                            <span class="badge b-risk" title="Live java processes whose exe resolves to one of these paths">{{ live_total }} live proc{{ '' if live_total==1 else 's' }}</span>
+                          {%- endif -%}
+                          {%- if any_alts == 'Y' -%}
+                            <span class="badge b-warn" title="One of these paths is the system default (/etc/alternatives/java target)">system default</span>
+                          {%- endif -%}
+                          {%- if rpm_owned == inst_n and inst_n > 0 -%}
+                            <span class="badge b-ok" title="All install(s) RPM-managed (yum/dnf removable)">RPM-managed</span>
+                          {%- elif rpm_owned > 0 -%}
+                            <span class="badge b-info" title="{{ rpm_owned }} of {{ inst_n }} RPM-managed">{{ rpm_owned }}/{{ inst_n }} RPM</span>
+                          {%- else -%}
+                            <span class="badge b-warn" title="Unpacked install (no RPM owns these files) — must be removed manually with rm -rf, not yum/dnf">unpacked (manual remove)</span>
+                          {%- endif -%}
+                          {%- if any_sym == 'Y' -%}
+                            <span class="badge b-info" title="Symlink path — collapsed to its real target">symlink</span>
+                          {%- endif -%}
+                        </div>
+                      </td>
+                      <td style="font-size:11px; color:#555; max-width:260px; word-break:break-word;">{{ pchk }}</td>
+                    </tr>
+                    {%- endfor -%}
+                  </table>
+                </div>
+                {%- endfor -%}
+                {%- endif -%}
+              </div>
+
+              <div class="section" id="sec-detail">
+                <div class="section-title">&#9888;&#65039; Outdated Java (Major &lt; 11) &mdash; Detail</div>
+                {%- if old_lines | length == 0 -%}
+                <div class="summary-box"><b>No outdated Java found.</b></div>
+                {%- else -%}
+                <div class="summary-box" style="font-size:12px;">
+                  Rows are <b>aggregated by finding</b>: same version + context + Oracle home + recommended action.
+                  Hosts sharing the same finding are listed comma-separated with a count.
+                  The <b>Recommended Action</b> column is driven by <code>JAVA_ACTION_RULES</code>.
+                  <span style="color:#888;">Scroll horizontally to see the full Path column.</span>
+                </div>
+                <div style="overflow-x: auto;">
+                <table class="t" style="min-width: 1400px;">
+                  <tr>
+                    <th style="text-align:center;">Risk</th>
+                    <th style="text-align:center;">Tier</th>
+                    <th style="text-align:center;">#Hosts</th>
+                    <th>Hostnames</th>
+                    <th>Version</th>
+                    <th style="text-align:center;">Major</th>
+                    <th>Context</th>
+                    <th>Type</th>
+                    <th>File Owner</th>
+                    <th>Application (Oracle Home)</th>
+                    <th style="text-align:center;">Prod Ver</th>
+                    <th>Recommended Action</th>
+                    <th>Action Owner</th>
+                    <th>Path (sample)</th>
+                    <th>RPM Package(s)</th>
+                  </tr>
+                  {%- for line in old_lines -%}
+                  {%- set p = line.split('|') -%}
+                  {%- set risk  = p[0] | trim -%}
+                  {%- set tier  = p[1] | trim -%}
+                  {%- set hcnt  = p[2] | trim -%}
+                  {%- set hlist = p[3] | trim -%}
+                  {%- set ver   = p[4] | trim -%}
+                  {%- set major = p[5] | trim -%}
+                  {%- set ctx   = p[6] | trim -%}
+                  {%- set jt    = p[7] | trim -%}
+                  {%- set fown  = p[8] | trim -%}
+                  {%- set ohome = p[9] | trim -%}
+                  {%- set pver  = p[10] | trim -%}
+                  {%- set act   = p[11] | trim -%}
+                  {%- set aown  = p[12] | trim -%}
+                  {%- set path  = p[13] | trim if (p | length) > 13 else '' -%}
+                  {%- set rpms  = p[14] | trim if (p | length) > 14 else '' -%}
+                  {%- if risk == 'RED' -%}{%- set rcls='risk-high' -%}{%- set rbcls='b-risk' -%}
+                  {%- elif risk == 'YELLOW' -%}{%- set rcls='risk-warn' -%}{%- set rbcls='b-warn' -%}
+                  {%- elif risk == 'GREEN' -%}{%- set rcls='risk-ok' -%}{%- set rbcls='b-ok' -%}
+                  {%- elif risk == 'INFO' -%}{%- set rcls='' -%}{%- set rbcls='b-info' -%}
+                  {%- else -%}{%- set rcls='risk-warn' -%}{%- set rbcls='b-warn' -%}{%- endif -%}
+                  {%- if tier == 'PROD' -%}{%- set tcls='b-risk' -%}
+                  {%- elif tier == 'MODEL' -%}{%- set tcls='b-warn' -%}
+                  {%- elif tier == 'TEST' -%}{%- set tcls='b-info' -%}
+                  {%- else -%}{%- set tcls='b-ok' -%}{%- endif -%}
+                  <tr class="{{ rcls }}">
+                    <td style="text-align:center;"><span class="badge {{ rbcls }}">{{ risk }}</span></td>
+                    <td style="text-align:center;"><span class="badge {{ tcls }}">{{ tier }}</span></td>
+                    <td style="text-align:center;"><b>{{ hcnt }}</b></td>
+                    <td style="font-size:11px; max-width:280px; word-break:break-word;">
+                      {%- set _hl = hlist.split(', ') | reject('equalto','') | list -%}
+                      {%- for h in _hl -%}<a class="host-link" href="#host-{{ h }}">{{ h }}</a>{%- if not loop.last -%}, {% endif -%}{%- endfor -%}
+                    </td>
+                    <td><b>{{ ver }}</b></td>
+                    <td style="text-align:center;">{{ major }}</td>
+                    <td style="font-size:11px;">{{ ctx }}</td>
+                    <td style="font-size:11px;">{{ jt }}</td>
+                    <td style="font-size:11px;">{{ fown }}</td>
+                    <td style="font-size:11px; max-width:240px; word-break:break-word;">{{ ohome }}</td>
+                    <td style="text-align:center; font-family:Consolas,monospace; font-size:11px;">{{ pver if pver else '-' }}</td>
+                    <td style="font-size:11px; max-width:260px; word-break:break-word;"><b>{{ act }}</b></td>
+                    <td style="font-size:11px;">{{ aown }}</td>
+                    <td><code style="font-size:10px; white-space: nowrap;">{{ path }}</code></td>
+                    <td style="font-size:10px; max-width:240px; word-break:break-all;">
+                      {%- if rpms -%}
+                        {%- for rp in rpms.split(', ') | reject('equalto','') | list -%}
+                          <code style="display:block; margin:1px 0; color:#1565c0; background:#e3f2fd;">&#128230; {{ rp }}</code>
+                        {%- endfor -%}
+                      {%- else -%}
+                        <span style="color:#888;">unpacked install &mdash; no RPM owner</span>
+                      {%- endif -%}
+                    </td>
+                  </tr>
+                  {%- endfor -%}
+                </table>
+                </div>
+                {%- endif -%}
+              </div>
+
+            </div>
+            <div class="footer">
+              Java Footprint Audit &mdash; Repository: {{ repo_user }}@{{ repo_tns_alias | default(repo_host) }} &mdash; Generated {{ _report_ts }}
+            </div>
+          </body></html>
+
+    - name: Show final report in console
+      ansible.builtin.debug:
+        msg: "{{ _report_text.split('\n') }}"
+
+    - name: Write text report to file
+      ansible.builtin.copy:
+        dest: "{{ _report_file }}"
+        content: "{{ _report_text }}"
+        mode: '0644'
+
+    - name: Write HTML report to file
+      ansible.builtin.copy:
+        dest: "{{ _report_html_file }}"
+        content: "{{ _report_html }}"
+        mode: '0644'
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Synthesize email body — smart executive summary from raw pipe data.
+    # Buckets findings by risk tier, ranks top action methods, highlights
+    # PROD impact, lists EOL homes, and prints a recommended next-step plan.
+    # The two report files (TXT + HTML) are still attached.
+    # ──────────────────────────────────────────────────────────────────────
+    - name: Compute analysis aggregates for email body
+      ansible.builtin.set_fact:
+        _act_rows: >-
+          {{ (_action_pipe.stdout | default('') | trim).split('\n')
+             | select('search','\\|') | list }}
+        _old_rows: >-
+          {{ (_old_pipe.stdout | default('') | trim).split('\n')
+             | select('search','\\|') | list }}
+        _gap_rows: >-
+          {{ (_ref_gap_pipe.stdout | default('') | trim).split('\n')
+             | select('search','\\|') | list }}
+        _ver_rows: >-
+          {{ (_ver_pipe.stdout | default('') | trim).split('\n')
+             | select('search','\\|') | list }}
+
+    - name: Build analysis structures
+      ansible.builtin.set_fact:
+        _act_by_tier: >-
+          {{ _act_rows
+             | map('split','|') | list
+             | groupby(0) }}
+        _act_parsed: >-
+          {{ _act_rows | map('split','|') | list }}
+        _eol_findings: >-
+          {{ _old_rows
+             | map('split','|') | list
+             | selectattr(0,'equalto','RED') | list }}
+        _prod_findings: >-
+          {{ _old_rows
+             | map('split','|') | list
+             | selectattr(1,'equalto','PROD') | list }}
+        _green_findings: >-
+          {{ _old_rows
+             | map('split','|') | list
+             | selectattr(0,'equalto','GREEN') | list }}
+        _yellow_findings: >-
+          {{ _old_rows
+             | map('split','|') | list
+             | selectattr(0,'equalto','YELLOW') | list }}
+        _behind_gap: >-
+          {{ _gap_rows
+             | map('split','|') | list
+             | selectattr(6,'search','BEHIND') | list }}
+
+    - name: Build fleet-wide tier aggregates from action plan
+      vars:
+        _ap_lines: "{{ (_action_pipe.stdout | default('') | trim).split('\n') | select('search','\\|') | list }}"
+        _ap_rows: "{{ _ap_lines | map('split','|') | list }}"
+        _ap_red:    "{{ _ap_rows | selectattr(0,'equalto','RED')    | list }}"
+        _ap_yellow: "{{ _ap_rows | selectattr(0,'equalto','YELLOW') | list }}"
+        _ap_green:  "{{ _ap_rows | selectattr(0,'equalto','GREEN')  | list }}"
+        _ap_info:   "{{ _ap_rows | selectattr(0,'equalto','INFO')   | list }}"
+      ansible.builtin.set_fact:
+        _act_red:    "{{ _ap_red }}"
+        _act_yellow: "{{ _ap_yellow }}"
+        _act_green:  "{{ _ap_green }}"
+        _act_info:   "{{ _ap_info }}"
+        _red_hosts_fleet:    "{{ _ap_red    | map(attribute=6) | map('trim') | map('split',', ') | sum(start=[]) | reject('equalto','') | unique | list }}"
+        _yellow_hosts_fleet: "{{ _ap_yellow | map(attribute=6) | map('trim') | map('split',', ') | sum(start=[]) | reject('equalto','') | unique | list }}"
+        _green_hosts_fleet:  "{{ _ap_green  | map(attribute=6) | map('trim') | map('split',', ') | sum(start=[]) | reject('equalto','') | unique | list }}"
+        _info_hosts_fleet:   "{{ _ap_info   | map(attribute=6) | map('trim') | map('split',', ') | sum(start=[]) | reject('equalto','') | unique | list }}"
+        _red_installs_fleet:    "{{ _ap_red    | map(attribute=3) | map('trim') | map('int') | sum }}"
+        _yellow_installs_fleet: "{{ _ap_yellow | map(attribute=3) | map('trim') | map('int') | sum }}"
+        _green_installs_fleet:  "{{ _ap_green  | map(attribute=3) | map('trim') | map('int') | sum }}"
+        _info_installs_fleet:   "{{ _ap_info   | map(attribute=3) | map('trim') | map('int') | sum }}"
+
+    - name: Build fleet-wide host sets per tier
+      ansible.builtin.set_fact:
+        _all_hosts_fleet: "{{ (_red_hosts_fleet + _yellow_hosts_fleet + _green_hosts_fleet + _info_hosts_fleet) | unique | list }}"
+        _red_only_hosts:    "{{ _red_hosts_fleet }}"
+        _yellow_only_hosts: "{{ _yellow_hosts_fleet | difference(_red_hosts_fleet) }}"
+        _green_only_hosts:  "{{ _green_hosts_fleet | difference(_red_hosts_fleet) | difference(_yellow_hosts_fleet) }}"
+        _info_only_hosts:   "{{ _info_hosts_fleet | difference(_red_hosts_fleet) | difference(_yellow_hosts_fleet) | difference(_green_hosts_fleet) }}"
+
+    - name: Build email body (analyzed summary)
+      ansible.builtin.set_fact:
+        _email_body: |
+          <!DOCTYPE html><html><head><meta charset="UTF-8">
+          <style>
+            body { font-family: 'Segoe UI', Arial, sans-serif; font-size: 14px; color: #2b2b2b; line-height: 1.55; max-width: 900px; margin: 0 auto; padding: 18px; }
+            h1 { color: #0d47a1; font-size: 20px; margin: 0 0 6px 0; }
+            h2 { color: #1565c0; font-size: 15px; margin: 18px 0 6px 0; border-bottom: 1px solid #e3f2fd; padding-bottom: 4px; }
+            .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 10px 0 16px 0; }
+            .kpi { background: #f5f7fa; border: 1px solid #e0e0e0; border-radius: 6px; padding: 10px; text-align: center; }
+            .kpi b { display: block; font-size: 22px; color: #0d47a1; }
+            .kpi span { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.4px; }
+            .red { color: #c62828; font-weight: 600; }
+            .yellow { color: #ef6c00; font-weight: 600; }
+            .green { color: #2e7d32; font-weight: 600; }
+            .gray { color: #607d8b; }
+            ul { margin: 6px 0 6px 20px; padding: 0; }
+            li { margin: 3px 0; }
+            .box { background: #fff8e1; border-left: 4px solid #f57c00; padding: 8px 12px; margin: 8px 0; border-radius: 4px; font-size: 13px; }
+            .box.red { background: #ffebee; border-left-color: #c62828; color: #2b2b2b; }
+            .box.green { background: #e8f5e9; border-left-color: #2e7d32; color: #2b2b2b; }
+            .small { font-size: 11px; color: #666; }
+            code { background: #eceff1; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+          </style></head><body>
+
+          <h1>&#9749; Java Footprint Audit &mdash; Executive Analysis</h1>
+          <p class="small">
+            <b>Scope:</b> {{ 'Single RUN_ID = ' ~ report_run_id if report_run_id != '' else 'Latest scan per host (auto-merged across all runs)' }}
+            &nbsp;|&nbsp; <b>Run(s):</b> {{ _hdr[0] | default(_eff_run_id) }}
+            &nbsp;|&nbsp; <b>Repository:</b> {{ repo_user }}@{{ repo_tns_alias | default(repo_host) }}
+            &nbsp;|&nbsp; <b>Generated:</b> {{ _report_ts }}
+            {% if _host_filter_active | default('') %}&nbsp;|&nbsp; <b style="color:#c62828;">Host filter:</b> <code>{{ _host_filter_active }}</code>{% endif %}
+          </p>
+
+          <div class="kpis">
+            <div class="kpi"><b>{{ _hdr[3] | default('0') }}</b><span>Hosts Scanned</span></div>
+            <div class="kpi"><b>{{ _hdr[4] | default('0') }}</b><span>Java Installs</span></div>
+            <div class="kpi"><b class="red">{{ _red_only_hosts | length }}</b><span>Hosts in Worst-State RED</span></div>
+            <div class="kpi"><b class="yellow">{{ _yellow_only_hosts | length }}</b><span>Hosts in Worst-State YELLOW</span></div>
+          </div>
+          <div class="kpis">
+            <div class="kpi"><b class="green">{{ _green_only_hosts | length }}</b><span>Hosts in Worst-State GREEN</span></div>
+            <div class="kpi"><b class="gray">{{ _info_only_hosts | length }}</b><span>Hosts INFO-only</span></div>
+            <div class="kpi"><b class="yellow">{{ _old_rows | length }}</b><span>Outdated Findings (&lt; 11)</span></div>
+            <div class="kpi"><b class="red">{{ _eol_findings | length }}</b><span>EOL Findings (Detail)</span></div>
+          </div>
+
+          <h2>&#127919; Bottom Line &mdash; Fleet Status</h2>
+          {% set prod_red_hosts = _eol_findings | selectattr(1,'equalto','PROD') | map(attribute=3) | map('split',', ') | sum(start=[]) | unique | list %}
+          <div class="box" style="background:#f5f7fa; border-left-color:#37474f;">
+            <p style="margin:0 0 6px 0;"><b>Worst-state classification</b> &mdash; each of the {{ _hdr[3] | default('0') }} host(s) is bucketed into its <i>most severe</i> tier. Sum = total hosts (no overlap).</p>
+            <ul style="margin:0;">
+              <li><span class="red">RED worst &mdash; {{ _red_only_hosts | length }} host(s)</span> ({{ prod_red_hosts | length }} PROD): host carries at least one EOL finding (no JDK patch path). Drives the upgrade/decommission project.</li>
+              <li><span class="yellow">YELLOW worst &mdash; {{ _yellow_only_hosts | length }} host(s)</span>: no RED, but at least one finding requiring vendor JDK Bundle Patch (DBA / OEM change ticket).</li>
+              <li><span class="green">GREEN worst &mdash; {{ _green_only_hosts | length }} host(s)</span>: only safely-remediable findings. Run <code>remediate_java_safe.yml</code>.</li>
+              <li><span class="gray">INFO only &mdash; {{ _info_only_hosts | length }} host(s)</span>: only parent-managed JREs (e.g. OPatch). No direct action.</li>
+            </ul>
+          </div>
+          <p class="small" style="margin-top:8px;">
+            <b>Action-coverage view (overlapping &mdash; same data, different question):</b>
+            RED touches {{ _red_hosts_fleet | length }}h / {{ _red_installs_fleet }}i &nbsp;&middot;&nbsp;
+            YELLOW touches {{ _yellow_hosts_fleet | length }}h / {{ _yellow_installs_fleet }}i &nbsp;&middot;&nbsp;
+            GREEN touches {{ _green_hosts_fleet | length }}h / {{ _green_installs_fleet }}i &nbsp;&middot;&nbsp;
+            INFO touches {{ _info_hosts_fleet | length }}h / {{ _info_installs_fleet }}i.
+            Most hosts appear in multiple tiers because a single host typically owns Oracle homes (YELLOW), Puppet/OS packages (GREEN), and OPatch-bundled JREs (INFO) simultaneously.
+          </p>
+          <p class="small">
+            <i>Outdated Findings ({{ _old_rows | length }}) is a count of distinct rows in the Outdated Detail table (Major &lt; 11 only),
+            not the same as fleet host counts above. The Action Plan covers <b>all</b> {{ _hdr[4] | default('0') }} installs.</i>
+          </p>
+
+          <h2>&#128270; Auto-Insights (DBA Hot Items)</h2>
+          {%- set unclassified = (_act_yellow + _act_red + _act_green + _act_info) | selectattr(1,'search','Manual review|UNCLASSIFIED|no rule matched') | list -%}
+          {%- set unclassified_inst = unclassified | map(attribute=3) | map('trim') | map('int') | sum -%}
+          {%- set unclassified_hosts = unclassified | map(attribute=6) | map('trim') | map('split',', ') | sum(start=[]) | reject('equalto','') | unique | list -%}
+          {%- set total_inst = (_hdr[4] | default('0') | int) -%}
+          {%- set unclassified_pct = ((unclassified_inst * 100) / total_inst) | round(0,'common') | int if total_inst > 0 else 0 -%}
+          {%- set total_hosts = (_hdr[3] | default('0') | int) -%}
+          {%- set clean_hosts = total_hosts - (_all_hosts_fleet | length) -%}
+          {%- set ver_parsed = _ver_rows | map('split','|') | list -%}
+          {%- set java8 = ver_parsed | selectattr(2,'search','^\\s*8\\s*$') | list | sort(attribute=3, reverse=true) -%}
+          {%- set java5 = ver_parsed | selectattr(2,'search','^\\s*5\\s*$') | list -%}
+          {%- set java6 = ver_parsed | selectattr(2,'search','^\\s*6\\s*$') | list -%}
+          {%- set java7 = ver_parsed | selectattr(2,'search','^\\s*7\\s*$') | list -%}
+          <ul>
+            {% if unclassified | length > 0 %}
+            <li>
+              <span class="yellow">&#9888;&#65039; <b>{{ unclassified_inst }} install(s)</b> on {{ unclassified_hosts | length }} host(s) ({{ unclassified_pct }}% of fleet) fall through the rule set as <code>DEFAULT-UNCLASSIFIED</code> &rarr; <i>Manual review required</i>.</span>
+              <div class="small">Tighten <code>vars/java_action_rules.yml</code> &mdash; likely candidates: OEM agent JDK paths (<code>/em_grid_agent/agent_*/oracle_common/jdk/</code>) and staged-patch dirs (<code>/oracle/temp/*/files/jdk/</code>). Re-run <code>playbooks/update_java_action_rules.yml</code>.</div>
+            </li>
+            {% endif %}
+            {% if (java5 | length + java6 | length + java7 | length) > 0 %}
+            <li>
+              <span class="red">&#9760;&#65039; Pre-Java-8 still present:</span>
+              {% for r in (java5 + java6 + java7) %}
+                <code>{{ r[0] | trim }}</code> ({{ r[1] | trim }}) &mdash; {{ r[3] | trim }} inst / {{ r[4] | trim }} hosts{% if not loop.last %};{% endif %}
+              {% endfor %}.
+              <div class="small">All EOL with no JDK patch path. Plan upgrade or removal.</div>
+            </li>
+            {% endif %}
+            {% if java8 | length > 1 %}
+            <li>
+              <b>Java 8 update-level skew:</b> {{ java8 | length }} distinct 8.x update levels coexist in the fleet.
+              <div class="small">
+                Top: {% for r in java8[:5] %}<code>{{ r[0] | trim }}</code> ({{ r[3] | trim }}/{{ r[4] | trim }}h){% if not loop.last %}, {% endif %}{% endfor %}.
+                Recommend converging on the latest known JDK 8 (see <i>Reference Gap Analysis</i> in attached HTML).
+              </div>
+            </li>
+            {% endif %}
+            {% if clean_hosts > 0 %}
+            <li>
+              <span class="green">&#9989; <b>{{ clean_hosts }} host(s)</b> have no actions in the rule set</span> &mdash; either fully classified-clean or all installs hit INFO-only rules. Verify in attached HTML &rArr; "Per-Host Action Plan".
+            </li>
+            {% endif %}
+            {% if _eol_findings | length > 0 %}
+            <li>
+              <span class="red">EOL detail snapshot:</span>
+              {% for r in _eol_findings %}<code>{{ r[4] | trim }}</code> ({{ r[7] | trim }}) &mdash; {{ r[2] | trim }}h{% if not loop.last %}, {% endif %}{% endfor %}.
+            </li>
+            {% endif %}
+          </ul>
+
+          <h2>&#128296; Recommended Next Steps (Prioritized)</h2>
+          <ol>
+            {% if _act_green | length > 0 %}
+            <li><b class="green">Tier GREEN &mdash; this week:</b> Run <code>remediate_java_safe.yml</code> in dry-run on a TEST host first, then apply with <code>--limit</code>.
+              <div class="small">Targets: {{ _green_hosts_fleet | length }} host(s) / {{ _green_installs_fleet }} install(s).
+              Actions: <code>dnf update java-1.8.0-openjdk</code>, remove java-1.6/1.7 where unused, cleanup stale <code>OPatch_b4_update_*</code> dirs, Puppet agent refresh.</div>
+            </li>
+            {% endif %}
+            {% if _act_yellow | length > 0 %}
+            <li><b class="yellow">Tier YELLOW &mdash; next change window:</b> Open DBA change tickets for Oracle JDK Bundle Patch on 19c DB homes (MOS 2843164.1) and GI homes (MOS 2118136.2). Validate on TEST/MODEL first; verify exact patch artefact per home.
+              <div class="small">Targets: {{ _yellow_hosts_fleet | length }} host(s) / {{ _yellow_installs_fleet }} install(s). Coordinate OEM agent JDK refresh with OEM admin via <code>emcli</code>.</div>
+            </li>
+            {% endif %}
+            {% if _act_red | length > 0 %}
+            <li><b class="red">Tier RED &mdash; project track:</b> Plan upgrade or decommission for EOL Oracle homes (11.x / 12cR1). No supported JDK update path exists.
+              <div class="small">Targets: {{ _red_hosts_fleet | length }} host(s) / {{ _red_installs_fleet }} install(s).
+              {% if _red_hosts_fleet | length > 0 %}Hosts: {{ _red_hosts_fleet | join(', ') }}{% endif %}</div>
+            </li>
+            {% endif %}
+            {% if _behind_gap | length > 0 %}
+            <li><b>Reference gap:</b> {{ _behind_gap | length }} version track(s) are behind the latest known JDK in <code>JAVA_VERSION_REFERENCE</code>. See attached HTML &rArr; "Reference Gap Analysis".</li>
+            {% endif %}
+          </ol>
+
+          <h2>&#127968; Per-Domain Action Plan</h2>
+          {% set act_parsed = _act_rows | map('split','|') | list %}
+          {% set by_owner = act_parsed | groupby(2) %}
+          {% if by_owner | length == 0 %}
+          <div class="box">No action plan data available.</div>
+          {% else %}
+          <ul>
+            {% for owner, rows in by_owner %}
+            {% set owner_installs = rows | map(attribute=3) | map('trim') | map('int') | sum %}
+            {% set owner_hosts = rows | map(attribute=6) | map('trim') | map('split',', ') | sum(start=[]) | reject('equalto','') | unique | list %}
+            {% set tiers = rows | map(attribute=0) | map('trim') | unique | list %}
+            {% set owner_red = (rows | selectattr(0,'equalto','RED') | list) | length %}
+            {% set owner_yellow = (rows | selectattr(0,'equalto','YELLOW') | list) | length %}
+            {% set owner_green = (rows | selectattr(0,'equalto','GREEN') | list) | length %}
+            <li>
+              <b>Domain: {{ owner | trim }}</b> &mdash; {{ owner_installs }} install(s) on {{ owner_hosts | length }} host(s)
+              {% if owner_red > 0 %}<span class="red">[{{ owner_red }} RED]</span>{% endif %}
+              {% if owner_yellow > 0 %}<span class="yellow">[{{ owner_yellow }} YELLOW]</span>{% endif %}
+              {% if owner_green > 0 %}<span class="green">[{{ owner_green }} GREEN]</span>{% endif %}
+              <ul class="small">
+                {% for r in rows %}
+                <li>{{ r[1] | trim }} &mdash; {{ r[3] | trim }} install / {{ r[4] | trim }} host(s)</li>
+                {% endfor %}
+              </ul>
+              <span class="small">
+                <b>Recommended next step:</b>
+                {% if 'RED' in tiers %}Plan upgrade/decommission for EOL items.
+                {% elif 'YELLOW' in tiers %}Open DBA/OEM change ticket for next maintenance window; verify exact patch artefact per home before applying.
+                {% elif 'GREEN' in tiers %}Schedule via <code>remediate_java_safe.yml</code> (dry-run first).
+                {% else %}Tracked via parent component &mdash; no direct action.
+                {% endif %}
+              </span>
+            </li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+
+          {% if _eol_findings | length > 0 %}
+          <h2>&#128680; EOL / RED Findings Detail</h2>
+          <div class="box red">
+            <ul>
+              {% for r in _eol_findings %}
+              <li><b>{{ r[1] | trim }}</b> &mdash; {{ r[2] | trim }} host(s): Java {{ r[4] | trim }} (major {{ r[5] | trim }}) in <code>{{ r[6] | trim }}</code>
+                {% if (r[9] | trim) | length > 0 %} &mdash; ORACLE_HOME: <code>{{ r[9] | trim }}</code>{% endif %}
+                <br><span class="small"><b>Action:</b> {{ r[11] | trim }} &mdash; <b>Owner:</b> {{ r[12] | trim }} &mdash; <b>Hosts:</b> {{ r[3] | trim }}</span>
+              </li>
+              {% endfor %}
+            </ul>
+          </div>
+          {% endif %}
+
+          {% if _act_green | length > 0 %}
+          <h2>&#9989; GREEN Actions (Safe to Remediate)</h2>
+          <div class="box green">
+            <ul>
+              {% for r in _act_green %}
+              <li><b>{{ r[1] | trim }}</b> &mdash; {{ r[3] | trim }} install(s) on {{ r[4] | trim }} host(s)
+                <br><span class="small"><b>Owner:</b> {{ r[2] | trim }}{% if (r[5] | trim) | length > 0 %} &mdash; <b>Precheck:</b> {{ r[5] | trim }}{% endif %}</span>
+              </li>
+              {% endfor %}
+            </ul>
+          </div>
+          {% endif %}
+
+          <h2>&#128202; Top 5 Action Buckets (by host count)</h2>
+          {% set top_act = _act_rows | map('split','|') | list | sort(attribute=4, reverse=true) %}
+          {% if top_act | length == 0 %}
+          <div class="box">No action plan data available. Load <code>JAVA_ACTION_RULES</code> via <code>playbooks/update_java_action_rules.yml</code>.</div>
+          {% else %}
+          <ul>
+            {% for r in top_act[:5] %}
+            <li>
+              {% set t = r[0] | trim %}
+              {% if t == 'RED' %}<span class="red">[{{ t }}]</span>
+              {% elif t == 'YELLOW' %}<span class="yellow">[{{ t }}]</span>
+              {% elif t == 'GREEN' %}<span class="green">[{{ t }}]</span>
+              {% else %}<span class="gray">[{{ t }}]</span>{% endif %}
+              <b>{{ r[1] | trim }}</b> &mdash; {{ r[3] | trim }} install(s) on {{ r[4] | trim }} host(s)
+              <span class="small">(owner: {{ r[2] | trim }})</span>
+            </li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+
+          {% if _behind_gap | length > 0 %}
+          <h2>&#128338; Tracks Behind Latest Known Version</h2>
+          <ul>
+            {% for r in _behind_gap[:8] %}
+            <li><b>{{ r[0] | trim }} {{ r[1] | trim }}</b>: installed <code>{{ r[2] | trim }}</code> &rarr; latest <code>{{ r[3] | trim }}</code>
+              ({{ r[4] | trim }} install(s) on {{ r[5] | trim }} host(s))</li>
+            {% endfor %}
+            {% if _behind_gap | length > 8 %}<li class="small">&hellip; and {{ _behind_gap | length - 8 }} more in attached HTML report.</li>{% endif %}
+          </ul>
+          {% endif %}
+
+          <h2>&#128206; Attachments</h2>
+          <ul>
+            <li><b>Full HTML report</b> &mdash; complete tables: by context, by version, by application, by owner, reference gap, action plan, outdated detail with hostnames + recommended action per finding.</li>
+            <li><b>Plain-text report</b> &mdash; same data, plain-text/console-friendly.</li>
+          </ul>
+
+          <p class="small" style="margin-top:18px; color:#999;">
+            Auto-generated by <code>playbooks/report_java_scan_run.yml</code>. Edit <code>vars/java_action_rules.yml</code>
+            and re-run <code>playbooks/update_java_action_rules.yml</code> to refine remediation classifications.
+          </p>
+          </body></html>
+
+    - name: Send summary email notification (analyzed body + report attachments)
+      ansible.builtin.mail:
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port }}"
+        from: "{{ email_from }}"
+        to: "{{ ([email_to] + (email_to_extra | default('') | split(',') | map('trim') | reject('equalto','') | list)) | join(', ') }}"
+        subject: "{{ email_subject_prefix | default('[Java-Footprint-Audit]') }} {{ ('RUN_ID=' ~ report_run_id) if report_run_id != '' else 'Latest-per-host' }} Hosts={{ _hdr[3] | default('0') }} Java={{ _hdr[4] | default('0') }} | Worst: RED={{ _red_only_hosts | length }} YELLOW={{ _yellow_only_hosts | length }} GREEN={{ _green_only_hosts | length }} INFO={{ _info_only_hosts | length }}"
+        subtype: html
+        charset: utf-8
+        body: "{{ _email_body }}"
+        attach:
+          - "{{ _report_file }}"
+          - "{{ _report_html_file }}"
+      when: send_summary_email | bool
+
+    - name: Final report completion
+      ansible.builtin.debug:
+        msg:
+          - "Java report generated for RUN_ID={{ _eff_run_id }}"
+          - "Text report: {{ _report_file }}"
+          - "HTML report: {{ _report_html_file }}"
+          - "Email sent: {{ send_summary_email | bool }}"
+          - "Use also: SELECT * FROM {{ repo_schema | upper }}.JAVA_SCAN_LATEST_VW ORDER BY HOSTNAME, JAVA_TYPE;"
+          - "Use also: SELECT * FROM {{ repo_schema | upper }}.JAVA_SCAN_OUTDATED_VW ORDER BY JAVA_MAJOR, HOSTNAME;"

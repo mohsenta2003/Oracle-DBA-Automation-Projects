@@ -1,0 +1,546 @@
+---
+# playbooks/_setup_audit_tables.yml
+#
+# One-shot playbook to create complete repository schema:
+#   1. Create all 11 ORACLE_OPT_* tables (idempotent — safe to re-run)
+#   2. Create 12 performance indexes (23 total including PK indexes)
+#   3. Create 5 reporting views (LATEST_VW, ENABLED_VW, INUSE_VW, TREND_VW, HISTORY_VW)
+#   4. Truncate all tables — wipes previous test/dev data
+#   5. Verify row counts (all should be 0 after truncate)
+#
+# What gets created:
+#   - 11 tables with IDENTITY columns (auto-creates 11 sequences)
+#   - 23 indexes (11 PRIMARY KEY + 12 performance indexes)
+#   - 11 sequences (auto-created by IDENTITY columns)
+#   - 5 views for reporting
+#
+# ── DEFAULT (d1hub repository) ────────────────────────────────────────────────
+#   ansible-playbook playbooks/_setup_audit_tables.yml -i "localhost," -c local -e "repo_tns_alias=d1hub"
+#
+# ── CUSTOM DATABASE ───────────────────────────────────────────────────────────
+#   ansible-playbook playbooks/_setup_audit_tables.yml -i "localhost," -c local \
+#     -e "repo_tns_alias=MYDB repo_user=AUDITUSER repo_password='MyPass' repo_schema=AUDITUSER"
+#
+# NOTE: repo_schema defaults to repo_user. Set it explicitly only when the
+#       connecting user differs from the schema owner (e.g. DBA proxy user).
+#
+- hosts: localhost
+  gather_facts: no
+  
+  vars_files:
+    - ../vars/repo_config.yml
+
+  tasks:
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 1 — Create / ensure all tables exist
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Create all ORACLE_OPT_* tables (idempotent)
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          BEGIN
+
+            -- ── Core tables ────────────────────────────────────────────────────
+
+            BEGIN
+              EXECUTE IMMEDIATE '
+                CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_RUNS (
+                  RUN_ID          NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                  RUN_DATE        DATE          DEFAULT SYSDATE,
+                  DATA_AS_OF      DATE,
+                  RUN_LABEL       VARCHAR2(256),
+                  TRIGGERED_BY    VARCHAR2(128),
+                  CONTROLLER_HOST VARCHAR2(256),
+                  PLAYBOOK        VARCHAR2(256),
+                  TOTAL_HOSTS     NUMBER,
+                  TOTAL_INSTANCES NUMBER
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+            END;
+
+            BEGIN
+              EXECUTE IMMEDIATE '
+                CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES (
+                  INST_ID           NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                  RUN_ID            NUMBER        NOT NULL,
+                  HOSTNAME          VARCHAR2(256) NOT NULL,
+                  SID               VARCHAR2(64)  NOT NULL,
+                  DBID              NUMBER,
+                  DB_NAME           VARCHAR2(64),
+                  DB_UNIQUE_NAME    VARCHAR2(64),
+                  ORACLE_VERSION    VARCHAR2(32),
+                  VERSION_MAJOR     NUMBER,
+                  DB_ROLE           VARCHAR2(32),
+                  OPEN_MODE         VARCHAR2(32),
+                  IS_STANDBY        VARCHAR2(1)   DEFAULT ''N'',
+                  WAS_QUERIED       VARCHAR2(1)   DEFAULT ''Y'',
+                  SKIP_REASON       VARCHAR2(512),
+                  OS_TYPE           VARCHAR2(32),
+                  OS_VERSION        VARCHAR2(128),
+                  OS_KERNEL         VARCHAR2(128),
+                  CPU_COUNT         NUMBER,
+                  HOST_TIMEZONE     VARCHAR2(64),
+                  REGION            VARCHAR2(32),
+                  DB_PATCH_LEVEL    VARCHAR2(512),
+                  DB_PATCH_DATE     DATE,
+                  DB_PATCH_ID       NUMBER,
+                  OPATCH_VERSION    VARCHAR2(32),
+                  DB_TOTAL_SIZE_GB  NUMBER,
+                  ORACLE_USER       VARCHAR2(64),
+                  ORACLE_HOME       VARCHAR2(512),
+                  LAST_UPDATED      DATE DEFAULT SYSDATE
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+            END;
+
+            BEGIN
+              EXECUTE IMMEDIATE '
+                CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_VOPTION (
+                  VOPTION_ID    NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                  RUN_ID        NUMBER        NOT NULL,
+                  INST_ID       NUMBER,
+                  HOSTNAME      VARCHAR2(256) NOT NULL,
+                  SID           VARCHAR2(64)  NOT NULL,
+                  REGION        VARCHAR2(32),
+                  OS_TYPE       VARCHAR2(32),
+                  OPTION_NAME   VARCHAR2(256) NOT NULL,
+                  OPTION_ENABLED VARCHAR2(8),
+                  IS_EE_EXTRA   VARCHAR2(1)   DEFAULT ''N'',
+                  IS_INUSE      VARCHAR2(1)   DEFAULT ''N'',
+                  LAST_UPDATED  DATE DEFAULT SYSDATE
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+            END;
+
+            BEGIN
+              EXECUTE IMMEDIATE '
+                CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_FEATURES (
+                  FEATURE_ID       NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                  RUN_ID           NUMBER        NOT NULL,
+                  INST_ID          NUMBER,
+                  HOSTNAME         VARCHAR2(256) NOT NULL,
+                  SID              VARCHAR2(64)  NOT NULL,
+                  REGION           VARCHAR2(32),
+                  OS_TYPE          VARCHAR2(32),
+                  FEATURE_NAME     VARCHAR2(256) NOT NULL,
+                  FEATURE_VERSION  VARCHAR2(32),
+                  DETECTED_USAGES  NUMBER,
+                  CURRENTLY_USED   VARCHAR2(8),
+                  FIRST_USAGE_DATE DATE,
+                  LAST_USAGE_DATE  DATE,
+                  LAST_SAMPLE_DATE DATE,
+                  AUX_COUNT        NUMBER,
+                  LAST_UPDATED     DATE DEFAULT SYSDATE
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+            END;
+
+            -- ── Detail tables ──────────────────────────────────────────────────
+
+            BEGIN
+              EXECUTE IMMEDIATE '
+                CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_PART (
+                  DETAIL_ID    NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                  RUN_ID       NUMBER        NOT NULL,
+                  INST_ID      NUMBER,
+                  HOSTNAME     VARCHAR2(256) NOT NULL,
+                  SID          VARCHAR2(64)  NOT NULL,
+                  OWNER        VARCHAR2(128) NOT NULL,
+                  TABLE_NAME   VARCHAR2(128) NOT NULL,
+                  PART_TYPE    VARCHAR2(32),
+                  SUBPART_TYPE VARCHAR2(32),
+                  PART_COUNT   NUMBER,
+                  PART_KEY     VARCHAR2(256),
+                  SIZE_GB      NUMBER,
+                  LAST_UPDATED DATE DEFAULT SYSDATE
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+            END;
+
+            BEGIN
+              EXECUTE IMMEDIATE '
+                CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_COMPRESS (
+                  DETAIL_ID    NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                  RUN_ID       NUMBER        NOT NULL,
+                  INST_ID      NUMBER,
+                  HOSTNAME     VARCHAR2(256) NOT NULL,
+                  SID          VARCHAR2(64)  NOT NULL,
+                  OWNER        VARCHAR2(128),
+                  OBJECT_NAME  VARCHAR2(256) NOT NULL,
+                  OBJECT_TYPE  VARCHAR2(32),
+                  COMPRESSION  VARCHAR2(32),
+                  COMPRESS_FOR VARCHAR2(64),
+                  SIZE_GB      NUMBER,
+                  LAST_UPDATED DATE DEFAULT SYSDATE
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+            END;
+
+            BEGIN
+              EXECUTE IMMEDIATE '
+                CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_SECURITY (
+                  DETAIL_ID    NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                  RUN_ID       NUMBER        NOT NULL,
+                  INST_ID      NUMBER,
+                  HOSTNAME     VARCHAR2(256) NOT NULL,
+                  SID          VARCHAR2(64)  NOT NULL,
+                  OBJECT_TYPE  VARCHAR2(32),
+                  OWNER_OR_TS  VARCHAR2(128),
+                  OBJECT_NAME  VARCHAR2(256),
+                  ENCRYPTED    VARCHAR2(8),
+                  ALGORITHM    VARCHAR2(64),
+                  SIZE_GB      NUMBER,
+                  LAST_UPDATED DATE DEFAULT SYSDATE
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+            END;
+
+            BEGIN
+              EXECUTE IMMEDIATE '
+                CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_INMEM (
+                  DETAIL_ID    NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                  RUN_ID       NUMBER        NOT NULL,
+                  INST_ID      NUMBER,
+                  HOSTNAME     VARCHAR2(256) NOT NULL,
+                  SID          VARCHAR2(64)  NOT NULL,
+                  OWNER        VARCHAR2(128),
+                  TABLE_NAME   VARCHAR2(128),
+                  INMEMORY     VARCHAR2(16),
+                  PRIORITY     VARCHAR2(32),
+                  COMPRESSION  VARCHAR2(64),
+                  SIZE_GB      NUMBER,
+                  LAST_UPDATED DATE DEFAULT SYSDATE
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+            END;
+
+            BEGIN
+              EXECUTE IMMEDIATE '
+                CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_PDB (
+                  DETAIL_ID     NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                  RUN_ID        NUMBER        NOT NULL,
+                  INST_ID       NUMBER,
+                  HOSTNAME      VARCHAR2(256) NOT NULL,
+                  SID           VARCHAR2(64)  NOT NULL,
+                  CON_ID        NUMBER,
+                  PDB_NAME      VARCHAR2(128),
+                  OPEN_MODE     VARCHAR2(32),
+                  RESTRICTED    VARCHAR2(8),
+                  CREATION_DATE DATE,
+                  LAST_UPDATED  DATE DEFAULT SYSDATE
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+            END;
+
+            BEGIN
+              EXECUTE IMMEDIATE '
+                CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_ADG (
+                  DETAIL_ID      NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                  RUN_ID         NUMBER        NOT NULL,
+                  INST_ID        NUMBER,
+                  HOSTNAME       VARCHAR2(256) NOT NULL,
+                  SID            VARCHAR2(64)  NOT NULL,
+                  DB_UNIQUE_NAME VARCHAR2(128),
+                  DB_ROLE        VARCHAR2(32),
+                  OPEN_MODE      VARCHAR2(32),
+                  FAL_SERVER     VARCHAR2(256),
+                  APPLIED_SCN    VARCHAR2(32),
+                  LAST_UPDATED   DATE DEFAULT SYSDATE
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+            END;
+
+            BEGIN
+              EXECUTE IMMEDIATE '
+                CREATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_RAC (
+                  DETAIL_ID     NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                  RUN_ID        NUMBER        NOT NULL,
+                  INST_ID       NUMBER,
+                  HOSTNAME      VARCHAR2(256) NOT NULL,
+                  SID           VARCHAR2(64)  NOT NULL,
+                  RAC_INST_ID   NUMBER,
+                  INSTANCE_NAME VARCHAR2(64),
+                  NODE_HOST     VARCHAR2(256),
+                  STATUS        VARCHAR2(32),
+                  LAST_UPDATED  DATE DEFAULT SYSDATE
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+            END;
+
+          END;
+          /
+          EXIT;
+          EOSQL
+      register: _create_result
+      changed_when: true
+
+    - name: Show CREATE output
+      ansible.builtin.debug:
+        msg: "{{ _create_result.stdout_lines }}"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 1.5 — Create indexes for performance
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Create performance indexes
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          BEGIN
+            -- Indexes on ORACLE_OPT_RUNS
+            BEGIN
+              EXECUTE IMMEDIATE 'CREATE INDEX ORACLE_OPT_RUNS_IDX1 ON {{ repo_schema | upper }}.ORACLE_OPT_RUNS(RUN_DATE)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            
+            BEGIN
+              EXECUTE IMMEDIATE 'CREATE INDEX ORACLE_OPT_RUNS_IDX2 ON {{ repo_schema | upper }}.ORACLE_OPT_RUNS(RUN_LABEL)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            
+            -- Indexes on ORACLE_OPT_INSTANCES
+            BEGIN
+              EXECUTE IMMEDIATE 'CREATE INDEX ORACLE_OPT_INSTANCES_IDX1 ON {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES(RUN_ID, HOSTNAME)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            
+            BEGIN
+              EXECUTE IMMEDIATE 'CREATE INDEX ORACLE_OPT_INSTANCES_IDX2 ON {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES(HOSTNAME, SID)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            
+            BEGIN
+              EXECUTE IMMEDIATE 'CREATE INDEX ORACLE_OPT_INSTANCES_IDX3 ON {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES(DB_ROLE, IS_STANDBY)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            
+            -- Indexes on ORACLE_OPT_VOPTION
+            BEGIN
+              EXECUTE IMMEDIATE 'CREATE INDEX ORACLE_OPT_VOPTION_IDX1 ON {{ repo_schema | upper }}.ORACLE_OPT_VOPTION(RUN_ID, IS_INUSE)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            
+            BEGIN
+              EXECUTE IMMEDIATE 'CREATE INDEX ORACLE_OPT_VOPTION_IDX2 ON {{ repo_schema | upper }}.ORACLE_OPT_VOPTION(OPTION_NAME, IS_EE_EXTRA)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            
+            BEGIN
+              EXECUTE IMMEDIATE 'CREATE INDEX ORACLE_OPT_VOPTION_IDX3 ON {{ repo_schema | upper }}.ORACLE_OPT_VOPTION(HOSTNAME, SID)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            
+            -- Indexes on ORACLE_OPT_FEATURES
+            BEGIN
+              EXECUTE IMMEDIATE 'CREATE INDEX ORACLE_OPT_FEATURES_IDX1 ON {{ repo_schema | upper }}.ORACLE_OPT_FEATURES(RUN_ID, DETECTED_USAGES)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            
+            BEGIN
+              EXECUTE IMMEDIATE 'CREATE INDEX ORACLE_OPT_FEATURES_IDX2 ON {{ repo_schema | upper }}.ORACLE_OPT_FEATURES(FEATURE_NAME)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            
+            -- Indexes on detail tables
+            BEGIN
+              EXECUTE IMMEDIATE 'CREATE INDEX ORACLE_OPT_D_PART_IDX1 ON {{ repo_schema | upper }}.ORACLE_OPT_D_PART(RUN_ID)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            
+            BEGIN
+              EXECUTE IMMEDIATE 'CREATE INDEX ORACLE_OPT_D_COMPRESS_IDX1 ON {{ repo_schema | upper }}.ORACLE_OPT_D_COMPRESS(RUN_ID)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            
+            BEGIN
+              EXECUTE IMMEDIATE 'CREATE INDEX ORACLE_OPT_D_SECURITY_IDX1 ON {{ repo_schema | upper }}.ORACLE_OPT_D_SECURITY(RUN_ID)';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF; END;
+            
+          END;
+          /
+          EXIT;
+          EOSQL
+      register: _index_result
+      changed_when: true
+      failed_when: "'ORA-' in _index_result.stdout and 'ORA-00955' not in _index_result.stdout"
+
+    - name: Show index creation status
+      ansible.builtin.debug:
+        msg: "✓ Performance indexes created"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 1.6 — Create reporting views
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Create reporting views
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          
+          -- View 1: LATEST_VW - Most recent run snapshot
+          CREATE OR REPLACE VIEW {{ repo_schema | upper }}.ORACLE_OPT_LATEST_VW AS
+          SELECT 
+            r.run_id, r.run_date, r.run_label,
+            i.hostname, i.sid, i.db_name, i.oracle_version, i.region,
+            v.option_name, v.option_enabled, v.is_ee_extra, v.is_inuse
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS r
+          JOIN {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i ON i.run_id = r.run_id
+          LEFT JOIN {{ repo_schema | upper }}.ORACLE_OPT_VOPTION v ON v.inst_id = i.inst_id
+          WHERE r.run_id = (SELECT MAX(run_id) FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS);
+          
+          -- View 2: ENABLED_VW - All enabled options from latest run
+          CREATE OR REPLACE VIEW {{ repo_schema | upper }}.ORACLE_OPT_ENABLED_VW AS
+          SELECT 
+            r.run_id, r.run_date, r.run_label,
+            i.hostname, i.sid, i.db_name, i.oracle_version, i.region,
+            v.option_name, v.option_enabled, v.is_ee_extra, v.is_inuse
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS r
+          JOIN {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i ON i.run_id = r.run_id
+          JOIN {{ repo_schema | upper }}.ORACLE_OPT_VOPTION v ON v.inst_id = i.inst_id
+          WHERE r.run_id = (SELECT MAX(run_id) FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS)
+            AND v.option_enabled = 'TRUE';
+          
+          -- View 3: INUSE_VW - Options with detected usage (license exposure)
+          CREATE OR REPLACE VIEW {{ repo_schema | upper }}.ORACLE_OPT_INUSE_VW AS
+          SELECT 
+            r.run_id, r.run_date, r.run_label,
+            i.hostname, i.sid, i.db_name, i.oracle_version, i.region,
+            v.option_name, v.option_enabled, v.is_ee_extra, v.is_inuse
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS r
+          JOIN {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i ON i.run_id = r.run_id
+          JOIN {{ repo_schema | upper }}.ORACLE_OPT_VOPTION v ON v.inst_id = i.inst_id
+          WHERE r.run_id = (SELECT MAX(run_id) FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS)
+            AND v.is_inuse = 'Y';
+          
+          -- View 4: TREND_VW - Usage counts over time per option
+          CREATE OR REPLACE VIEW {{ repo_schema | upper }}.ORACLE_OPT_TREND_VW AS
+          SELECT 
+            r.run_date,
+            v.option_name,
+            COUNT(DISTINCT i.hostname) AS host_count,
+            SUM(CASE WHEN v.is_inuse = 'Y' THEN 1 ELSE 0 END) AS in_use_count
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS r
+          JOIN {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i ON i.run_id = r.run_id
+          JOIN {{ repo_schema | upper }}.ORACLE_OPT_VOPTION v ON v.inst_id = i.inst_id
+          GROUP BY r.run_date, v.option_name;
+          
+          -- View 5: HISTORY_VW - Full point-in-time history across all runs
+          CREATE OR REPLACE VIEW {{ repo_schema | upper }}.ORACLE_OPT_HISTORY_VW AS
+          SELECT 
+            r.run_id, r.run_date, r.run_label,
+            i.hostname, i.sid, i.db_name, i.oracle_version, i.region,
+            v.option_name, v.option_enabled, v.is_ee_extra, v.is_inuse
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS r
+          JOIN {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i ON i.run_id = r.run_id
+          LEFT JOIN {{ repo_schema | upper }}.ORACLE_OPT_VOPTION v ON v.inst_id = i.inst_id;
+          
+          EXIT;
+          EOSQL
+      register: _view_result
+      changed_when: true
+      failed_when: "'ORA-' in _view_result.stdout or 'SP2-' in _view_result.stdout"
+
+    - name: Show view creation status
+      ansible.builtin.debug:
+        msg: "✓ All 5 reporting views created (LATEST_VW, ENABLED_VW, INUSE_VW, TREND_VW, HISTORY_VW)"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 2 — Truncate all tables (clears all previous test / dev data)
+    #          Detail tables first (no FK constraints, but logical order)
+    #          then core tables.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Truncate all ORACLE_OPT_* tables
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET HEADING OFF FEEDBACK ON PAGESIZE 0
+          -- Detail tables first
+          TRUNCATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_PART;
+          TRUNCATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_COMPRESS;
+          TRUNCATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_SECURITY;
+          TRUNCATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_INMEM;
+          TRUNCATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_PDB;
+          TRUNCATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_ADG;
+          TRUNCATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_D_RAC;
+          -- Core tables
+          TRUNCATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_FEATURES;
+          TRUNCATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_VOPTION;
+          TRUNCATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES;
+          TRUNCATE TABLE {{ repo_schema | upper }}.ORACLE_OPT_RUNS;
+          EXIT;
+          EOSQL
+      register: _trunc_result
+      changed_when: true
+
+    - name: Show TRUNCATE output
+      ansible.builtin.debug:
+        msg: "{{ _trunc_result.stdout_lines }}"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 3 — Verify: list all ORACLE_OPT_* tables + row counts (all = 0)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Verify tables exist and are empty
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET LINESIZE 60
+          SET PAGESIZE 50
+          SET FEEDBACK OFF
+          PROMPT ── Tables in MTAHERI schema ──
+          SELECT table_name
+          FROM   user_tables
+          WHERE  table_name LIKE 'ORACLE_OPT%'
+          ORDER  BY table_name;
+          PROMPT
+          PROMPT ── Row counts (expect all 0) ──
+          SELECT 'ORACLE_OPT_RUNS'        t, COUNT(*) n FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS        UNION ALL
+          SELECT 'ORACLE_OPT_INSTANCES'   t, COUNT(*) n FROM {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES   UNION ALL
+          SELECT 'ORACLE_OPT_VOPTION'     t, COUNT(*) n FROM {{ repo_schema | upper }}.ORACLE_OPT_VOPTION     UNION ALL
+          SELECT 'ORACLE_OPT_FEATURES'    t, COUNT(*) n FROM {{ repo_schema | upper }}.ORACLE_OPT_FEATURES    UNION ALL
+          SELECT 'ORACLE_OPT_D_PART'      t, COUNT(*) n FROM {{ repo_schema | upper }}.ORACLE_OPT_D_PART      UNION ALL
+          SELECT 'ORACLE_OPT_D_COMPRESS'  t, COUNT(*) n FROM {{ repo_schema | upper }}.ORACLE_OPT_D_COMPRESS  UNION ALL
+          SELECT 'ORACLE_OPT_D_SECURITY'  t, COUNT(*) n FROM {{ repo_schema | upper }}.ORACLE_OPT_D_SECURITY  UNION ALL
+          SELECT 'ORACLE_OPT_D_INMEM'     t, COUNT(*) n FROM {{ repo_schema | upper }}.ORACLE_OPT_D_INMEM     UNION ALL
+          SELECT 'ORACLE_OPT_D_PDB'       t, COUNT(*) n FROM {{ repo_schema | upper }}.ORACLE_OPT_D_PDB       UNION ALL
+          SELECT 'ORACLE_OPT_D_ADG'       t, COUNT(*) n FROM {{ repo_schema | upper }}.ORACLE_OPT_D_ADG       UNION ALL
+          SELECT 'ORACLE_OPT_D_RAC'       t, COUNT(*) n FROM {{ repo_schema | upper }}.ORACLE_OPT_D_RAC
+          ORDER  BY 1;
+          EXIT;
+          EOSQL
+      register: _verify_result
+      changed_when: false
+
+    - name: Show verification
+      ansible.builtin.debug:
+        msg: "{{ _verify_result.stdout_lines }}"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 4 — Final summary: count all objects created
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Count all created objects
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          
+          SELECT 'TABLES:' || COUNT(*) FROM user_tables WHERE table_name LIKE 'ORACLE_OPT%';
+          SELECT 'INDEXES:' || COUNT(*) FROM user_indexes WHERE table_name LIKE 'ORACLE_OPT%';
+          SELECT 'SEQUENCES:' || COUNT(*) FROM user_sequences WHERE sequence_name LIKE 'ORACLE_OPT%';
+          SELECT 'VIEWS:' || COUNT(*) FROM user_views WHERE view_name LIKE 'ORACLE_OPT%';
+          
+          EXIT;
+          EOSQL
+      register: _summary_result
+      changed_when: false
+
+    - name: Repository build complete
+      ansible.builtin.debug:
+        msg: |
+          ✓✓✓ REPOSITORY BUILD COMPLETE ✓✓✓
+          
+          Objects created:
+          {{ _summary_result.stdout_lines | join('\n') }}
+          
+          Expected counts:
+            TABLES:11
+            INDEXES:23
+            SEQUENCES:11
+            VIEWS:5
+          
+          All tables truncated and ready for data collection.

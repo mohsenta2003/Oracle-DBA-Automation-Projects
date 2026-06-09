@@ -1,0 +1,278 @@
+---
+# ================================================================================
+# Manage Profiles Instance Tasks - Called for each Oracle instance
+# ================================================================================
+
+- name: "{{ current_sid }} - Set instance ORACLE_HOME"
+  ansible.builtin.set_fact:
+    current_oracle_home: "{{ oracle_home_map[current_sid] | default(oracle_home_map.values() | list | first | default('/u01/app/oracle/product/19.0.0/dbhome_1')) }}"
+
+- name: "{{ current_sid }} - Set environment"
+  ansible.builtin.set_fact:
+    oracle_env:
+      ORACLE_HOME: "{{ current_oracle_home }}"
+      ORACLE_SID: "{{ current_sid }}"
+      LD_LIBRARY_PATH: "{{ current_oracle_home }}/lib"
+      PATH: "{{ current_oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+
+- name: "{{ current_sid }} - Set report timestamp"
+  ansible.builtin.set_fact:
+    report_timestamp: "{{ ansible_date_time.iso8601 }}"
+
+# ============================================
+# LIST - List all profiles
+# ============================================
+- name: "{{ current_sid }} - List all profiles"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    SELECT DISTINCT profile FROM dba_profiles ORDER BY profile;
+    EXIT;
+    EOF
+  register: profiles_list
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'list'
+
+- name: "{{ current_sid }} - Get profile details"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    SELECT RPAD(resource_name, 35) || ': ' || limit
+    FROM dba_profiles
+    WHERE profile = UPPER('{{ profile_name | default('DEFAULT') }}')
+    ORDER BY resource_type, resource_name;
+    EXIT;
+    EOF
+  register: profile_details
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'list'
+
+- name: "{{ current_sid }} - Get users per profile"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    SELECT RPAD(profile, 25) || ': ' || COUNT(*) || ' users'
+    FROM dba_users
+    GROUP BY profile
+    ORDER BY profile;
+    EXIT;
+    EOF
+  register: users_per_profile
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'list'
+
+# ============================================
+# CREATE - Create new profile
+# ============================================
+- name: "{{ current_sid }} - Check if profile exists"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT COUNT(*) FROM dba_profiles WHERE profile = UPPER('{{ profile_name }}');
+    EXIT;
+    EOF
+  register: profile_exists
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'create' and profile_name != ''
+
+- name: "{{ current_sid }} - Create profile"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    CREATE PROFILE {{ profile_name | upper }} LIMIT
+    {% for key, value in profile_limits.items() %}
+    {{ key }} {{ value }}{% if not loop.last %} {% endif %}
+    {% endfor %};
+    EXIT;
+    EOF
+  register: create_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'create' and profile_name != '' and profile_exists.stdout | trim | int == 0
+  failed_when: false
+
+# ============================================
+# MODIFY - Modify existing profile
+# ============================================
+- name: "{{ current_sid }} - Modify profile"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    {% for key, value in profile_limits.items() %}
+    ALTER PROFILE {{ profile_name | upper }} LIMIT {{ key }} {{ value }};
+    {% endfor %}
+    EXIT;
+    EOF
+  register: modify_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'modify' and profile_name != '' and profile_limits | length > 0
+  failed_when: false
+
+# ============================================
+# ASSIGN - Assign profile to user
+# ============================================
+- name: "{{ current_sid }} - Get current user profile"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT profile FROM dba_users WHERE username = UPPER('{{ target_user }}');
+    EXIT;
+    EOF
+  register: current_profile
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'assign' and target_user != ''
+
+- name: "{{ current_sid }} - Assign profile to user"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    ALTER USER {{ target_user | upper }} PROFILE {{ profile_name | upper }};
+    EXIT;
+    EOF
+  register: assign_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'assign' and profile_name != '' and target_user != ''
+  failed_when: false
+
+# ============================================
+# DROP - Drop profile
+# ============================================
+- name: "{{ current_sid }} - Get users with profile before drop"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    SELECT username FROM dba_users WHERE profile = UPPER('{{ profile_name }}');
+    EXIT;
+    EOF
+  register: profile_users
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'drop' and profile_name != ''
+
+- name: "{{ current_sid }} - Drop profile"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    DROP PROFILE {{ profile_name | upper }} CASCADE;
+    EXIT;
+    EOF
+  register: drop_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'drop' and profile_name != ''
+  failed_when: false
+
+# ============================================
+# Build Profile Report
+# ============================================
+- name: "{{ current_sid }} - Build profile report"
+  ansible.builtin.set_fact:
+    profile_report: |
+      ╔═══════════════════════════════════════════════════════════════════════════════════╗
+      ║                          PROFILE MANAGEMENT REPORT                                ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ Report Time: {{ report_timestamp }}
+      ║ Host:        {{ inventory_hostname }}
+      ║ Instance:    {{ current_sid }}
+      ║ ORACLE_HOME: {{ current_oracle_home }}
+      ║ Action:      {{ action | upper }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if action == 'list' %}
+      ║ ALL PROFILES:                                                                     ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ profiles_list.stdout | default('No profiles found') }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ PROFILE DETAILS ({{ profile_name | default('DEFAULT') | upper }}):                ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ profile_details.stdout | default('Profile not found') }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ USERS PER PROFILE:                                                                ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ users_per_profile.stdout | default('No users found') }}
+      {% elif action == 'create' %}
+      ║ CREATE PROFILE: {{ profile_name | upper }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if profile_exists.stdout | default('0') | trim | int > 0 %}
+      ║ ⚠️  Profile already exists - no changes made
+      {% elif create_result is defined and create_result.rc == 0 %}
+      ║ ✅ Profile created successfully with limits:
+      {% for key, value in profile_limits.items() %}
+      ║   {{ key }}: {{ value }}
+      {% endfor %}
+      {% else %}
+      ║ ❌ Failed to create profile
+      ║ {{ create_result.stdout | default('') }}
+      {% endif %}
+      {% elif action == 'modify' %}
+      ║ MODIFY PROFILE: {{ profile_name | upper }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if modify_result is defined and modify_result.rc == 0 %}
+      ║ ✅ Profile modified successfully:
+      {% for key, value in profile_limits.items() %}
+      ║   {{ key }}: {{ value }}
+      {% endfor %}
+      {% else %}
+      ║ ❌ Failed to modify profile
+      {% endif %}
+      {% elif action == 'assign' %}
+      ║ ASSIGN PROFILE: {{ profile_name | upper }} TO {{ target_user | upper }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ Previous Profile: {{ current_profile.stdout | default('Unknown') | trim }}
+      {% if assign_result is defined and assign_result.rc == 0 %}
+      ║ ✅ Profile assigned successfully
+      {% else %}
+      ║ ❌ Failed to assign profile
+      {% endif %}
+      {% elif action == 'drop' %}
+      ║ DROP PROFILE: {{ profile_name | upper }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ Users affected (reassigned to DEFAULT):
+      {{ profile_users.stdout | default('None') }}
+      {% if drop_result is defined and drop_result.rc == 0 %}
+      ║ ✅ Profile dropped successfully
+      {% else %}
+      ║ ❌ Failed to drop profile
+      {% endif %}
+      {% endif %}
+      ╚═══════════════════════════════════════════════════════════════════════════════════╝
+
+- name: "{{ current_sid }} - Display profile report"
+  ansible.builtin.debug:
+    msg: "{{ profile_report }}"
+
+- name: "{{ current_sid }} - Save profile report"
+  ansible.builtin.copy:
+    content: "{{ profile_report }}"
+    dest: "{{ report_base_dir }}/{{ report_date }}/{{ inventory_hostname }}/profiles_{{ current_sid }}.txt"
+    mode: '0644'
+  delegate_to: localhost
+  become: no

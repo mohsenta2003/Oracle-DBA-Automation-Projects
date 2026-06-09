@@ -1,0 +1,9 @@
+---
+# vars file for oracle_patch
+# All values are auto-detected from the target system
+# Override with -e "variable=value" when applying patches
+#
+# Example overrides for patching:
+#   -e "patch_dir=/oracle/patches"
+#   -e "patch_id=32545008"
+#   -e "backup_dir=/oracle/backup"

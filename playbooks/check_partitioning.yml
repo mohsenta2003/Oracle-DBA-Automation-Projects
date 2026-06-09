@@ -1,0 +1,45 @@
+---
+# Oracle Partitioning Option Check Playbook
+#
+# Checks the Oracle Partitioning EE option across all instances on target hosts.
+# - Reports v$option status, dba_feature_usage_statistics first/last used dates
+# - Lists all partitioned tables and indexes per non-system schema
+# - Generates per-instance TXT + HTML reports
+# - Generates consolidated cross-host TXT + CSV + HTML reports
+#
+# Compatible with: Linux (EU/US) and AIX (EU/TLP)
+# Auth:            Use inv_key.yml (SSH key) or inv_pas.yml (SSH password)
+#
+# Usage Examples:
+#
+#   # Check ALL hosts across the entire estate
+#   ansible-playbook playbooks/check_partitioning.yml -i inv_key.yml
+#
+#   # Check all EU Linux production servers
+#   ansible-playbook playbooks/check_partitioning.yml -i inv_key.yml -l all_eu_linux
+#
+#   # Check all AIX servers (EU + TLP)
+#   ansible-playbook playbooks/check_partitioning.yml -i inv_key.yml -l all_aix_prod
+#
+#   # Check a single host
+#   ansible-playbook playbooks/check_partitioning.yml -i inv_key.yml -l crlnxp316
+#
+#   # Check a single instance on a multi-instance host
+#   ansible-playbook playbooks/check_partitioning.yml -i inv_key.yml -l crlnxd2201 -e "db_sid=MYDB"
+#
+#   # Override Oracle user (if auto-detection fails)
+#   ansible-playbook playbooks/check_partitioning.yml -i inv_key.yml -l ukaixpuk0001 -e "oracle_user=oracle"
+#
+# Reports saved to:
+#   reports/YYYY-MM-DD/<hostname>/partitioning_<SID>_<timestamp>.txt
+#   reports/YYYY-MM-DD/<hostname>/partitioning_<SID>_<timestamp>.html
+#   reports/YYYY-MM-DD/partitioning_consolidated_<timestamp>.txt  (all hosts)
+#   reports/YYYY-MM-DD/partitioning_results_<timestamp>.csv       (all hosts)
+#   reports/YYYY-MM-DD/partitioning_report_<timestamp>.html       (all hosts)
+
+- name: Check Oracle Partitioning Option
+  hosts: all
+  become: no
+  gather_facts: no
+  roles:
+    - oracle_partitioning

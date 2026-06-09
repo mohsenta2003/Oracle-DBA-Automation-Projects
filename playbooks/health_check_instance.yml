@@ -1,0 +1,379 @@
+---
+# ================================================================================
+# Health Check Instance Tasks - Called for each Oracle instance
+# ================================================================================
+
+- name: "{{ current_sid }} - Set instance ORACLE_HOME"
+  ansible.builtin.set_fact:
+    current_oracle_home: "{{ oracle_home_map[current_sid] | default(oracle_home_map.values() | list | first | default('/u01/app/oracle/product/19.0.0/dbhome_1')) }}"
+
+- name: "{{ current_sid }} - Set environment"
+  ansible.builtin.set_fact:
+    oracle_env:
+      ORACLE_HOME: "{{ current_oracle_home }}"
+      ORACLE_SID: "{{ current_sid }}"
+      LD_LIBRARY_PATH: "{{ current_oracle_home }}/lib"
+      PATH: "{{ current_oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+
+- name: "{{ current_sid }} - Get service name from listener"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT value FROM v\$parameter WHERE name = 'service_names';
+    EXIT;
+    EOF
+  register: service_name_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  failed_when: false
+
+- name: "{{ current_sid }} - Set service name"
+  ansible.builtin.set_fact:
+    current_service: "{{ service_name_result.stdout | trim | default(current_sid) }}"
+
+- name: "{{ current_sid }} - Set report timestamp"
+  ansible.builtin.set_fact:
+    report_timestamp: "{{ ansible_date_time.iso8601 }}"
+
+# ============================================
+# 1. Instance Status
+# ============================================
+- name: "{{ current_sid }} - Get instance status"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200
+    SELECT 'Instance: ' || instance_name || ' | Status: ' || status || 
+           ' | Version: ' || version || 
+           ' | Startup: ' || TO_CHAR(startup_time, 'YYYY-MM-DD HH24:MI:SS') ||
+           ' | Uptime: ' || ROUND(SYSDATE - startup_time) || ' days'
+    FROM v\$instance;
+    EXIT;
+    EOF
+  register: instance_status
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+
+- name: "{{ current_sid }} - Get database info"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200
+    SELECT 'Database: ' || name || ' | Open Mode: ' || open_mode || 
+           ' | Log Mode: ' || log_mode || 
+           ' | Force Logging: ' || force_logging
+    FROM v\$database;
+    EXIT;
+    EOF
+  register: database_info
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+
+# ============================================
+# 2. SGA/PGA Usage
+# ============================================
+- name: "{{ current_sid }} - Get SGA info"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200
+    SELECT name || ': ' || ROUND(value/1024/1024/1024, 2) || ' GB'
+    FROM v\$sga;
+    EXIT;
+    EOF
+  register: sga_info
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+
+- name: "{{ current_sid }} - Get PGA info"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200
+    SELECT 'PGA Target: ' || ROUND(value/1024/1024/1024, 2) || ' GB'
+    FROM v\$pgastat WHERE name = 'aggregate PGA target parameter';
+    EXIT;
+    EOF
+  register: pga_info
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+
+# ============================================
+# 3. Tablespace Usage
+# ============================================
+- name: "{{ current_sid }} - Get tablespace usage"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    SELECT RPAD(tablespace_name, 25) || ' | ' ||
+           LPAD(CASE WHEN used_space * 8192 / 1024 / 1024 / 1024 >= 1024 
+                     THEN TO_CHAR(ROUND(used_space * 8192 / 1024 / 1024 / 1024 / 1024, 2), '9990.99') || ' TB'
+                     ELSE TO_CHAR(ROUND(used_space * 8192 / 1024 / 1024 / 1024, 2), '9990.99') || ' GB'
+                END, 12) || ' / ' ||
+           LPAD(CASE WHEN tablespace_size * 8192 / 1024 / 1024 / 1024 >= 1024 
+                     THEN TO_CHAR(ROUND(tablespace_size * 8192 / 1024 / 1024 / 1024 / 1024, 2), '9990.99') || ' TB'
+                     ELSE TO_CHAR(ROUND(tablespace_size * 8192 / 1024 / 1024 / 1024, 2), '9990.99') || ' GB'
+                END, 12) || ' | ' ||
+           LPAD(TO_CHAR(ROUND(used_percent, 1), '990.9') || '%', 8) || ' | ' ||
+           CASE 
+             WHEN used_percent >= {{ tablespace_critical_pct }} THEN 'CRITICAL'
+             WHEN used_percent >= {{ tablespace_warning_pct }} THEN 'WARNING'
+             ELSE 'OK'
+           END
+    FROM dba_tablespace_usage_metrics
+    ORDER BY used_percent DESC;
+    EXIT;
+    EOF
+  register: tablespace_usage
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+
+# ============================================
+# 4. Session Statistics
+# ============================================
+- name: "{{ current_sid }} - Get session statistics"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200
+    SELECT 'Total Sessions: ' || COUNT(*) || ' | Active: ' || 
+           SUM(CASE WHEN status = 'ACTIVE' AND type = 'USER' THEN 1 ELSE 0 END) ||
+           ' | Inactive: ' || SUM(CASE WHEN status = 'INACTIVE' THEN 1 ELSE 0 END) ||
+           ' | Blocked: ' || SUM(CASE WHEN blocking_session IS NOT NULL THEN 1 ELSE 0 END)
+    FROM v\$session;
+    EXIT;
+    EOF
+  register: session_stats
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: include_sessions | bool
+
+- name: "{{ current_sid }} - Get sessions by username"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 20 LINESIZE 200
+    SELECT RPAD(NVL(username, 'BACKGROUND'), 25) || ': ' || COUNT(*) || ' sessions'
+    FROM v\$session
+    GROUP BY username
+    ORDER BY COUNT(*) DESC
+    FETCH FIRST 10 ROWS ONLY;
+    EXIT;
+    EOF
+  register: sessions_by_user
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: include_sessions | bool
+
+# ============================================
+# 5. Wait Events
+# ============================================
+- name: "{{ current_sid }} - Get top wait events"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 20 LINESIZE 200
+    SELECT RPAD(event, 50) || ' | ' || total_waits || ' waits | ' ||
+           ROUND(time_waited/100, 2) || ' sec'
+    FROM v\$system_event
+    WHERE event NOT LIKE 'SQL*Net%'
+      AND event NOT LIKE '%idle%'
+      AND event NOT LIKE 'rdbms ipc%'
+    ORDER BY time_waited DESC
+    FETCH FIRST 10 ROWS ONLY;
+    EXIT;
+    EOF
+  register: top_wait_events
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: include_wait_events | bool
+
+# ============================================
+# 6. Invalid Objects
+# ============================================
+- name: "{{ current_sid }} - Get invalid object count"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200
+    SELECT 'Total Invalid Objects: ' || COUNT(*) ||
+           ' | User Objects: ' || SUM(CASE WHEN owner NOT IN ('SYS', 'SYSTEM', 'PUBLIC', 'OUTLN', 'DBSNMP') THEN 1 ELSE 0 END)
+    FROM dba_objects
+    WHERE status = 'INVALID';
+    EXIT;
+    EOF
+  register: invalid_count
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: include_invalid_objects | bool
+
+- name: "{{ current_sid }} - Get invalid objects list"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 30 LINESIZE 200
+    SELECT owner || '.' || object_name || ' (' || object_type || ')'
+    FROM dba_objects
+    WHERE status = 'INVALID'
+      AND owner NOT IN ('SYS', 'SYSTEM', 'PUBLIC', 'OUTLN', 'DBSNMP')
+    ORDER BY owner, object_type, object_name
+    FETCH FIRST 20 ROWS ONLY;
+    EXIT;
+    EOF
+  register: invalid_objects
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: include_invalid_objects | bool
+
+# ============================================
+# 7. Long Running Queries
+# ============================================
+- name: "{{ current_sid }} - Get long running queries"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 20 LINESIZE 200
+    SELECT 'SID: ' || s.sid || ' | User: ' || s.username || 
+           ' | Runtime: ' || ROUND((SYSDATE - s.sql_exec_start) * 24 * 60, 1) || ' min' ||
+           ' | SQL: ' || SUBSTR(q.sql_text, 1, 40) || '...'
+    FROM v\$session s
+    JOIN v\$sql q ON s.sql_id = q.sql_id AND s.sql_child_number = q.child_number
+    WHERE s.status = 'ACTIVE'
+      AND s.username IS NOT NULL
+      AND s.sql_exec_start IS NOT NULL
+      AND (SYSDATE - s.sql_exec_start) * 86400 > {{ long_query_seconds }}
+    ORDER BY (SYSDATE - s.sql_exec_start) DESC
+    FETCH FIRST 10 ROWS ONLY;
+    EXIT;
+    EOF
+  register: long_queries
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  failed_when: false
+  when: include_long_queries | bool
+
+# ============================================
+# 8. Alert Log Errors (last 24h)
+# ============================================
+- name: "{{ current_sid }} - Get recent alert log errors"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 20 LINESIZE 200
+    SELECT TO_CHAR(originating_timestamp, 'YYYY-MM-DD HH24:MI:SS') || ' | ' ||
+           SUBSTR(message_text, 1, 80)
+    FROM v\$diag_alert_ext
+    WHERE originating_timestamp > SYSDATE - 1
+      AND message_type IN (1, 2)
+    ORDER BY originating_timestamp DESC
+    FETCH FIRST 10 ROWS ONLY;
+    EXIT;
+    EOF
+  register: alert_errors
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  failed_when: false
+
+# ============================================
+# Generate Health Report
+# ============================================
+- name: "{{ current_sid }} - Build health report"
+  ansible.builtin.set_fact:
+    health_report: |
+      ╔═══════════════════════════════════════════════════════════════════════════════════╗
+      ║                          DATABASE HEALTH CHECK REPORT                             ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ Report Time: {{ report_timestamp }}
+      ║ Host:        {{ inventory_hostname }}
+      ║ Instance:    {{ current_sid }}
+      ║ Service:     {{ current_service }}
+      ║ ORACLE_HOME: {{ current_oracle_home }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ 1. INSTANCE STATUS                                                                ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ instance_status.stdout | default('Unable to retrieve') }}
+      {{ database_info.stdout | default('') }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ 2. MEMORY (SGA/PGA)                                                               ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ sga_info.stdout | default('Unable to retrieve') }}
+      {{ pga_info.stdout | default('') }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ 3. TABLESPACE USAGE                                                               ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ tablespace_usage.stdout | default('Unable to retrieve') }}
+      {% if include_sessions | bool %}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ 4. SESSION STATISTICS                                                             ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ session_stats.stdout | default('Unable to retrieve') }}
+      
+      Top Users by Sessions:
+      {{ sessions_by_user.stdout | default('Unable to retrieve') }}
+      {% endif %}
+      {% if include_wait_events | bool %}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ 5. WAIT EVENTS                                                                    ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      Top System Wait Events:
+      {{ top_wait_events.stdout | default('Unable to retrieve') }}
+      {% endif %}
+      {% if include_invalid_objects | bool %}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ 6. INVALID OBJECTS                                                                ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ invalid_count.stdout | default('Unable to retrieve') }}
+      
+      {{ invalid_objects.stdout | default('No invalid user objects') }}
+      {% endif %}
+      {% if include_long_queries | bool %}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ 7. LONG RUNNING QUERIES (> {{ long_query_seconds }}s)                             ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ long_queries.stdout | default('No long running queries') }}
+      {% endif %}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ 8. RECENT ALERT LOG ERRORS (24h)                                                  ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ alert_errors.stdout | default('No recent errors') }}
+      ╚═══════════════════════════════════════════════════════════════════════════════════╝
+
+- name: "{{ current_sid }} - Display health report"
+  ansible.builtin.debug:
+    msg: "{{ health_report }}"
+
+- name: "{{ current_sid }} - Save health report"
+  ansible.builtin.copy:
+    content: "{{ health_report }}"
+    dest: "{{ report_base_dir }}/{{ report_date }}/{{ inventory_hostname }}/health_check_{{ current_sid }}.txt"
+    mode: '0644'
+  delegate_to: localhost
+  become: no

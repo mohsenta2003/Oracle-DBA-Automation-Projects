@@ -1,0 +1,59 @@
+---
+# ============================================================================
+# Java Footprint Audit - Repository Configuration
+# ============================================================================
+# SINGLE SOURCE OF TRUTH for Java scanner settings.
+#
+# Used by:
+#   - roles/java_scanner/defaults/main.yml (reference defaults)
+#   - playbooks/_setup_java_scan_tables.yml
+#   - playbooks/collect_java_footprint.yml
+#   - playbooks/report_java_scan_run.yml
+#
+# To change environment (DEV -> TEST -> PROD), edit ONLY this file.
+# ============================================================================
+
+# Repository database connection
+repo_tns_alias: "dbai"          # TNS alias if configured: "dbai" or leave empty
+repo_host:      "crlnxd1046"   # Repository DB host
+repo_port:      "1535"         # Listener port
+repo_sid:       "dbai"         # Repository SID
+repo_user:      "mtaheri"      # Schema owner / connection user
+repo_schema:    "mtaheri"      # Schema owning JAVA_SCAN_* tables
+repo_password:  ""             # Set via -e "repo_password=<pwd>" or ansible-vault
+
+# Auto-built connection string (do not modify)
+repo_dsn: "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={{ repo_host }})(PORT={{ repo_port }}))(CONNECT_DATA=(SID={{ repo_sid }})))"
+_repo_conn_string: "{{ repo_tns_alias if (repo_tns_alias | default('')) else repo_dsn }}"
+
+# ============================================================================
+# Reporting & Email Notification Configuration
+# ============================================================================
+# Report output directory (text report and optional HTML in future).
+# Same style as Oracle license audit report playbook:
+#   default to /tmp unless overridden.
+# Override example:
+#   -e "report_output_dir=/path/to/reports"
+report_output_dir: "/tmp"
+
+# Collector SQL/debug log directory on controller.
+# Same folder standard as oracle_options_audit:
+#   logs/<role>/<YYYY-MM-DD>
+# Override example:
+#   -e "log_dir=/your/path"
+log_dir: "{{ playbook_dir }}/../logs/java_scanner/{{ lookup('pipe', 'date +%Y-%m-%d') }}"
+
+send_summary_email: true
+email_to:   "Mohsen.Taheri@transamerica.com"
+email_from: "crlnxp1086@transamerica.com"
+smtp_host:  "mail1.us.aegon.com"
+smtp_port:  25
+email_subject_prefix: "[Java-Footprint-Audit]"
+
+# ============================================================================
+# Scanner behaviour
+# ============================================================================
+java_scan_become_root: true     # true = scan as root (recommended for Oracle homes)
+
+# Run label for each collection execution
+run_label: "java-scan-{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%SZ') }}"

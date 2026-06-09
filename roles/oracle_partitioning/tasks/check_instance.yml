@@ -1,0 +1,742 @@
+---
+# roles/oracle_partitioning/tasks/check_instance.yml
+# Check Oracle Partitioning option for a single instance
+# Called from main.yml with loop_var: current_sid
+
+- name: "{{ current_sid }} - Resolve ORACLE_HOME"
+  ansible.builtin.set_fact:
+    _current_oracle_home: "{{ _oratab_map[current_sid] | default(_oratab_map.values() | first) }}"
+
+- name: "{{ current_sid }} - Show instance info"
+  ansible.builtin.debug:
+    msg: "Checking Partitioning: SID={{ current_sid }} | ORACLE_HOME={{ _current_oracle_home }}"
+
+# ============================================
+# 1. Check database status and role
+# ============================================
+- name: "{{ current_sid }} - Check database status and role"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _current_oracle_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SELECT status || '|' || database_role || '|' || open_mode FROM v$instance, v$database;
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: db_status_check
+  failed_when: false
+
+- name: "{{ current_sid }} - Parse database status"
+  ansible.builtin.set_fact:
+    _db_status:    "{{ (db_status_check.stdout | default('UNKNOWN|UNKNOWN|UNKNOWN') | trim).split('|')[0] | default('UNKNOWN') }}"
+    _db_role:      "{{ (db_status_check.stdout | default('UNKNOWN|UNKNOWN|UNKNOWN') | trim).split('|')[1] | default('UNKNOWN') }}"
+    _db_open_mode: "{{ (db_status_check.stdout | default('UNKNOWN|UNKNOWN|UNKNOWN') | trim).split('|')[2] | default('UNKNOWN') }}"
+
+- name: "{{ current_sid }} - Debug connection failure"
+  ansible.builtin.debug:
+    msg:
+      - "WARNING: Connection to {{ current_sid }} failed or returned empty status."
+      - "RC: {{ db_status_check.rc | default('N/A') }}"
+      - "Stdout: {{ db_status_check.stdout | default('N/A') }}"
+      - "Stderr: {{ db_status_check.stderr | default('N/A') }}"
+  when: db_status_check.rc | default(0) != 0 or db_status_check.stdout | trim == ""
+
+- name: "{{ current_sid }} - Set standby flag"
+  ansible.builtin.set_fact:
+    _is_standby: "{{ _db_role in ['PHYSICAL STANDBY', 'LOGICAL STANDBY', 'SNAPSHOT STANDBY'] or _db_open_mode is not search('READ') }}"
+
+- name: "{{ current_sid }} - Display database status"
+  ansible.builtin.debug:
+    msg: "{{ current_sid }}: Status={{ _db_status }}, Role={{ _db_role }}, Open Mode={{ _db_open_mode }}, Standby={{ _is_standby }}"
+
+# ============================================
+# 1b. Get Oracle version (needed for 11g vs 12c+ compatibility)
+# ============================================
+- name: "{{ current_sid }} - Get Oracle DB version"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _current_oracle_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SELECT TO_CHAR(version) FROM v$instance;
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: db_version_check
+  changed_when: false
+  failed_when: "'ORA-' in (db_version_check.stderr | default(''))"
+  when: not (_is_standby | bool)
+
+- name: "{{ current_sid }} - Parse Oracle version"
+  ansible.builtin.set_fact:
+    _db_version_full:  "{{ db_version_check.stdout | default('0.0.0.0.0') | trim }}"
+    _db_version_major: "{{ (db_version_check.stdout | default('0.0.0.0.0') | trim).split('.')[0] | int }}"
+    _is_12c_plus:      "{{ (db_version_check.stdout | default('0.0.0.0.0') | trim).split('.')[0] | int >= 12 }}"
+  when: not (_is_standby | bool)
+
+# For 11g: exclude system schemas via hard-coded list (oracle_maintained col does not exist)
+# For 12c+: use oracle_maintained = 'N' (dynamic, always correct)
+- name: "{{ current_sid }} - Set schema exclusion filter for SQL"
+  ansible.builtin.set_fact:
+    _schema_filter: >-
+      {% if _is_12c_plus | bool %}
+      JOIN dba_users u ON owner = u.username WHERE u.oracle_maintained = 'N'
+      {% else %}
+      WHERE owner NOT IN ('SYS','SYSTEM','DBSNMP','SYSMAN','OUTLN','MDSYS','ORDSYS',
+        'EXFSYS','DMSYS','WMSYS','CTXSYS','ANONYMOUS','XDB','ORDPLUGINS','OLAPSYS',
+        'PUBLIC','LBACSYS','OJVMSYS','GSMADMIN_INTERNAL','APPQOSSYS','APEX_PUBLIC_USER')
+      {% endif %}
+  when: not (_is_standby | bool)
+
+- name: "{{ current_sid }} - Display version info"
+  ansible.builtin.debug:
+    msg: "{{ current_sid }}: Oracle Version={{ _db_version_full }}, 12c+={{ _is_12c_plus | bool | ternary('YES','NO') }}, Filter={{ 'oracle_maintained' if (_is_12c_plus | bool) else 'static exclusion list' }}"
+  when: not (_is_standby | bool)
+
+# ============================================
+# 2. Set standby placeholder (skip further queries)
+# ============================================
+- name: "{{ current_sid }} - Record standby result and skip"
+  ansible.builtin.set_fact:
+    _instance_results: "{{ _instance_results | default([]) + [{'sid': current_sid, 'db_role': _db_role, 'open_mode': _db_open_mode, 'is_standby': true, 'option_enabled': false, 'installed': 'FALSE', 'inuse': 'NO', 'table_count': 0, 'index_count': 0, 'schema_count': 0, 'first_used': 'N/A', 'last_sampled': 'N/A', 'report_file': '', 'output': 'DATABASE IS IN ' ~ _db_open_mode ~ ' MODE (Role: ' ~ _db_role ~ ') - Cannot query Partitioning features'}] }}"
+  when: _is_standby | bool
+
+# ============================================
+# 3. Refresh feature usage stats FIRST (so summary query gets current data)
+# ============================================
+- name: "{{ current_sid }} - Refresh feature usage statistics"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _current_oracle_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      BEGIN
+        DBMS_FEATURE_USAGE_INTERNAL.exec_db_usage_sampling(SYSDATE);
+      END;
+      /
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: feature_refresh
+  changed_when: false
+  failed_when: >-
+    'ORA-' in (feature_refresh.stdout | default('')) or
+    'ORA-' in (feature_refresh.stderr | default(''))
+  when: not (_is_standby | bool)
+
+# ============================================
+# 4. Single combined query: Installed + In-Use + Counts + Dates
+# Uses version-aware schema filter (_is_12c_plus)
+# ============================================
+- name: "{{ current_sid }} - Get partitioning status, counts and dates (single query)"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _current_oracle_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SET LINESIZE 500
+      {% if _is_12c_plus | bool %}
+      SELECT
+        (SELECT value FROM v$option WHERE parameter = 'Partitioning') || '|' ||
+        CASE WHEN (SELECT COUNT(*) FROM dba_part_tables pt
+                   JOIN dba_users u ON pt.owner = u.username
+                   WHERE u.oracle_maintained = 'N') > 0
+             THEN 'YES' ELSE 'NO' END || '|' ||
+        (SELECT TO_CHAR(COUNT(*)) FROM dba_part_tables pt
+         JOIN dba_users u ON pt.owner = u.username
+         WHERE u.oracle_maintained = 'N') || '|' ||
+        (SELECT TO_CHAR(COUNT(*)) FROM dba_part_indexes pi
+         JOIN dba_users u ON pi.owner = u.username
+         WHERE u.oracle_maintained = 'N') || '|' ||
+        (SELECT TO_CHAR(COUNT(DISTINCT pt.owner)) FROM dba_part_tables pt
+         JOIN dba_users u ON pt.owner = u.username
+         WHERE u.oracle_maintained = 'N') || '|' ||
+        NVL((SELECT TO_CHAR(MAX(first_usage_date),'YYYY-MM-DD') FROM dba_feature_usage_statistics
+             WHERE name = 'Partitioning' AND first_usage_date IS NOT NULL), 'Never') || '|' ||
+        NVL((SELECT TO_CHAR(MAX(CASE WHEN last_usage_date IS NOT NULL THEN last_usage_date
+                                     ELSE last_sample_date END),'YYYY-MM-DD')
+             FROM dba_feature_usage_statistics WHERE name = 'Partitioning'), 'Never') || '|' ||
+        NVL((SELECT TO_CHAR(ROUND(SUM(bytes)/1073741824,4))
+             FROM dba_segments s JOIN dba_users u ON s.owner = u.username
+             WHERE u.oracle_maintained = 'N'
+             AND s.segment_type IN ('TABLE PARTITION','TABLE SUBPARTITION',
+                                    'INDEX PARTITION','INDEX SUBPARTITION')), '0') || '|' ||
+        NVL((SELECT TO_CHAR(ROUND(SUM(bytes)/1073741824,4)) FROM dba_data_files), '0')
+      FROM DUAL;
+      {% else %}
+      -- Oracle 11g: use static exclusion list (oracle_maintained column does not exist)
+      SELECT
+        (SELECT value FROM v$option WHERE parameter = 'Partitioning') || '|' ||
+        CASE WHEN (SELECT COUNT(*) FROM dba_part_tables
+                   WHERE owner NOT IN ('SYS','SYSTEM','DBSNMP','SYSMAN','OUTLN','MDSYS',
+                     'ORDSYS','EXFSYS','DMSYS','WMSYS','CTXSYS','ANONYMOUS','XDB',
+                     'ORDPLUGINS','OLAPSYS','PUBLIC','LBACSYS','OJVMSYS')) > 0
+             THEN 'YES' ELSE 'NO' END || '|' ||
+        (SELECT TO_CHAR(COUNT(*)) FROM dba_part_tables
+         WHERE owner NOT IN ('SYS','SYSTEM','DBSNMP','SYSMAN','OUTLN','MDSYS',
+           'ORDSYS','EXFSYS','DMSYS','WMSYS','CTXSYS','ANONYMOUS','XDB',
+           'ORDPLUGINS','OLAPSYS','PUBLIC','LBACSYS','OJVMSYS')) || '|' ||
+        (SELECT TO_CHAR(COUNT(*)) FROM dba_part_indexes
+         WHERE owner NOT IN ('SYS','SYSTEM','DBSNMP','SYSMAN','OUTLN','MDSYS',
+           'ORDSYS','EXFSYS','DMSYS','WMSYS','CTXSYS','ANONYMOUS','XDB',
+           'ORDPLUGINS','OLAPSYS','PUBLIC','LBACSYS','OJVMSYS')) || '|' ||
+        (SELECT TO_CHAR(COUNT(DISTINCT owner)) FROM dba_part_tables
+         WHERE owner NOT IN ('SYS','SYSTEM','DBSNMP','SYSMAN','OUTLN','MDSYS',
+           'ORDSYS','EXFSYS','DMSYS','WMSYS','CTXSYS','ANONYMOUS','XDB',
+           'ORDPLUGINS','OLAPSYS','PUBLIC','LBACSYS','OJVMSYS')) || '|' ||
+        NVL((SELECT TO_CHAR(MAX(first_usage_date),'YYYY-MM-DD') FROM dba_feature_usage_statistics
+             WHERE name = 'Partitioning' AND first_usage_date IS NOT NULL), 'Never') || '|' ||
+        NVL((SELECT TO_CHAR(MAX(last_sample_date),'YYYY-MM-DD') FROM dba_feature_usage_statistics
+             WHERE name = 'Partitioning'), 'Never') || '|' ||
+        NVL((SELECT TO_CHAR(ROUND(SUM(bytes)/1073741824,4))
+             FROM dba_segments
+             WHERE owner NOT IN ('SYS','SYSTEM','DBSNMP','SYSMAN','OUTLN','MDSYS',
+               'ORDSYS','EXFSYS','DMSYS','WMSYS','CTXSYS','ANONYMOUS','XDB',
+               'ORDPLUGINS','OLAPSYS','PUBLIC','LBACSYS','OJVMSYS')
+             AND segment_type IN ('TABLE PARTITION','TABLE SUBPARTITION',
+                                  'INDEX PARTITION','INDEX SUBPARTITION')), '0') || '|' ||
+        NVL((SELECT TO_CHAR(ROUND(SUM(bytes)/1073741824,4)) FROM dba_data_files), '0')
+      FROM DUAL;
+      {% endif %}
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: part_summary
+  changed_when: false
+  failed_when: "'ORA-' in (part_summary.stderr | default(''))"
+  when: not (_is_standby | bool)
+
+- name: "{{ current_sid }} - Parse partitioning summary"
+  ansible.builtin.set_fact:
+    _part_installed:    "{{ (part_summary.stdout | default('FALSE|NO|0|0|0|Never|Never|0|0') | trim).split('|')[0] | default('FALSE') | trim | upper }}"
+    _part_inuse:        "{{ (part_summary.stdout | default('FALSE|NO|0|0|0|Never|Never|0|0') | trim).split('|')[1] | default('NO') | trim | upper }}"
+    _part_table_count:  "{{ (part_summary.stdout | default('FALSE|NO|0|0|0|Never|Never|0|0') | trim).split('|')[2] | default('0') | trim }}"
+    _part_index_count:  "{{ (part_summary.stdout | default('FALSE|NO|0|0|0|Never|Never|0|0') | trim).split('|')[3] | default('0') | trim }}"
+    _part_schema_count: "{{ (part_summary.stdout | default('FALSE|NO|0|0|0|Never|Never|0|0') | trim).split('|')[4] | default('0') | trim }}"
+    _part_first_used:   "{{ (part_summary.stdout | default('FALSE|NO|0|0|0|Never|Never|0|0') | trim).split('|')[5] | default('Never') | trim }}"
+    _part_last_used:    "{{ (part_summary.stdout | default('FALSE|NO|0|0|0|Never|Never|0|0') | trim).split('|')[6] | default('Never') | trim }}"
+    _part_total_size_gb:   "{{ (part_summary.stdout | default('FALSE|NO|0|0|0|Never|Never|0|0') | trim).split('|')[7] | default('0') | trim }}"
+    _db_total_size_gb:     "{{ (part_summary.stdout | default('FALSE|NO|0|0|0|Never|Never|0|0') | trim).split('|')[8] | default('0') | trim }}"
+    _partitioning_enabled: "{{ 'TRUE' in (part_summary.stdout | default('') | upper) }}"
+  when: not (_is_standby | bool)
+
+# ============================================
+# 5. Full detail: partitioned tables (pipe-delimited, for HTML table)
+# ============================================
+- name: "{{ current_sid }} - Get partitioned tables detail (pipe-delimited)"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _current_oracle_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SET LINESIZE 500
+      {% if _is_12c_plus | bool %}
+      SELECT
+        pt.owner || '|' ||
+        pt.table_name || '|' ||
+        NVL((SELECT LISTAGG(pkc.column_name,',') WITHIN GROUP (ORDER BY pkc.column_position)
+             FROM dba_part_key_columns pkc
+             WHERE pkc.owner = pt.owner AND pkc.name = pt.table_name
+             AND pkc.object_type = 'TABLE'), 'N/A') || '|' ||
+        pt.partitioning_type || '|' ||
+        NVL(pt.subpartitioning_type,'NONE') || '|' ||
+        TO_CHAR(pt.partition_count) || '|' ||
+        NVL(pt.interval, 'N/A') || '|' ||
+        NVL(TO_CHAR(ROUND(NVL(seg.size_gb,0),4)),'0')
+      FROM dba_part_tables pt
+      JOIN dba_users u ON pt.owner = u.username
+      LEFT JOIN (SELECT owner, segment_name,
+                        ROUND(SUM(bytes)/1073741824,4) AS size_gb
+                 FROM dba_segments
+                 WHERE segment_type IN ('TABLE PARTITION','TABLE SUBPARTITION')
+                 GROUP BY owner, segment_name) seg
+        ON seg.owner = pt.owner AND seg.segment_name = pt.table_name
+      WHERE u.oracle_maintained = 'N'
+      ORDER BY pt.owner, pt.table_name;
+      {% else %}
+      -- Oracle 11g: interval column and LISTAGG available (11.1+), but no oracle_maintained
+      SELECT
+        pt.owner || '|' ||
+        pt.table_name || '|' ||
+        NVL((SELECT LISTAGG(pkc.column_name,',') WITHIN GROUP (ORDER BY pkc.column_position)
+             FROM dba_part_key_columns pkc
+             WHERE pkc.owner = pt.owner AND pkc.name = pt.table_name
+             AND pkc.object_type = 'TABLE'), 'N/A') || '|' ||
+        pt.partitioning_type || '|' ||
+        NVL(pt.subpartitioning_type,'NONE') || '|' ||
+        TO_CHAR(pt.partition_count) || '|' ||
+        NVL(pt.interval, 'N/A') || '|' ||
+        NVL(TO_CHAR(ROUND(NVL(seg.size_gb,0),4)),'0')
+      FROM dba_part_tables pt
+      LEFT JOIN (SELECT owner, segment_name,
+                        ROUND(SUM(bytes)/1073741824,4) AS size_gb
+                 FROM dba_segments
+                 WHERE segment_type IN ('TABLE PARTITION','TABLE SUBPARTITION')
+                 GROUP BY owner, segment_name) seg
+        ON seg.owner = pt.owner AND seg.segment_name = pt.table_name
+      WHERE pt.owner NOT IN ('SYS','SYSTEM','DBSNMP','SYSMAN','OUTLN','MDSYS',
+        'ORDSYS','EXFSYS','DMSYS','WMSYS','CTXSYS','ANONYMOUS','XDB',
+        'ORDPLUGINS','OLAPSYS','PUBLIC','LBACSYS','OJVMSYS')
+      ORDER BY pt.owner, pt.table_name;
+      {% endif %}
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: part_tables_raw
+  changed_when: false
+  failed_when: "'ORA-' in (part_tables_raw.stderr | default(''))"
+  when: not (_is_standby | bool) and (_part_inuse | bool)
+
+# ============================================
+# 6. Full detail: partitioned indexes (pipe-delimited, for HTML table)
+# ============================================
+- name: "{{ current_sid }} - Get partitioned indexes detail (pipe-delimited)"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ _current_oracle_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      export ORACLE_SID={{ current_sid }}
+      sqlplus -s / as sysdba << 'EOSQL'
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      SET LINESIZE 500
+      {% if _is_12c_plus | bool %}
+      SELECT
+        pi.owner || '|' ||
+        pi.index_name || '|' ||
+        NVL((SELECT LISTAGG(pkc.column_name,',') WITHIN GROUP (ORDER BY pkc.column_position)
+             FROM dba_part_key_columns pkc
+             WHERE pkc.owner = pi.owner AND pkc.name = pi.index_name
+             AND pkc.object_type = 'INDEX'), 'N/A') || '|' ||
+        pi.table_name || '|' ||
+        pi.partitioning_type || '|' ||
+        TO_CHAR(pi.partition_count) || '|' ||
+        NVL(TO_CHAR(ROUND(NVL(seg.size_gb,0),4)),'0')
+      FROM dba_part_indexes pi
+      JOIN dba_users u ON pi.owner = u.username
+      LEFT JOIN (SELECT owner, segment_name,
+                        ROUND(SUM(bytes)/1073741824,4) AS size_gb
+                 FROM dba_segments
+                 WHERE segment_type IN ('INDEX PARTITION','INDEX SUBPARTITION')
+                 GROUP BY owner, segment_name) seg
+        ON seg.owner = pi.owner AND seg.segment_name = pi.index_name
+      WHERE u.oracle_maintained = 'N'
+      ORDER BY pi.owner, pi.index_name;
+      {% else %}
+      -- Oracle 11g: no oracle_maintained column
+      SELECT
+        pi.owner || '|' ||
+        pi.index_name || '|' ||
+        NVL((SELECT LISTAGG(pkc.column_name,',') WITHIN GROUP (ORDER BY pkc.column_position)
+             FROM dba_part_key_columns pkc
+             WHERE pkc.owner = pi.owner AND pkc.name = pi.index_name
+             AND pkc.object_type = 'INDEX'), 'N/A') || '|' ||
+        pi.table_name || '|' ||
+        pi.partitioning_type || '|' ||
+        TO_CHAR(pi.partition_count) || '|' ||
+        NVL(TO_CHAR(ROUND(NVL(seg.size_gb,0),4)),'0')
+      FROM dba_part_indexes pi
+      LEFT JOIN (SELECT owner, segment_name,
+                        ROUND(SUM(bytes)/1073741824,4) AS size_gb
+                 FROM dba_segments
+                 WHERE segment_type IN ('INDEX PARTITION','INDEX SUBPARTITION')
+                 GROUP BY owner, segment_name) seg
+        ON seg.owner = pi.owner AND seg.segment_name = pi.index_name
+      WHERE pi.owner NOT IN ('SYS','SYSTEM','DBSNMP','SYSMAN','OUTLN','MDSYS',
+        'ORDSYS','EXFSYS','DMSYS','WMSYS','CTXSYS','ANONYMOUS','XDB',
+        'ORDPLUGINS','OLAPSYS','PUBLIC','LBACSYS','OJVMSYS')
+      ORDER BY pi.owner, pi.index_name;
+      {% endif %}
+      EXIT;
+      EOSQL
+  become: yes
+  become_user: "{{ _oracle_user }}"
+  register: part_indexes_raw
+  changed_when: false
+  failed_when: "'ORA-' in (part_indexes_raw.stderr | default(''))"
+  when: not (_is_standby | bool) and (_part_inuse | bool)
+
+# ============================================
+# 7. Save per-instance TXT report
+# ============================================
+- name: "{{ current_sid }} - Build combined output for report"
+  ansible.builtin.set_fact:
+    _inst_output: |
+      Installed (v$option): {{ _part_installed | bool | ternary('TRUE', 'FALSE') }}
+      In-Use (Objects exist): {{ _part_inuse | bool | ternary('YES', 'NO') }}
+      First Used:  {{ _part_first_used | default('Never') }}
+      Last Used: {{ _part_last_used | default('Never') }}
+      Partitioned Tables:  {{ _part_table_count | default(0) }}
+      Partitioned Indexes: {{ _part_index_count | default(0) }}
+      Schemas Using:       {{ _part_schema_count | default(0) }}
+      Partitioned Objects Size (GB): {{ _part_total_size_gb | default('0') }}
+      Database Total Size (GB):      {{ _db_total_size_gb | default('0') }}
+  when: not (_is_standby | bool)
+
+- name: "{{ current_sid }} - Save per-instance TXT report"
+  ansible.builtin.copy:
+    content: |
+      ================================================================================
+      ORACLE PARTITIONING OPTION REPORT
+      ================================================================================
+      Host:             {{ inventory_hostname }}
+      Database:         {{ current_sid }}
+      DB Role:          {{ _db_role }}
+      Open Mode:        {{ _db_open_mode }}
+      Oracle User:      {{ _oracle_user }}
+      ORACLE_HOME:      {{ _current_oracle_home }}
+      Generated:        {{ ansible_date_time.iso8601 }}
+      ================================================================================
+
+      QUICK SUMMARY
+      ----------------------------------------
+        Installed? (v$option):    {{ _part_installed | bool | ternary('TRUE','FALSE') }}
+        In-Use? (Objects exist):  {{ _part_inuse | bool | ternary('YES','NO') }}
+
+      FEATURE USAGE STATISTICS
+        First Used:    {{ _part_first_used | default('Never') }}
+        Last Used:     {{ _part_last_used | default('Never') }}
+
+      OBJECT COUNTS (non-system schemas only)
+        Partitioned Tables:           {{ _part_table_count | default(0) }}
+        Partitioned Indexes:          {{ _part_index_count | default(0) }}
+        Schemas Using:                {{ _part_schema_count | default(0) }}
+        Partitioned Objects Size (GB):{{ _part_total_size_gb | default('0') }}
+        Database Total Size (GB):     {{ _db_total_size_gb | default('0') }}
+
+      LICENSE REQUIRED: {{ 'YES - Oracle Partitioning (EE option) license needed' if (_part_inuse | bool) else 'NO' }}
+
+      {% if _part_inuse | bool %}
+      ================================================================================
+      PARTITIONED TABLES DETAIL
+      ================================================================================
+      {% set col1 = 20 %}{% set col2 = 28 %}{% set col3 = 25 %}{% set col4 = 12 %}{% set col5 = 11 %}{% set col6 = 5 %}{% set col7 = 12 %}{% set col8 = 8 %}
+      {{ 'OWNER'.ljust(col1) }} {{ 'TABLE_NAME'.ljust(col2) }} {{ 'PARTITION_KEY'.ljust(col3) }} {{ 'PART_TYPE'.ljust(col4) }} {{ 'SUBPART'.ljust(col5) }} {{ 'PARTS'.ljust(col6) }} {{ 'INTERVAL'.ljust(col7) }} SIZE_GB
+      {{ '-' * col1 }} {{ '-' * col2 }} {{ '-' * col3 }} {{ '-' * col4 }} {{ '-' * col5 }} {{ '-' * col6 }} {{ '-' * col7 }} --------
+      {% for line in (part_tables_raw.stdout | default('') | trim).split('\n') %}
+      {% if line | trim != '' %}
+      {% set cols = line.split('|') %}
+      {{ (cols[0] | default('')).ljust(col1) }} {{ (cols[1] | default('')).ljust(col2) }} {{ (cols[2] | default('')).ljust(col3) }} {{ (cols[3] | default('')).ljust(col4) }} {{ (cols[4] | default('')).ljust(col5) }} {{ (cols[5] | default('')).ljust(col6) }} {{ (cols[6] | default('')).ljust(col7) }} {{ cols[7] | default('') }}
+      {% endif %}
+      {% endfor %}
+
+      ================================================================================
+      PARTITIONED INDEXES DETAIL
+      ================================================================================
+      {{ 'OWNER'.ljust(20) }} {{ 'INDEX_NAME'.ljust(30) }} {{ 'PARTITION_KEY'.ljust(25) }} {{ 'TABLE_NAME'.ljust(25) }} {{ 'PART_TYPE'.ljust(12) }} {{ 'PARTS'.ljust(5) }} SIZE_GB
+      {{ '-' * 20 }} {{ '-' * 30 }} {{ '-' * 25 }} {{ '-' * 25 }} {{ '-' * 12 }} {{ '-' * 5 }} -------
+      {% for line in (part_indexes_raw.stdout | default('') | trim).split('\n') %}
+      {% if line | trim != '' %}
+      {% set cols = line.split('|') %}
+      {{ (cols[0] | default('')).ljust(20) }} {{ (cols[1] | default('')).ljust(30) }} {{ (cols[2] | default('')).ljust(25) }} {{ (cols[3] | default('')).ljust(25) }} {{ (cols[4] | default('')).ljust(12) }} {{ (cols[5] | default('')).ljust(5) }} {{ cols[6] | default('') }}
+      {% endif %}
+      {% endfor %}
+      {% elif _part_installed | bool %}
+
+      NOTE: Partitioning option is INSTALLED (v$option=TRUE) but no partitioned objects
+            found in non-system schemas. Option may be licensed but not actively used.
+      {% else %}
+
+      NOTE: Partitioning option is NOT INSTALLED on this instance (v$option=FALSE).
+            No partitioned objects to report.
+      {% endif %}
+
+      ================================================================================
+                                  END OF REPORT
+      ================================================================================
+    dest: "{{ _local_report_dir }}/partitioning_{{ current_sid }}_{{ _report_timestamp }}.txt"
+  delegate_to: localhost
+  become: no
+  when: not (_is_standby | bool)
+
+# ============================================
+# 8. Save per-instance HTML report
+# ============================================
+- name: "{{ current_sid }} - Save per-instance HTML report"
+  ansible.builtin.copy:
+    content: |
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Partitioning: {{ current_sid }} @ {{ inventory_hostname }}</title>
+          <style>
+              :root {
+                  --primary: #1e3a8a;
+                  --bg-gray: #f8fafc;
+                  --border: #e2e8f0;
+                  --text-main: #1e293b;
+                  --text-muted: #64748b;
+              }
+              body { font-family: 'Inter', -apple-system, system-ui, sans-serif; background-color: #f1f5f9; color: var(--text-main); margin: 0; padding: 40px; line-height: 1.5; }
+              .container { max-width: 1400px; margin: 0 auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); }
+              h1 { color: var(--primary); font-size: 1.75rem; border-bottom: 2px solid var(--bg-gray); padding-bottom: 20px; margin-bottom: 30px; }
+              h2 { font-size: 1.1rem; color: #334155; margin-top: 35px; margin-bottom: 15px; border-left: 4px solid var(--primary); padding-left: 12px; }
+              .header-info { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 20px; margin-bottom: 30px; background: var(--bg-gray); padding: 25px; border-radius: 8px; border: 1px solid var(--border); }
+              .info-item strong { color: var(--text-muted); display: block; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 5px; }
+              .info-item span { font-weight: 600; color: var(--text-main); }
+              .badge { display: inline-flex; align-items: center; padding: 4px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
+              .badge-true     { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+              .badge-false    { background: #f1f5f9; color: #475569; border: 1px solid var(--border); }
+              .badge-yes      { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
+              .badge-no       { background: #f1f5f9; color: #475569; border: 1px solid var(--border); }
+              .badge-license  { background: #fef9c3; color: #854d0e; border: 1px solid #fde68a; }
+              .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 15px; margin: 20px 0; }
+              .stat-card { background: var(--bg-gray); padding: 20px; border-radius: 8px; border: 1px solid var(--border); text-align: center; }
+              .stat-card .num { font-size: 2rem; font-weight: 700; color: var(--primary); }
+              .stat-card .label { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; margin-top: 5px; }
+              table { width: 100%; border-collapse: separate; border-spacing: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+              .tbl-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 8px; }
+              th { background: var(--bg-gray); color: var(--text-muted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 12px 14px; text-align: left; border-bottom: 2px solid var(--border); }
+              td { padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 0.875rem; }
+              tr:last-child td { border-bottom: none; }
+              tr:hover { background: #fcfdfe; }
+              .footer { margin-top: 40px; padding-top: 20px; text-align: center; color: var(--text-muted); font-size: 0.8rem; border-top: 1px solid var(--border); }
+              .note-box { background: #f8fafc; border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; color: var(--text-muted); font-size: 0.875rem; margin-top: 15px; }
+          </style>
+      </head>
+      <body>
+          <div class="container">
+              <h1>&#x1F5C3; Oracle Partitioning Report</h1>
+
+              <div class="header-info">
+                  <div class="info-item"><strong>Host</strong><span>{{ inventory_hostname }}</span></div>
+                  <div class="info-item"><strong>Database</strong><span>{{ current_sid }}</span></div>
+                  <div class="info-item"><strong>DB Role</strong><span>{{ _db_role }}</span></div>
+                  <div class="info-item"><strong>Open Mode</strong><span>{{ _db_open_mode }}</span></div>
+                  <div class="info-item"><strong>Oracle User</strong><span>{{ _oracle_user }}</span></div>
+                  <div class="info-item"><strong>Database Total Size</strong><span>{{ _db_total_size_gb | default('0') }} GB</span></div>
+                  {% if _part_inuse | bool %}<div class="info-item"><strong>Partitioned Objects Size</strong><span style="color:#dc2626;font-weight:700;">{{ _part_total_size_gb | default('0') }} GB</span></div>{% endif %}
+                  <div class="info-item"><strong>Generated</strong><span>{{ ansible_date_time.iso8601 }}</span></div>
+              </div>
+
+              <h2>Partitioning Option Status</h2>
+              <table>
+                  <thead>
+                      <tr>
+                          <th>Feature</th>
+                          <th>Installed? (v$option)</th>
+                          <th>In-Use? (Objects exist)</th>
+                          <th>First Used</th>
+                          <th>Last Used</th>
+                          <th>Tables</th>
+                          <th>Indexes</th>
+                          <th>Schemas</th>
+                          <th style="text-align:right;">Partitioned Size (GB)</th>
+                          <th style="text-align:right;">DB Total Size (GB)</th>
+                          <th>License Required?</th>
+                      </tr>
+                  </thead>
+                  <tbody>
+                      <tr>
+                          <td><strong>Partitioning</strong></td>
+                          <td>
+                              {% if _part_installed | bool %}
+                              <span class="badge badge-true">TRUE</span>
+                              {% else %}
+                              <span class="badge badge-false">FALSE</span>
+                              {% endif %}
+                          </td>
+                          <td>
+                              {% if _part_inuse | bool %}
+                              <span class="badge badge-yes">YES</span>
+                              {% else %}
+                              <span class="badge badge-no">NO</span>
+                              {% endif %}
+                          </td>
+                          <td>{{ _part_first_used | default('Never') }}</td>
+                          <td>{{ _part_last_used | default('Never') }}</td>
+                          <td>{{ _part_table_count | default(0) }}</td>
+                          <td>{{ _part_index_count | default(0) }}</td>
+                          <td>{{ _part_schema_count | default(0) }}</td>
+                          <td style="text-align:right;">{{ _part_total_size_gb | default('0') }}</td>
+                          <td style="text-align:right;">{{ _db_total_size_gb | default('0') }}</td>
+                          <td>
+                              {% if _part_inuse | bool %}
+                              <span class="badge badge-license">YES</span>
+                              {% else %}
+                              <span class="badge badge-no">NO</span>
+                              {% endif %}
+                          </td>
+                      </tr>
+                  </tbody>
+              </table>
+
+              {% if _part_inuse | bool %}
+
+              <div class="stat-grid">
+                  <div class="stat-card">
+                      <div class="num">{{ _part_table_count | default(0) }}</div>
+                      <div class="label">Partitioned Tables</div>
+                  </div>
+                  <div class="stat-card">
+                      <div class="num">{{ _part_index_count | default(0) }}</div>
+                      <div class="label">Partitioned Indexes</div>
+                  </div>
+                  <div class="stat-card">
+                      <div class="num">{{ _part_schema_count | default(0) }}</div>
+                      <div class="label">Schemas Using</div>
+                  </div>
+                  <div class="stat-card" style="border-top:3px solid #1e3a8a;">
+                      <div class="num" style="font-size:1.4rem;">{{ _db_total_size_gb | default('0') }}</div>
+                      <div class="label">DB Total Size (GB)</div>
+                  </div>
+                  <div class="stat-card" style="border-top:3px solid #dc2626;">
+                      <div class="num" style="font-size:1.4rem;color:#dc2626;">{{ _part_total_size_gb | default('0') }}</div>
+                      <div class="label">Partitioned Size (GB)</div>
+                  </div>
+              </div>
+
+              <h2>&#x1F4CB; Partitioned Objects</h2>
+
+              <h3 style="font-size:0.95rem;color:#334155;margin:20px 0 8px;">Partitioned Tables</h3>
+              <div class="tbl-scroll">
+              <table>
+                  <thead>
+                      <tr>
+                          <th>Owner</th>
+                          <th>Table Name</th>
+                          <th>Partition Key</th>
+                          <th>Partitioning Type</th>
+                          <th>Subpartitioning</th>
+                          <th style="text-align:center;">Partitions</th>
+                          <th>Interval</th>
+                          <th style="text-align:right;">Size (GB)</th>
+                      </tr>
+                  </thead>
+                  <tbody>
+                      {% set table_lines = (part_tables_raw.stdout | default('') | trim).split('\n') %}
+                      {% for line in table_lines %}
+                      {% if line | trim != '' %}
+                      {% set cols = line.split('|') %}
+                      <tr>
+                          <td>{{ cols[0] | default('') | trim }}</td>
+                          <td>{{ cols[1] | default('') | trim }}</td>
+                          <td style="font-family:monospace;font-size:0.8rem;word-break:break-all;">{{ cols[2] | default('') | trim }}</td>
+                          <td>{{ cols[3] | default('') | trim }}</td>
+                          <td>{{ cols[4] | default('') | trim }}</td>
+                          <td style="text-align:center;">{{ cols[5] | default('') | trim }}</td>
+                          <td>{{ cols[6] | default('') | trim }}</td>
+                          <td style="text-align:right;">{{ cols[7] | default('') | trim }}</td>
+                      </tr>
+                      {% endif %}
+                      {% endfor %}
+                  </tbody>
+              </table>
+              </div>
+
+              <h3 style="font-size:0.95rem;color:#334155;margin:20px 0 8px;">Partitioned Indexes</h3>
+              <div class="tbl-scroll">
+              <table>
+                  <thead>
+                      <tr>
+                          <th>Owner</th>
+                          <th>Index Name</th>
+                          <th>Partition Key</th>
+                          <th>Table Name</th>
+                          <th>Partitioning Type</th>
+                          <th style="text-align:center;">Partitions</th>
+                          <th style="text-align:right;">Size (GB)</th>
+                      </tr>
+                  </thead>
+                  <tbody>
+                      {% set index_lines = (part_indexes_raw.stdout | default('') | trim).split('\n') %}
+                      {% for line in index_lines %}
+                      {% if line | trim != '' %}
+                      {% set cols = line.split('|') %}
+                      <tr>
+                          <td>{{ cols[0] | default('') | trim }}</td>
+                          <td>{{ cols[1] | default('') | trim }}</td>
+                          <td style="font-family:monospace;font-size:0.8rem;word-break:break-all;">{{ cols[2] | default('') | trim }}</td>
+                          <td>{{ cols[3] | default('') | trim }}</td>
+                          <td>{{ cols[4] | default('') | trim }}</td>
+                          <td style="text-align:center;">{{ cols[5] | default('') | trim }}</td>
+                          <td style="text-align:right;">{{ cols[6] | default('') | trim }}</td>
+                      </tr>
+                      {% endif %}
+                      {% endfor %}
+                  </tbody>
+              </table>
+              </div>
+
+              {% elif _part_installed | bool %}
+              <div class="note-box">
+                  &#x2705; Partitioning option is <strong>INSTALLED</strong> (v$option = TRUE) but no partitioned
+                  objects were found in non-system schemas. The option is licensed but not actively used.
+              </div>
+              {% else %}
+              <div class="note-box">
+                  &#x274C; Partitioning option is <strong>NOT INSTALLED</strong> on this instance (v$option = FALSE).
+                  No partitioned objects to report.
+              </div>
+              {% endif %}
+
+              <div class="footer">
+                  Oracle DBA Automation &mdash; Partitioning Report &mdash; {{ inventory_hostname }}/{{ current_sid }} &mdash; {{ ansible_date_time.iso8601 }}
+              </div>
+          </div>
+      </body>
+      </html>
+    dest: "{{ _local_report_dir }}/partitioning_{{ current_sid }}_{{ _report_timestamp }}.html"
+  delegate_to: localhost
+  become: no
+  when: not (_is_standby | bool)
+
+# ============================================
+# 9. Append to _instance_results (for consolidated report)
+# ============================================
+- name: "{{ current_sid }} - Append result to instance list"
+  ansible.builtin.set_fact:
+    _instance_results: "{{ _instance_results | default([]) + [{'sid': current_sid, 'db_role': _db_role, 'open_mode': _db_open_mode, 'is_standby': false, 'option_enabled': _partitioning_enabled | default(false) | bool, 'installed': _part_installed | default('FALSE'), 'inuse': _part_inuse | default('NO'), 'table_count': _part_table_count | default(0), 'index_count': _part_index_count | default(0), 'schema_count': _part_schema_count | default(0), 'total_size_gb': _part_total_size_gb | default('0'), 'db_total_size_gb': _db_total_size_gb | default('0'), 'first_used': _part_first_used | default('Never'), 'last_sampled': _part_last_used | default('Never'), 'report_file': 'partitioning_' ~ current_sid ~ '_' ~ _report_timestamp ~ '.html', 'output': _inst_output | default('')}] }}"
+  when: not (_is_standby | bool)
+
+# ============================================
+# 10. Console summary per instance
+# ============================================
+- name: "{{ current_sid }} - Display instance summary"
+  ansible.builtin.debug:
+    msg: |
+
+      ===== PARTITIONING: {{ current_sid }} on {{ inventory_hostname }} =====
+      Installed? (v$option): {{ _part_installed | default('FALSE') }}
+      In-Use?  (Objects):    {{ _part_inuse | default('NO') }}
+      Tables:  {{ _part_table_count | default(0) }}  |  Indexes: {{ _part_index_count | default(0) }}  |  Schemas: {{ _part_schema_count | default(0) }}
+      First Used: {{ _part_first_used | default('Never') }}  |  Last Used: {{ _part_last_used | default('Never') }}
+      License Required: {{ 'YES' if (_part_inuse | bool) else 'NO' }}
+      TXT:  reports/{{ _report_date }}/{{ inventory_hostname }}/partitioning_{{ current_sid }}_{{ _report_timestamp }}.txt
+      HTML: reports/{{ _report_date }}/{{ inventory_hostname }}/partitioning_{{ current_sid }}_{{ _report_timestamp }}.html
+      =====================================================================
+  when: not (_is_standby | bool)
+
+- name: "{{ current_sid }} - Display standby notice"
+  ansible.builtin.debug:
+    msg: "SKIPPED {{ current_sid }} on {{ inventory_hostname }}: Database is in {{ _db_open_mode }} mode (Role: {{ _db_role }}) - cannot query Partitioning features"
+  when: _is_standby | bool

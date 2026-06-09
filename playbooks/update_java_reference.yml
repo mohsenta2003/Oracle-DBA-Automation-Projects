@@ -1,0 +1,126 @@
+---
+# playbooks/update_java_reference.yml
+#
+# Idempotent MERGE of vars/java_reference.yml into
+# {{ repo_schema }}.JAVA_VERSION_REFERENCE.
+#
+# Creates the table if missing. Edit vars/java_reference.yml and re-run.
+#
+# Usage:
+#   ansible-playbook playbooks/update_java_reference.yml -i "localhost," -c local \
+#     -e "repo_password=<pwd>"
+
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars_files:
+    - ../vars/java_scanner_config.yml
+    - ../vars/java_reference.yml
+
+  vars:
+    _conn: "{{ repo_tns_alias if (repo_tns_alias | default('')) else '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=' ~ repo_host ~ ')(PORT=' ~ repo_port ~ '))(CONNECT_DATA=(' ~ ('SERVICE_NAME=' ~ repo_service if (repo_service | default('')) else 'SID=' ~ repo_sid) ~ ')))' }}"
+
+  tasks:
+
+    - name: Validate inputs
+      ansible.builtin.assert:
+        that:
+          - repo_user | default('') | length > 0
+          - repo_schema | default('') | length > 0
+          - repo_password | default('') | length > 0
+          - java_reference | default([]) | length > 0
+        fail_msg: "Missing repo creds or empty java_reference list."
+
+    - name: Ensure JAVA_VERSION_REFERENCE table exists
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          BEGIN
+            EXECUTE IMMEDIATE '
+              CREATE TABLE {{ repo_schema | upper }}.JAVA_VERSION_REFERENCE (
+                TRACK_KEY      VARCHAR2(64)  PRIMARY KEY,
+                VENDOR         VARCHAR2(64)  NOT NULL,
+                MAJOR          NUMBER        NOT NULL,
+                LATEST_VERSION VARCHAR2(64)  NOT NULL,
+                RELEASE_DATE   DATE,
+                EOL_DATE       DATE,
+                NOTES          VARCHAR2(512),
+                UPDATED_AT     TIMESTAMP DEFAULT SYSTIMESTAMP
+              )';
+          EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+          END;
+          /
+          EXIT;
+          EOSQL
+      register: _ref_create
+      changed_when: "'created' in (_ref_create.stdout | default('') | lower)"
+
+    - name: Build MERGE SQL file
+      ansible.builtin.copy:
+        dest: "/tmp/java_reference_merge_{{ lookup('pipe','date +%s') }}.sql"
+        mode: "0600"
+        content: |
+          SET DEFINE OFF
+          SET FEEDBACK OFF
+          {% for r in java_reference %}
+          MERGE INTO {{ repo_schema | upper }}.JAVA_VERSION_REFERENCE t
+          USING (SELECT
+                   '{{ r.track_key | replace("'", "''") }}'        AS TRACK_KEY,
+                   '{{ r.vendor    | replace("'", "''") }}'        AS VENDOR,
+                   {{ r.major | int }}                              AS MAJOR,
+                   '{{ r.latest_version | replace("'", "''") }}'   AS LATEST_VERSION,
+                   {% if (r.release_date | default('')) | length > 0 %}TO_DATE('{{ r.release_date }}','YYYY-MM-DD'){% else %}NULL{% endif %} AS RELEASE_DATE,
+                   {% if (r.eol_date | default('')) | length > 0 %}TO_DATE('{{ r.eol_date }}','YYYY-MM-DD'){% else %}NULL{% endif %} AS EOL_DATE,
+                   '{{ (r.notes | default('')) | replace("'", "''") }}' AS NOTES
+                 FROM DUAL) s
+          ON (t.TRACK_KEY = s.TRACK_KEY)
+          WHEN MATCHED THEN UPDATE SET
+              VENDOR         = s.VENDOR,
+              MAJOR          = s.MAJOR,
+              LATEST_VERSION = s.LATEST_VERSION,
+              RELEASE_DATE   = s.RELEASE_DATE,
+              EOL_DATE       = s.EOL_DATE,
+              NOTES          = s.NOTES,
+              UPDATED_AT     = SYSTIMESTAMP
+          WHEN NOT MATCHED THEN INSERT
+              (TRACK_KEY, VENDOR, MAJOR, LATEST_VERSION, RELEASE_DATE, EOL_DATE, NOTES, UPDATED_AT)
+              VALUES (s.TRACK_KEY, s.VENDOR, s.MAJOR, s.LATEST_VERSION, s.RELEASE_DATE, s.EOL_DATE, s.NOTES, SYSTIMESTAMP);
+          {% endfor %}
+          COMMIT;
+          EXIT;
+      register: _ref_sql
+
+    - name: Execute MERGE
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << EOSQL
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          @{{ _ref_sql.dest }}
+          EOSQL
+      register: _ref_run
+      changed_when: true
+
+    - name: Show row count
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          SELECT 'JAVA_VERSION_REFERENCE rows=' || COUNT(*) FROM {{ repo_schema | upper }}.JAVA_VERSION_REFERENCE;
+          EXIT;
+          EOSQL
+      register: _ref_count
+      changed_when: false
+
+    - name: Result
+      ansible.builtin.debug:
+        msg: "{{ _ref_count.stdout_lines }}"
+
+    - name: Cleanup temp SQL
+      ansible.builtin.file:
+        path: "{{ _ref_sql.dest }}"
+        state: absent

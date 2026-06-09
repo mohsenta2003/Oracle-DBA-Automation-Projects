@@ -1,0 +1,370 @@
+---
+# ================================================================================
+# Clone Schema Instance Tasks - Called for each Oracle instance
+# ================================================================================
+
+- name: "{{ current_sid }} - Set instance ORACLE_HOME"
+  ansible.builtin.set_fact:
+    current_oracle_home: "{{ oracle_home_map[current_sid] | default(oracle_home_map.values() | list | first | default('/u01/app/oracle/product/19.0.0/dbhome_1')) }}"
+
+- name: "{{ current_sid }} - Set environment"
+  ansible.builtin.set_fact:
+    oracle_env:
+      ORACLE_HOME: "{{ current_oracle_home }}"
+      ORACLE_SID: "{{ current_sid }}"
+      LD_LIBRARY_PATH: "{{ current_oracle_home }}/lib"
+      PATH: "{{ current_oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+
+- name: "{{ current_sid }} - Set report timestamp"
+  ansible.builtin.set_fact:
+    report_timestamp: "{{ ansible_date_time.iso8601 }}"
+
+- name: "{{ current_sid }} - Generate dump file name"
+  ansible.builtin.set_fact:
+    dump_filename: "{{ dump_prefix }}_{{ source_schema | upper }}_{{ current_sid }}{% if include_timestamp %}_{{ ansible_date_time.date | replace('-','') }}{% endif %}.dmp"
+    log_filename: "{{ dump_prefix }}_{{ source_schema | upper }}_{{ current_sid }}{% if include_timestamp %}_{{ ansible_date_time.date | replace('-','') }}{% endif %}.log"
+
+# ============================================
+# Get Data Pump directory path
+# ============================================
+- name: "{{ current_sid }} - Get Data Pump directory path"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT directory_path FROM dba_directories 
+    WHERE directory_name = '{{ datapump_dir }}';
+    EXIT;
+    EOF
+  register: dp_path
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+
+- name: "{{ current_sid }} - Fail if Data Pump directory not found"
+  ansible.builtin.fail:
+    msg: "Data Pump directory {{ datapump_dir }} not found in database"
+  when: dp_path.stdout | trim == ''
+
+# ============================================
+# Check if source schema exists
+# ============================================
+- name: "{{ current_sid }} - Check if source schema exists"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT username FROM dba_users WHERE username = UPPER('{{ source_schema }}');
+    EXIT;
+    EOF
+  register: source_exists
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: source_schema != ''
+
+# ============================================
+# LIST - List existing dump files
+# ============================================
+- name: "{{ current_sid }} - List dump files"
+  ansible.builtin.shell: |
+    ls -lh {{ dp_path.stdout | trim }}/*.dmp 2>/dev/null | tail -20 || echo "No dump files found"
+  register: dump_files
+  become_user: "{{ oracle_user }}"
+  changed_when: false
+  when: action == 'list'
+
+# ============================================
+# ESTIMATE - Estimate export size
+# ============================================
+- name: "{{ current_sid }} - Get schema size estimate"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING ON FEEDBACK OFF PAGESIZE 100 LINESIZE 150
+    COL segment_type FORMAT A25
+    COL size_gb FORMAT 999,999.99
+    
+    SELECT segment_type, 
+           ROUND(SUM(bytes)/1024/1024/1024, 2) as size_gb,
+           COUNT(*) as segment_count
+    FROM dba_segments 
+    WHERE owner = UPPER('{{ source_schema }}')
+    GROUP BY segment_type
+    ORDER BY 2 DESC;
+    
+    SELECT 'TOTAL' as segment_type,
+           ROUND(SUM(bytes)/1024/1024/1024, 2) as size_gb,
+           COUNT(*) as segment_count
+    FROM dba_segments 
+    WHERE owner = UPPER('{{ source_schema }}');
+    EXIT;
+    EOF
+  register: schema_estimate
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'estimate' and source_exists.stdout | trim != ''
+
+- name: "{{ current_sid }} - Get object counts"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING ON FEEDBACK OFF PAGESIZE 100 LINESIZE 150
+    COL object_type FORMAT A30
+    
+    SELECT object_type, COUNT(*) as count
+    FROM dba_objects 
+    WHERE owner = UPPER('{{ source_schema }}')
+    GROUP BY object_type
+    ORDER BY 2 DESC;
+    EXIT;
+    EOF
+  register: object_counts
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'estimate' and source_exists.stdout | trim != ''
+
+# ============================================
+# STATUS - Show Data Pump job status
+# ============================================
+- name: "{{ current_sid }} - Get Data Pump job status"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING ON FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    COL owner_name FORMAT A15
+    COL job_name FORMAT A30
+    COL operation FORMAT A10
+    COL job_mode FORMAT A10
+    COL state FORMAT A15
+    
+    SELECT owner_name, job_name, operation, job_mode, state, 
+           attached_sessions, degree
+    FROM dba_datapump_jobs
+    WHERE state != 'NOT RUNNING'
+    ORDER BY start_time DESC;
+    EXIT;
+    EOF
+  register: dp_jobs
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'status'
+
+# ============================================
+# EXPORT - Export schema
+# ============================================
+- name: "{{ current_sid }} - Export schema"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/expdp "'/ as sysdba'" \
+      SCHEMAS={{ source_schema | upper }} \
+      DIRECTORY={{ datapump_dir }} \
+      DUMPFILE={{ dump_filename }} \
+      LOGFILE={{ log_filename }} \
+      PARALLEL={{ parallel }} \
+      COMPRESSION={{ compression }} \
+      CONTENT={{ content }} \
+      {% if exclude_stats | bool %}EXCLUDE=STATISTICS {% endif %}
+      REUSE_DUMPFILES=YES
+  register: export_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action in ['export', 'clone'] and source_exists.stdout | trim != ''
+  failed_when: false
+
+# ============================================
+# CLONE - Import with remapping
+# ============================================
+- name: "{{ current_sid }} - Check if target schema exists"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT username FROM dba_users WHERE username = UPPER('{{ target_schema }}');
+    EXIT;
+    EOF
+  register: target_exists
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'clone' and target_schema != ''
+
+- name: "{{ current_sid }} - Import schema with remapping"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/impdp "'/ as sysdba'" \
+      DIRECTORY={{ datapump_dir }} \
+      DUMPFILE={{ dump_filename }} \
+      LOGFILE=imp_{{ target_schema | upper }}_{{ ansible_date_time.date | replace('-','') }}.log \
+      REMAP_SCHEMA={{ source_schema | upper }}:{{ target_schema | upper }} \
+      {% if remap_tablespace != '' %}REMAP_TABLESPACE={{ remap_tablespace }} {% endif %}
+      {% if transform_segment_attrs | bool %}TRANSFORM=SEGMENT_ATTRIBUTES:N {% endif %}
+      TABLE_EXISTS_ACTION={{ table_exists_action }} \
+      PARALLEL={{ parallel }}
+  register: import_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'clone' and export_result is defined and export_result.rc == 0
+  failed_when: false
+
+# ============================================
+# IMPORT - Import from existing dump
+# ============================================
+- name: "{{ current_sid }} - Check dump file exists for import"
+  ansible.builtin.stat:
+    path: "{{ dp_path.stdout | trim }}/{{ dump_filename }}"
+  register: dump_exists
+  when: action == 'import'
+
+- name: "{{ current_sid }} - Import from dump file"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/impdp "'/ as sysdba'" \
+      DIRECTORY={{ datapump_dir }} \
+      DUMPFILE={{ dump_filename }} \
+      LOGFILE=imp_{{ ansible_date_time.date | replace('-','') }}.log \
+      {% if target_schema != '' %}REMAP_SCHEMA={{ source_schema | upper }}:{{ target_schema | upper }} {% endif %}
+      TABLE_EXISTS_ACTION={{ table_exists_action }} \
+      PARALLEL={{ parallel }}
+  register: import_only_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'import' and dump_exists.stat.exists | default(false)
+  failed_when: false
+
+# ============================================
+# Get clone/import results
+# ============================================
+- name: "{{ current_sid }} - Get target schema objects count"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING ON FEEDBACK OFF PAGESIZE 100 LINESIZE 150
+    COL object_type FORMAT A30
+    
+    SELECT object_type, status, COUNT(*) as count
+    FROM dba_objects 
+    WHERE owner = UPPER('{{ target_schema }}')
+    GROUP BY object_type, status
+    ORDER BY 1, 2;
+    EXIT;
+    EOF
+  register: target_objects
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'clone' and import_result is defined and import_result.rc is defined
+
+# ============================================
+# Build Clone Report
+# ============================================
+- name: "{{ current_sid }} - Build schema clone report"
+  ansible.builtin.set_fact:
+    clone_report: |
+      ╔═══════════════════════════════════════════════════════════════════════════════════╗
+      ║                          SCHEMA CLONE REPORT                                      ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ Report Time:    {{ report_timestamp }}
+      ║ Host:           {{ inventory_hostname }}
+      ║ Instance:       {{ current_sid }}
+      ║ ORACLE_HOME:    {{ current_oracle_home }}
+      ║ Action:         {{ action | upper }}
+      ║ Source Schema:  {{ source_schema | upper }}
+      ║ Target Schema:  {{ target_schema | upper if target_schema != '' else 'N/A' }}
+      ║ Data Pump Dir:  {{ datapump_dir }} ({{ dp_path.stdout | trim }})
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if source_exists is defined and source_exists.stdout | trim == '' %}
+      ║ ❌ ERROR: Source schema {{ source_schema }} does not exist                        ║
+      {% elif action == 'list' %}
+      ║ EXISTING DUMP FILES:                                                              ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ dump_files.stdout | default('No files found') }}
+      {% elif action == 'estimate' %}
+      ║ SCHEMA SIZE ESTIMATE:                                                             ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ schema_estimate.stdout | default('No data') }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ OBJECT COUNTS:                                                                    ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ object_counts.stdout | default('No objects') }}
+      {% elif action == 'status' %}
+      ║ DATA PUMP JOB STATUS:                                                             ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ dp_jobs.stdout | default('No active Data Pump jobs') }}
+      {% elif action == 'export' %}
+      ║ EXPORT RESULT:                                                                    ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ Dump File: {{ dp_path.stdout | trim }}/{{ dump_filename }}
+      ║ Log File:  {{ dp_path.stdout | trim }}/{{ log_filename }}
+      ║
+      {% if export_result is defined and export_result.rc == 0 %}
+      ║ ✅ Export completed successfully
+      {% else %}
+      ║ ❌ Export failed or had warnings
+      ║ {{ export_result.stderr | default(export_result.stdout) | default('Check log file') }}
+      {% endif %}
+      {% elif action == 'clone' %}
+      ║ CLONE OPERATION:                                                                  ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ Step 1: Export {{ source_schema | upper }}
+      ║   Dump: {{ dp_path.stdout | trim }}/{{ dump_filename }}
+      {% if export_result is defined and export_result.rc == 0 %}
+      ║   Status: ✅ Completed
+      {% else %}
+      ║   Status: ❌ Failed
+      {% endif %}
+      ║
+      ║ Step 2: Import as {{ target_schema | upper }}
+      {% if import_result is defined and import_result.rc is defined %}
+      {% if import_result.rc == 0 %}
+      ║   Status: ✅ Completed
+      {% else %}
+      ║   Status: ⚠️ Completed with warnings (check import log)
+      {% endif %}
+      {% else %}
+      ║   Status: ❌ Not executed
+      {% endif %}
+      {% if target_objects is defined and target_objects.stdout is defined %}
+      ║
+      ║ Target Schema Objects:
+      {{ target_objects.stdout }}
+      {% endif %}
+      {% elif action == 'import' %}
+      ║ IMPORT RESULT:                                                                    ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if dump_exists is defined and dump_exists.stat.exists | default(false) %}
+      {% if import_only_result is defined and import_only_result.rc == 0 %}
+      ║ ✅ Import completed successfully
+      {% else %}
+      ║ ⚠️ Import completed with warnings (check log file)
+      {% endif %}
+      {% else %}
+      ║ ❌ Dump file not found: {{ dump_filename }}
+      {% endif %}
+      {% endif %}
+      ╚═══════════════════════════════════════════════════════════════════════════════════╝
+
+- name: "{{ current_sid }} - Display schema clone report"
+  ansible.builtin.debug:
+    msg: "{{ clone_report }}"
+
+- name: "{{ current_sid }} - Save schema clone report"
+  ansible.builtin.copy:
+    content: "{{ clone_report }}"
+    dest: "{{ report_base_dir }}/{{ report_date }}/{{ inventory_hostname }}/clone_schema_{{ current_sid }}.txt"
+    mode: '0644'
+  delegate_to: localhost
+  become: no

@@ -1,0 +1,366 @@
+---
+# Monitor a single instance
+# Called from main.yml with loop_var: current_sid
+
+  - name: "{{ current_sid }} - Get ORACLE_HOME"
+    ansible.builtin.set_fact:
+      _current_oracle_home: "{{ _oratab_map[current_sid] | default(_oratab_map.values() | first) }}"
+
+  - name: "{{ current_sid }} - Get ORACLE_BASE"
+    ansible.builtin.set_fact:
+      _current_oracle_base: "{{ _current_oracle_home | regex_replace('/product/.*', '') }}"
+
+  - name: "{{ current_sid }} - Display instance info"
+    ansible.builtin.debug:
+      msg: "Monitoring: {{ current_sid }} | ORACLE_HOME: {{ _current_oracle_home }}"
+
+  # ============================================
+  # Database Status
+  # ============================================
+  - name: "{{ current_sid }} - Check database status"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 200
+        SET HEADING ON
+        SET FEEDBACK OFF
+        SELECT instance_name, status, version, startup_time, host_name FROM v$instance;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: db_status
+    failed_when: false
+
+  # ============================================
+  # Tablespace Usage (GB/TB)
+  # ============================================
+  - name: "{{ current_sid }} - Check tablespace usage"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 300
+        SET PAGESIZE 200
+        SET HEADING ON
+        SET FEEDBACK OFF
+        COL tablespace_name FORMAT A30
+        COL used_size FORMAT A12
+        COL max_size FORMAT A12
+        COL pct_used FORMAT 999.99
+        SELECT 
+          tablespace_name,
+          CASE 
+            WHEN SUM(bytes)/1024/1024/1024/1024 >= 1 THEN TO_CHAR(ROUND(SUM(bytes)/1024/1024/1024/1024,2)) || ' TB'
+            ELSE TO_CHAR(ROUND(SUM(bytes)/1024/1024/1024,2)) || ' GB'
+          END AS used_size,
+          CASE 
+            WHEN SUM(maxbytes)/1024/1024/1024/1024 >= 1 THEN TO_CHAR(ROUND(SUM(maxbytes)/1024/1024/1024/1024,2)) || ' TB'
+            ELSE TO_CHAR(ROUND(SUM(maxbytes)/1024/1024/1024,2)) || ' GB'
+          END AS max_size,
+          ROUND(SUM(bytes)/SUM(maxbytes)*100,2) AS pct_used
+        FROM dba_data_files 
+        WHERE maxbytes > 0 
+        GROUP BY tablespace_name
+        ORDER BY pct_used DESC;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: tablespace_usage
+    failed_when: false
+
+  # ============================================
+  # Alert Log Errors (Last 24 hours)
+  # ============================================
+  - name: "{{ current_sid }} - Get alert log path"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET HEADING OFF
+        SET FEEDBACK OFF
+        SELECT value FROM v$diag_info WHERE name = 'Diag Trace';
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: alert_log_path
+    failed_when: false
+
+  - name: "{{ current_sid }} - Check alert log errors"
+    ansible.builtin.shell:
+      cmd: |
+        ALERT_DIR="{{ alert_log_path.stdout | trim }}"
+        ALERT_FILE="${ALERT_DIR}/alert_{{ current_sid }}.log"
+        if [ -f "$ALERT_FILE" ]; then
+          # Search for ORA- errors and include 2 lines of context to ensure timestamps are captured
+          grep -B 2 "ORA-" "$ALERT_FILE" | tail -150
+        else
+          echo "Alert log not found at $ALERT_FILE"
+        fi
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: alert_log_errors
+    failed_when: false
+
+  # ============================================
+  # Wait Events
+  # ============================================
+  - name: "{{ current_sid }} - Query wait events"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 200
+        SET PAGESIZE 100
+        SET HEADING ON
+        SET FEEDBACK OFF
+        COL event FORMAT A40
+        COL wait_class FORMAT A15
+        SELECT s.sid, s.event, s.wait_class, s.seconds_in_wait 
+        FROM v$session s 
+        WHERE s.wait_class != 'Idle' AND s.state = 'WAITING'
+        ORDER BY s.seconds_in_wait DESC
+        FETCH FIRST 20 ROWS ONLY;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: wait_events
+    failed_when: false
+
+  # ============================================
+  # Blocking Sessions
+  # ============================================
+  - name: "{{ current_sid }} - Query blocking sessions"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 200
+        SET PAGESIZE 100
+        SET HEADING ON
+        SET FEEDBACK OFF
+        SELECT s1.sid || ',' || s1.serial# AS blocking, 
+               s2.sid || ',' || s2.serial# AS blocked,
+               s2.username, s2.event
+        FROM v$session s1 
+        JOIN v$session s2 ON s1.sid = s2.blocking_session 
+        WHERE s2.blocking_session IS NOT NULL;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: blocking_sessions
+    failed_when: false
+
+  - name: "{{ current_sid }} - Check OS Health (Disk/Memory)"
+    ansible.builtin.shell:
+      cmd: |
+        echo "[DISK_USAGE_START]"
+        df -h / /u0* /db* /ora* 2>/dev/null | grep -v "Filesystem" || echo "No mount points matched"
+        echo "[DISK_USAGE_END]"
+        echo "[OS_MEM_START]"
+        free -m || echo "free command not found"
+        echo "[OS_MEM_END]"
+    register: os_health_out
+    failed_when: false
+
+  - name: "{{ current_sid }} - Execute advanced KPI script"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba @/tmp/advanced_kpi.sql
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: advanced_kpis
+    failed_when: false
+
+  - name: "{{ current_sid }} - Parse advanced KPIs"
+    ansible.builtin.set_fact:
+      _adv_out: "{{ advanced_kpis.stdout | default('') }}"
+      _os_out: "{{ os_health_out.stdout | default('') }}"
+      _disk_usage: "{{ (os_health_out.stdout | default('') | regex_findall('(?s)\\[DISK_USAGE_START\\](.*?)\\[DISK_USAGE_END\\]') | first) | default('') | trim }}"
+      _os_mem: "{{ (os_health_out.stdout | default('') | regex_findall('(?s)\\[OS_MEM_START\\](.*?)\\[OS_MEM_END\\]') | first) | default('') | trim }}"
+      _top_waits: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[TOP_WAITS_START\\](.*?)\\[TOP_WAITS_END\\]') | first) | default('') | trim }}"
+      _top_sql: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[TOP_SQL_START\\](.*?)\\[TOP_SQL_END\\]') | first) | default('') | trim }}"
+      _adv_stats: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[STALE_STATS_START\\](.*?)\\[STALE_STATS_END\\]') | first) | default('') | trim }}"
+      _adv_idxs: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[MISSING_FK_INDEX_START\\](.*?)\\[MISSING_FK_INDEX_END\\]') | first) | default('') | trim }}"
+      _adv_res: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[RESOURCE_ADVICE_START\\](.*?)\\[RESOURCE_ADVICE_END\\]') | first) | default('') | trim }}"
+      _hot_io: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[HOT_IO_START\\](.*?)\\[HOT_IO_END\\]') | first) | default('') | trim }}"
+      _backup_history: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[BACKUP_HISTORY_START\\](.*?)\\[BACKUP_HISTORY_END\\]') | first) | default('') | trim }}"
+      _patch_history: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[PATCH_HISTORY_START\\](.*?)\\[PATCH_HISTORY_END\\]') | first) | default('') | trim }}"
+      _wait_history: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[WAIT_HISTORY_START\\](.*?)\\[WAIT_HISTORY_END\\]') | first) | default('') | trim }}"
+      _db_extra: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[DB_EXTRA_START\\](.*?)\\[DB_EXTRA_END\\]') | first) | default('') | trim }}"
+      _perf_ratios: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[PERF_RATIOS_START\\](.*?)\\[PERF_RATIOS_END\\]') | first) | default('') | trim }}"
+      _redo_log_health: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[REDO_LOG_START\\](.*?)\\[REDO_LOG_END\\]') | first) | default('') | trim }}"
+      _seq_risks: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[SEQ_RISK_START\\](.*?)\\[SEQ_RISK_END\\]') | first) | default('') | trim }}"
+      _session_audit: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[SESSION_AUDIT_START\\](.*?)\\[SESSION_AUDIT_END\\]') | first) | default('') | trim }}"
+      _security_audit: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[SECURITY_AUDIT_START\\](.*?)\\[SECURITY_AUDIT_END\\]') | first) | default('') | trim }}"
+      _resource_limits: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[RESOURCE_LIMITS_START\\](.*?)\\[RESOURCE_LIMITS_END\\]') | first) | default('') | trim }}"
+      _fra_health: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[FRA_HEALTH_START\\](.*?)\\[FRA_HEALTH_END\\]') | first) | default('') | trim }}"
+      _shared_pool_diag: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[SHARED_POOL_START\\](.*?)\\[SHARED_POOL_END\\]') | first) | default('') | trim }}"
+      _contention_diag: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[CONTENTION_START\\](.*?)\\[CONTENTION_END\\]') | first) | default('') | trim }}"
+      _stats_dates: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[STATS_GATHER_START\\](.*?)\\[STATS_GATHER_END\\]') | first) | default('') | trim }}"
+      _index_rebuilds: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[INDEX_REBUILD_START\\](.*?)\\[INDEX_REBUILD_END\\]') | first) | default('') | trim }}"
+      _sort_segments: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[SORT_SEGMENTS_START\\](.*?)\\[SORT_SEGMENTS_END\\]') | first) | default('') | trim }}"
+      _invalid_count: "{{ (advanced_kpis.stdout | default('') | regex_findall('(?s)\\[INVALID_OBJECTS_START\\](.*?)\\[INVALID_OBJECTS_END\\]') | first | default('') | trim | split('\n') | reject('eq', '') | list | length) if '[INVALID_OBJECTS_START]' in (advanced_kpis.stdout | default('')) else 0 }}"
+
+  - name: "{{ current_sid }} - Set advisor tips summary"
+    ansible.builtin.set_fact:
+      _advisor_tips: >-
+        {% set tips = [] %}
+        {% if _adv_stats != '' %}{% set _ = tips.append('STATISTICS ADVICE:\n' + _adv_stats) %}{% endif %}
+        {% if _adv_idxs != '' %}{% set _ = tips.append('INDEX ADVICE:\n' + _adv_idxs) %}{% endif %}
+        {% if _adv_res != '' %}{% set _ = tips.append('RESOURCE ADVICE:\n' + _adv_res) %}{% endif %}
+        {% if _seq_risks != '' %}{% set _ = tips.append('CRITICAL: SEQUENCE EXHAUSTION DETECTED:\n' + _seq_risks) %}{% endif %}
+        {% if _resource_limits | regex_search('Pct: (9\\d\\.|100)') %}{% set _ = tips.append('CRITICAL: RESOURCE LIMITS NEAR EXHAUSTION:\n' + _resource_limits) %}{% endif %}
+        {% if _fra_health | regex_search('Pct Used: (9\\d|100)') %}{% set _ = tips.append('CRITICAL: FRA SPACE EXHAUSTED:\n' + _fra_health) %}{% endif %}
+        {{ tips | join('\n\n') }}
+
+  # ============================================
+  # Save Instance Report
+  # ============================================
+  - name: "{{ current_sid }} - Ensure instance report directory exists"
+    ansible.builtin.file:
+      path: "{{ _local_report_dir }}/{{ current_sid | trim }}"
+      state: directory
+    delegate_to: localhost
+    become: no
+
+  - name: "{{ current_sid }} - Save monitoring report (Text)"
+    ansible.builtin.copy:
+      content: |
+        ================================================================================
+                         ORACLE DATABASE MONITORING REPORT
+        ================================================================================
+        Host:        {{ inventory_hostname }}
+        Database:    {{ current_sid }}
+        Oracle User: {{ _oracle_user }}
+        ORACLE_HOME: {{ _current_oracle_home }}
+        Generated:   {{ ansible_date_time.iso8601 }}
+        ================================================================================
+        {{ _db_extra }}
+        
+        ================================================================================
+        1. DATABASE STATUS
+        ================================================================================
+        {{ db_status.stdout | default('Unable to connect to database') }}
+        
+        
+        ================================================================================
+        2. TABLESPACE USAGE
+        ================================================================================
+        {{ tablespace_usage.stdout | default('No tablespace data available') }}
+        
+        
+        ================================================================================
+        3. ALERT LOG ERRORS (Recent ORA- errors)
+        ================================================================================
+        {% if alert_log_errors.stdout | default('') | trim == '' or 'no rows selected' in alert_log_errors.stdout | lower %}
+        ✅ No recent ORA- errors in alert log
+        {% else %}
+        {{ alert_log_errors.stdout }}
+        {% endif %}
+        
+        
+        ================================================================================
+        4. ACTIVE WAIT EVENTS (Current)
+        ================================================================================
+        {% if wait_events.stdout | default('') | trim == '' or 'no rows selected' in wait_events.stdout | lower %}
+        ✅ No sessions currently waiting
+        {% else %}
+        {{ wait_events.stdout }}
+        {% endif %}
+        
+        
+        ================================================================================
+        5. BLOCKING SESSIONS
+        ================================================================================
+        {% if blocking_sessions.stdout | default('') | trim == '' or 'no rows selected' in blocking_sessions.stdout | lower %}
+        ✅ No blocking sessions detected
+        {% else %}
+        ⚠️  BLOCKING DETECTED:
+        {{ blocking_sessions.stdout }}
+        {% endif %}
+        
+        
+        ================================================================================
+        6. ADVANCED DIAGNOSTICS & HISTORY
+        ================================================================================
+        
+        BACKUP HISTORY:
+        {{ _backup_history | default('No records found') }}
+        
+        PATCH HISTORY:
+        {{ _patch_history | default('No records found') }}
+        
+        WAIT CLASS HISTORY (Last 24h):
+        {{ _wait_history | default('Insufficient data') }}
+
+        TOP 10 WAIT EVENTS:
+        {{ _top_waits if _top_waits != '' else 'None detected' }}
+        
+        TOP 10 HIGH-LOAD SQL:
+        {{ _top_sql if _top_sql != '' else 'None detected' }}
+        
+        ADVISOR SUGGESTIONS (Stats, Indexes, Resources):
+        {% if _advisor_tips | trim == '' %}
+        ✅ No specific advisor recommendations at this time.
+        {% else %}
+        {{ _advisor_tips }}
+        {% endif %}
+
+        ================================================================================
+                                    END OF REPORT
+        ================================================================================
+      dest: "{{ _local_report_dir }}/{{ current_sid | trim }}/monitor_{{ current_sid | trim }}.txt"
+    delegate_to: localhost
+    become: no
+
+  - name: "{{ current_sid }} - Collect results for consolidated report"
+    ansible.builtin.set_fact:
+      _current_mon_result:
+        sid: "{{ current_sid }}"
+        status: "{{ db_status.stdout | default('') | regex_search('OPEN|MOUNTED|STARTED') | default('UNKNOWN') }}"
+        version: "{{ db_status.stdout | default('') | regex_search('\\d+\\.\\d+\\.\\d+\\.\\d+\\.\\d+') | default('N/A') }}"
+        max_tbs_pct: >-
+          {% set max_pct = [0] %}
+          {% for line in tablespace_usage.stdout_lines | default([]) %}
+            {% set pct = line | regex_search('\\d+\\.\\d+$') %}
+            {% if pct %}{% set _ = max_pct.append(pct | float) %}{% endif %}
+          {% endfor %}
+          {{ max_pct | max }}
+        has_alert_errors: "{{ alert_log_errors.stdout | default('') | trim != '' }}"
+        blocking_count: "{{ blocking_sessions.stdout_lines | length - 2 if (blocking_sessions.stdout is defined and 'no rows selected' not in blocking_sessions.stdout | lower and blocking_sessions.stdout_lines | length > 2) else 0 }}"
+        wait_count: "{{ wait_events.stdout_lines | length - 2 if (wait_events.stdout is defined and 'no rows selected' not in wait_events.stdout | lower and wait_events.stdout_lines | length > 2) else 0 }}"
+        invalid_count: "{{ _invalid_count }}"
+        advisor_tips: "{{ _advisor_tips }}"
+        startup_time: "{{ _db_extra | regex_search('Startup Time: (.*)', '\\1') | default('Unknown') }}"
+        last_patch: "{{ _patch_history | split('\n') | first | regex_replace('Action: |Namespace: |Version: |Date: ', '') | default('None') }}"
+        report_file: "{{ current_sid | trim }}/monitor_{{ current_sid | trim }}.html"
+
+  - name: "{{ current_sid }} - Save monitoring report (HTML)"
+    ansible.builtin.template:
+      src: instance_report.j2
+      dest: "{{ _local_report_dir }}/{{ current_sid | trim }}/monitor_{{ current_sid | trim }}.html"
+    delegate_to: localhost
+    become: no
+
+  - name: "{{ current_sid }} - Add result to host list"
+    ansible.builtin.set_fact:
+      _mon_instance_results: "{{ _mon_instance_results | default([]) + [_current_mon_result] }}"

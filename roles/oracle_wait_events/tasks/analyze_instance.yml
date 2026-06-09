@@ -1,0 +1,327 @@
+---
+# Analyze wait events for a single instance
+# Called from main.yml with loop_var: current_sid
+
+  - name: "{{ current_sid }} - Get ORACLE_HOME"
+    ansible.builtin.set_fact:
+      _current_oracle_home: "{{ _oratab_map[current_sid] | default(_oratab_map.values() | first) }}"
+
+  - name: "{{ current_sid }} - Display instance info"
+    ansible.builtin.debug:
+      msg: "Analyzing instance: {{ current_sid }} | ORACLE_HOME: {{ _current_oracle_home }}"
+
+  # ============================================
+  # Current Wait Events (Active Sessions Waiting)
+  # ============================================
+  - name: "{{ current_sid }} - Query current wait events"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 300
+        SET PAGESIZE 200
+        SET HEADING ON
+        SET FEEDBACK OFF
+        COL sid FORMAT 99999
+        COL serial# FORMAT 99999
+        COL username FORMAT A15
+        COL program FORMAT A25
+        COL event FORMAT A40
+        COL wait_class FORMAT A15
+        COL seconds_in_wait FORMAT 999999
+        COL state FORMAT A10
+        
+        SELECT 
+          s.sid,
+          s.serial#,
+          NVL(s.username, 'BACKGROUND') AS username,
+          SUBSTR(s.program, 1, 25) AS program,
+          s.event,
+          s.wait_class,
+          s.seconds_in_wait,
+          s.state
+        FROM v$session s 
+        WHERE s.wait_class != 'Idle' 
+          AND s.state = 'WAITING'
+        ORDER BY s.seconds_in_wait DESC;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: current_waits
+    failed_when: false
+
+  # ============================================
+  # Wait Event Summary (Top Wait Classes)
+  # ============================================
+  - name: "{{ current_sid }} - Query wait class summary"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 200
+        SET PAGESIZE 100
+        SET HEADING ON
+        SET FEEDBACK OFF
+        COL wait_class FORMAT A20
+        COL total_waits FORMAT 999,999,999
+        COL time_waited_secs FORMAT 999,999,999.99
+        COL avg_wait_ms FORMAT 999,999.99
+        
+        SELECT 
+          wait_class,
+          total_waits,
+          ROUND(time_waited/100, 2) AS time_waited_secs,
+          ROUND(average_wait*10, 2) AS avg_wait_ms
+        FROM v$system_wait_class 
+        WHERE wait_class != 'Idle'
+        ORDER BY time_waited DESC;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: wait_class_summary
+    failed_when: false
+
+  # ============================================
+  # Top Wait Events (System-wide)
+  # ============================================
+  - name: "{{ current_sid }} - Query top system wait events"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 250
+        SET PAGESIZE 50
+        SET HEADING ON
+        SET FEEDBACK OFF
+        COL event FORMAT A50
+        COL wait_class FORMAT A15
+        COL total_waits FORMAT 999,999,999
+        COL time_waited_secs FORMAT 999,999.99
+        COL avg_wait_ms FORMAT 999.99
+        
+        SELECT * FROM (
+          SELECT 
+            event,
+            wait_class,
+            total_waits,
+            ROUND(time_waited/100, 2) AS time_waited_secs,
+            ROUND(average_wait*10, 2) AS avg_wait_ms
+          FROM v$system_event 
+          WHERE wait_class != 'Idle'
+          ORDER BY time_waited DESC
+        ) WHERE ROWNUM <= 20;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: top_wait_events
+    failed_when: false
+
+  # ============================================
+  # Blocking Sessions Analysis
+  # ============================================
+  - name: "{{ current_sid }} - Query blocking sessions"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 300
+        SET PAGESIZE 100
+        SET HEADING ON
+        SET FEEDBACK OFF
+        COL blocker FORMAT A20
+        COL blocker_user FORMAT A15
+        COL blocked FORMAT A20
+        COL blocked_user FORMAT A15
+        COL wait_event FORMAT A30
+        COL seconds_blocked FORMAT 999999
+        
+        SELECT 
+          s1.sid || ',' || s1.serial# AS blocker,
+          NVL(s1.username, 'BACKGROUND') AS blocker_user,
+          s2.sid || ',' || s2.serial# AS blocked,
+          s2.username AS blocked_user,
+          s2.event AS wait_event,
+          s2.seconds_in_wait AS seconds_blocked
+        FROM v$session s1 
+        JOIN v$session s2 ON s1.sid = s2.blocking_session 
+        WHERE s2.blocking_session IS NOT NULL
+        ORDER BY s2.seconds_in_wait DESC;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: blocking_sessions
+    failed_when: false
+
+  # ============================================
+  # Lock Wait Analysis
+  # ============================================
+  - name: "{{ current_sid }} - Query lock waits"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ current_sid }}
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 250
+        SET PAGESIZE 100
+        SET HEADING ON
+        SET FEEDBACK OFF
+        COL holder_sid FORMAT 99999
+        COL holder_user FORMAT A15
+        COL waiter_sid FORMAT 99999
+        COL waiter_user FORMAT A15
+        COL lock_type FORMAT A15
+        COL object_name FORMAT A30
+        
+        SELECT 
+          l1.sid AS holder_sid,
+          s1.username AS holder_user,
+          l2.sid AS waiter_sid,
+          s2.username AS waiter_user,
+          l1.type AS lock_type,
+          o.object_name
+        FROM v$lock l1
+        JOIN v$lock l2 ON l1.id1 = l2.id1 AND l1.id2 = l2.id2 AND l1.block = 1 AND l2.request > 0
+        JOIN v$session s1 ON l1.sid = s1.sid
+        JOIN v$session s2 ON l2.sid = s2.sid
+        LEFT JOIN dba_objects o ON l1.id1 = o.object_id
+        ORDER BY l1.sid;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: lock_waits
+    failed_when: false
+
+  # ============================================
+  # Save comprehensive wait event report
+  # ============================================
+  - name: "{{ current_sid }} - Save wait events report"
+    ansible.builtin.copy:
+      content: |
+        ================================================================================
+                         ORACLE WAIT EVENTS ANALYSIS REPORT
+        ================================================================================
+        Host:           {{ inventory_hostname }}
+        Database SID:   {{ current_sid }}
+        Oracle User:    {{ _oracle_user }}
+        ORACLE_HOME:    {{ _current_oracle_home }}
+        Report Time:    {{ ansible_date_time.iso8601 }}
+        ================================================================================
+        
+        
+        ================================================================================
+        1. CURRENT ACTIVE WAIT EVENTS
+        ================================================================================
+        Sessions currently waiting (excluding idle waits):
+        
+        {% if current_waits.stdout | default('') | trim == '' or 'no rows selected' in current_waits.stdout | lower %}
+        ✅ No sessions currently waiting - Database is running smoothly!
+        {% else %}
+        {{ current_waits.stdout }}
+        {% endif %}
+        
+        
+        ================================================================================
+        2. WAIT CLASS SUMMARY (Since Instance Startup)
+        ================================================================================
+        Overview of wait time by category:
+        
+        {{ wait_class_summary.stdout | default('No data available') }}
+        
+        INTERPRETATION:
+        - User I/O      : Waiting for data blocks from disk
+        - System I/O    : Control file, redo log writes
+        - Concurrency   : Buffer cache, library cache contention
+        - Application   : Row locks, enqueue waits
+        - Commit        : Log file sync (redo writes at commit)
+        - Network       : SQL*Net message waits
+        
+        
+        ================================================================================
+        3. TOP 20 WAIT EVENTS (Since Instance Startup)
+        ================================================================================
+        Most significant wait events by total time:
+        
+        {{ top_wait_events.stdout | default('No data available') }}
+        
+        
+        ================================================================================
+        4. BLOCKING SESSIONS
+        ================================================================================
+        Sessions blocking other sessions:
+        
+        {% if blocking_sessions.stdout | default('') | trim == '' or 'no rows selected' in blocking_sessions.stdout | lower %}
+        ✅ No blocking sessions detected
+        {% else %}
+        ⚠️  BLOCKING DETECTED:
+        {{ blocking_sessions.stdout }}
+        
+        ACTION: Consider killing the blocking session if it's stuck:
+          ALTER SYSTEM KILL SESSION 'blocker_sid,serial#' IMMEDIATE;
+        {% endif %}
+        
+        
+        ================================================================================
+        5. LOCK WAIT ANALYSIS
+        ================================================================================
+        Detailed lock holder/waiter information:
+        
+        {% if lock_waits.stdout | default('') | trim == '' or 'no rows selected' in lock_waits.stdout | lower %}
+        ✅ No lock contention detected
+        {% else %}
+        ⚠️  LOCK CONTENTION DETECTED:
+        {{ lock_waits.stdout }}
+        {% endif %}
+        
+        
+        ================================================================================
+        COMMON WAIT EVENT EXPLANATIONS
+        ================================================================================
+        
+        db file sequential read    - Single block I/O (index reads) - Consider I/O optimization
+        db file scattered read     - Multi-block I/O (full scans) - Review execution plans
+        log file sync              - Commit wait for redo - Check disk speed, reduce commits
+        buffer busy waits          - Hot blocks - Consider partitioning
+        enq: TX - row lock         - Row-level lock - Application design issue
+        library cache lock         - Hard parsing - Use bind variables
+        latch: cache buffers chains- Buffer cache contention - Increase buffer cache
+        
+        ================================================================================
+                                    END OF REPORT
+        ================================================================================
+      dest: "{{ _local_report_dir }}/wait_events_{{ current_sid }}.txt"
+    delegate_to: localhost
+    become: no
+
+  # ============================================
+  # Display instance summary
+  # ============================================
+  - name: "{{ current_sid }} - Display summary"
+    ansible.builtin.debug:
+      msg: |
+        
+        -------- {{ current_sid }} --------
+        {% if current_waits.stdout | default('') | trim == '' or 'no rows selected' in current_waits.stdout | lower %}
+        ✅ Active Waits: None
+        {% else %}
+        ⚠️  Active Waits: DETECTED
+        {% endif %}
+        {% if blocking_sessions.stdout | default('') | trim == '' or 'no rows selected' in blocking_sessions.stdout | lower %}
+        ✅ Blocking: None
+        {% else %}
+        ⚠️  Blocking: DETECTED
+        {% endif %}
+        📄 Report: wait_events_{{ current_sid }}.txt

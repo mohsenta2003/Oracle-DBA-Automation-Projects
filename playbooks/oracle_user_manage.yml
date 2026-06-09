@@ -1,0 +1,187 @@
+---
+# ================================================================================
+# Oracle User Management with cx_Oracle Modules
+# ================================================================================
+#
+# This playbook uses the ansible-oracle-modules (cx_Oracle based) for 
+# idempotent user management operations.
+#
+# PREREQUISITES:
+#   - cx_Oracle Python library installed on control machine or target
+#   - Oracle Instant Client (if running from control machine)
+#   - Network connectivity to Oracle listener
+#   - System or DBA credentials
+#
+# USAGE:
+#   # Create a new user
+#   ansible-playbook playbooks/oracle_user_manage.yml --limit crlnxd2201 \
+#     -e "db_service=ORCL" \
+#     -e "schema_name=APP_USER" \
+#     -e "schema_password=SecurePass123" \
+#     -e "action=create"
+#
+#   # Lock a user
+#   ansible-playbook playbooks/oracle_user_manage.yml --limit crlnxd2201 \
+#     -e "db_service=ORCL" \
+#     -e "schema_name=APP_USER" \
+#     -e "action=lock"
+#
+#   # Unlock a user
+#   ansible-playbook playbooks/oracle_user_manage.yml --limit crlnxd2201 \
+#     -e "db_service=ORCL" \
+#     -e "schema_name=APP_USER" \
+#     -e "action=unlock"
+#
+#   # Drop a user
+#   ansible-playbook playbooks/oracle_user_manage.yml --limit crlnxd2201 \
+#     -e "db_service=ORCL" \
+#     -e "schema_name=APP_USER" \
+#     -e "action=drop"
+#
+#   # Create user with specific grants
+#   ansible-playbook playbooks/oracle_user_manage.yml --limit crlnxd2201 \
+#     -e "db_service=ORCL" \
+#     -e "schema_name=APP_USER" \
+#     -e "schema_password=SecurePass123" \
+#     -e "default_tablespace=USERS" \
+#     -e "grants=['CONNECT','RESOURCE','CREATE VIEW']" \
+#     -e "action=create"
+# ================================================================================
+
+- name: Oracle User Management (cx_Oracle Module)
+  hosts: all
+  become: no
+  gather_facts: no
+  
+  vars:
+    # Connection defaults - override with -e
+    db_hostname: "{{ inventory_hostname }}"
+    db_port: 1521
+    db_service: "{{ db_sid | default('ORCL') }}"
+    # Authentication - use Oracle wallet or credentials
+    db_user: "{{ oracle_dba_user | default('system') }}"
+    db_password: "{{ oracle_dba_password | default('') }}"
+    db_mode: normal
+    # User defaults
+    default_tablespace: USERS
+    temp_tablespace: TEMP
+    grants:
+      - CONNECT
+      - RESOURCE
+    action: create
+
+  environment:
+    ORACLE_HOME: "{{ oracle_home | default('/u01/app/oracle/product/19.0.0/dbhome_1') }}"
+    LD_LIBRARY_PATH: "{{ oracle_home | default('/u01/app/oracle/product/19.0.0/dbhome_1') }}/lib"
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.fail:
+        msg: "Required variable '{{ item }}' is not defined"
+      when: vars[item] is not defined or vars[item] == ''
+      loop:
+        - schema_name
+        - db_service
+
+    - name: Validate password for create action
+      ansible.builtin.fail:
+        msg: "schema_password is required for create action"
+      when: 
+        - action == 'create'
+        - schema_password | default('') == ''
+
+    # ============================================
+    # Create User
+    # ============================================
+    - name: Create Oracle user
+      oracle_user:
+        hostname: "{{ db_hostname }}"
+        port: "{{ db_port }}"
+        service_name: "{{ db_service }}"
+        user: "{{ db_user }}"
+        password: "{{ db_password }}"
+        mode: "{{ db_mode }}"
+        schema: "{{ schema_name }}"
+        schema_password: "{{ schema_password }}"
+        default_tablespace: "{{ default_tablespace }}"
+        default_temp_tablespace: "{{ temp_tablespace }}"
+        grants: "{{ grants }}"
+        state: present
+      when: action == 'create'
+      register: create_result
+
+    - name: Display create result
+      ansible.builtin.debug:
+        msg: "User {{ schema_name }} created successfully"
+      when: 
+        - action == 'create'
+        - create_result.changed | default(false)
+
+    # ============================================
+    # Lock User
+    # ============================================
+    - name: Lock Oracle user
+      oracle_user:
+        hostname: "{{ db_hostname }}"
+        port: "{{ db_port }}"
+        service_name: "{{ db_service }}"
+        user: "{{ db_user }}"
+        password: "{{ db_password }}"
+        mode: "{{ db_mode }}"
+        schema: "{{ schema_name }}"
+        state: locked
+      when: action == 'lock'
+      register: lock_result
+
+    - name: Display lock result
+      ansible.builtin.debug:
+        msg: "User {{ schema_name }} locked successfully"
+      when: 
+        - action == 'lock'
+        - lock_result.changed | default(false)
+
+    # ============================================
+    # Unlock User
+    # ============================================
+    - name: Unlock Oracle user
+      oracle_user:
+        hostname: "{{ db_hostname }}"
+        port: "{{ db_port }}"
+        service_name: "{{ db_service }}"
+        user: "{{ db_user }}"
+        password: "{{ db_password }}"
+        mode: "{{ db_mode }}"
+        schema: "{{ schema_name }}"
+        state: unlocked
+      when: action == 'unlock'
+      register: unlock_result
+
+    - name: Display unlock result
+      ansible.builtin.debug:
+        msg: "User {{ schema_name }} unlocked successfully"
+      when: 
+        - action == 'unlock'
+        - unlock_result.changed | default(false)
+
+    # ============================================
+    # Drop User
+    # ============================================
+    - name: Drop Oracle user
+      oracle_user:
+        hostname: "{{ db_hostname }}"
+        port: "{{ db_port }}"
+        service_name: "{{ db_service }}"
+        user: "{{ db_user }}"
+        password: "{{ db_password }}"
+        mode: "{{ db_mode }}"
+        schema: "{{ schema_name }}"
+        state: absent
+      when: action == 'drop'
+      register: drop_result
+
+    - name: Display drop result
+      ansible.builtin.debug:
+        msg: "User {{ schema_name }} dropped successfully"
+      when: 
+        - action == 'drop'
+        - drop_result.changed | default(false)

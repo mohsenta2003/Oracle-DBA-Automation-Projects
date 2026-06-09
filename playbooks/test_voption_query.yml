@@ -1,0 +1,207 @@
+---
+- name: Diagnostic tests for voption query logic
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: no
+  vars_files:
+    - ../vars/repo_config.yml
+  vars:
+    _test_run_ids: "81,101,121"
+  
+  tasks:
+    - name: "TEST 1 - Count total voption rows with IS_EE_EXTRA=Y"
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING ON FEEDBACK ON PAGESIZE 50 LINESIZE 120
+          SELECT COUNT(*) as total_ee_extra_rows
+          FROM {{ repo_schema }}.ORACLE_OPT_VOPTION
+          WHERE is_ee_extra = 'Y';
+          EXIT;
+          EOSQL
+      register: test1
+      changed_when: false
+      become: false
+
+    - debug: msg="{{ test1.stdout_lines }}"
+
+    - name: "TEST 2 - Count voption rows in our RUN_IDs"
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING ON FEEDBACK ON PAGESIZE 50 LINESIZE 120
+          SELECT run_id, COUNT(*) as row_count
+          FROM {{ repo_schema }}.ORACLE_OPT_VOPTION
+          WHERE is_ee_extra = 'Y'
+          AND run_id IN ({{ _test_run_ids }})
+          GROUP BY run_id
+          ORDER BY run_id;
+          EXIT;
+          EOSQL
+      register: test2
+      changed_when: false
+      become: false
+
+    - debug: msg="{{ test2.stdout_lines }}"
+
+    - name: "TEST 3 - Check host_latest_run CTE results"
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING ON FEEDBACK ON PAGESIZE 50 LINESIZE 120
+          WITH host_latest_run AS (
+            SELECT i.hostname, MAX(i.run_id) AS run_id
+            FROM {{ repo_schema }}.ORACLE_OPT_INSTANCES i
+            WHERE i.run_id IN ({{ _test_run_ids }})
+            GROUP BY i.hostname
+          )
+          SELECT COUNT(DISTINCT hostname) as unique_hosts,
+                 COUNT(*) as total_rows,
+                 MIN(run_id) as min_run_id,
+                 MAX(run_id) as max_run_id
+          FROM host_latest_run;
+          EXIT;
+          EOSQL
+      register: test3
+      changed_when: false
+      become: false
+
+    - debug: msg="{{ test3.stdout_lines }}"
+
+    - name: "TEST 4 - Try simple JOIN voption + host_latest_run"
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING ON FEEDBACK ON PAGESIZE 50 LINESIZE 120
+          WITH host_latest_run AS (
+            SELECT i.hostname, MAX(i.run_id) AS run_id
+            FROM {{ repo_schema }}.ORACLE_OPT_INSTANCES i
+            WHERE i.run_id IN ({{ _test_run_ids }})
+            GROUP BY i.hostname
+          )
+          SELECT COUNT(*) as rows_after_join
+          FROM {{ repo_schema }}.ORACLE_OPT_VOPTION v
+          JOIN host_latest_run hlr ON hlr.hostname = v.hostname AND hlr.run_id = v.run_id
+          WHERE v.is_ee_extra = 'Y';
+          EXIT;
+          EOSQL
+      register: test4
+      changed_when: false
+      become: false
+
+    - debug: msg="{{ test4.stdout_lines }}"
+
+    - name: "TEST 5 - Sample voption data (first 5 rows)"
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING ON FEEDBACK ON PAGESIZE 50 LINESIZE 180
+          SELECT run_id, hostname, sid, option_name, option_enabled, is_inuse, is_ee_extra
+          FROM {{ repo_schema }}.ORACLE_OPT_VOPTION
+          WHERE is_ee_extra = 'Y'
+          AND run_id IN ({{ _test_run_ids }})
+          AND ROWNUM <= 5
+          ORDER BY run_id, hostname, option_name;
+          EXIT;
+          EOSQL
+      register: test5
+      changed_when: false
+      become: false
+
+    - debug: msg="{{ test5.stdout_lines }}"
+
+    - name: "TEST 6 - Sample instances data (first 5 rows)"
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING ON FEEDBACK ON PAGESIZE 50 LINESIZE 180
+          SELECT run_id, hostname, sid, os_type, region
+          FROM {{ repo_schema }}.ORACLE_OPT_INSTANCES
+          WHERE run_id IN ({{ _test_run_ids }})
+          AND ROWNUM <= 5
+          ORDER BY run_id, hostname;
+          EXIT;
+          EOSQL
+      register: test6
+      changed_when: false
+      become: false
+
+    - debug: msg="{{ test6.stdout_lines }}"
+
+    - name: "TEST 7 - Check if hostname/sid pairs match between tables"
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING ON FEEDBACK ON PAGESIZE 50 LINESIZE 180
+          SELECT 
+            'VOPTION' as source,
+            COUNT(DISTINCT hostname || '-' || sid) as unique_host_sid_pairs
+          FROM {{ repo_schema }}.ORACLE_OPT_VOPTION
+          WHERE is_ee_extra = 'Y' AND run_id IN ({{ _test_run_ids }})
+          UNION ALL
+          SELECT 
+            'INSTANCES' as source,
+            COUNT(DISTINCT hostname || '-' || sid) as unique_host_sid_pairs
+          FROM {{ repo_schema }}.ORACLE_OPT_INSTANCES
+          WHERE run_id IN ({{ _test_run_ids }});
+          EXIT;
+          EOSQL
+      register: test7
+      changed_when: false
+      become: false
+
+    - debug: msg="{{ test7.stdout_lines }}"
+
+    - name: "TEST 8 - Full query with voption_with_instance CTE"
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING ON FEEDBACK ON PAGESIZE 50 LINESIZE 120
+          WITH host_latest_run AS (
+            SELECT i.hostname, MAX(i.run_id) AS run_id
+            FROM {{ repo_schema }}.ORACLE_OPT_INSTANCES i
+            WHERE i.run_id IN ({{ _test_run_ids }})
+            GROUP BY i.hostname
+          ),
+          voption_with_instance AS (
+            SELECT 
+              v.option_name,
+              v.hostname,
+              v.sid,
+              v.option_enabled,
+              v.is_inuse
+            FROM {{ repo_schema }}.ORACLE_OPT_VOPTION v
+            JOIN host_latest_run hlr ON hlr.hostname = v.hostname AND hlr.run_id = v.run_id
+            JOIN {{ repo_schema }}.ORACLE_OPT_INSTANCES i ON i.hostname = hlr.hostname AND i.run_id = hlr.run_id AND i.sid = v.sid
+            WHERE v.is_ee_extra = 'Y'
+          )
+          SELECT COUNT(*) as final_row_count
+          FROM voption_with_instance;
+          EXIT;
+          EOSQL
+      register: test8
+      changed_when: false
+      become: false
+
+    - debug: msg="{{ test8.stdout_lines }}"
+
+    - name: "=== SUMMARY ==="
+      debug:
+        msg:
+          - "TEST 1: Total EE extra rows in VOPTION table"
+          - "TEST 2: EE extra rows by RUN_ID (81,101,121)"
+          - "TEST 3: host_latest_run CTE output stats"
+          - "TEST 4: Rows after simple JOIN (voption + host_latest_run)"
+          - "TEST 5: Sample voption data"
+          - "TEST 6: Sample instances data"
+          - "TEST 7: Count of unique hostname-SID pairs in both tables"
+          - "TEST 8: Final row count with voption_with_instance CTE"

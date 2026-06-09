@@ -1,0 +1,200 @@
+---
+# ═══════════════════════════════════════════════════════════════════════════
+# Validate Repository Schema
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Purpose: Verify that the central repository schema is properly configured
+#          before running data collection playbooks.
+#
+# Usage:
+#   ansible-playbook playbooks/_validate_repo.yml -i "localhost," -c local
+#   ansible-playbook playbooks/_validate_repo.yml -i "localhost," -c local -e "repo_tns_alias=d1hub"
+#
+# What it checks:
+#   1. Database connectivity
+#   2. All 11 ORACLE_OPT_* tables exist
+#   3. Required columns (IS_EE_EXTRA, IS_INUSE)
+#   4. Sequences and indexes are present
+#   5. Views are created
+#
+# ═══════════════════════════════════════════════════════════════════════════
+
+- name: Validate Oracle Options Audit Repository
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/repo_config.yml
+
+  tasks:
+    # ──────────────────────────────────────────────────────────────────────
+    # Step 1: Test Connection
+    # ──────────────────────────────────────────────────────────────────────
+    - name: Test repository database connection
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          SELECT 'REPO_ONLINE' FROM DUAL;
+          EXIT;
+          EOSQL
+      register: _conn_test
+      changed_when: false
+      failed_when: "'REPO_ONLINE' not in _conn_test.stdout"
+
+    - name: Display connection status
+      ansible.builtin.debug:
+        msg: "✓ Repository connection SUCCESSFUL: {{ repo_user }}@{{ _conn_string }}"
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Step 2: Validate Schema Objects
+    # ──────────────────────────────────────────────────────────────────────
+    - name: Validate schema structure
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          
+          -- Check table count
+          SELECT 'TABLES:' || COUNT(*) 
+          FROM user_tables 
+          WHERE table_name LIKE 'ORACLE_OPT%';
+          
+          -- Check indexes
+          SELECT 'INDEXES:' || COUNT(*) 
+          FROM user_indexes 
+          WHERE table_name LIKE 'ORACLE_OPT%';
+          
+          -- Check sequences
+          SELECT 'SEQUENCES:' || COUNT(*) 
+          FROM user_sequences 
+          WHERE sequence_name LIKE 'ORACLE_OPT%';
+          
+          -- Check views
+          SELECT 'VIEWS:' || COUNT(*) 
+          FROM user_views 
+          WHERE view_name LIKE 'ORACLE_OPT%';
+          
+          -- Check required columns in ORACLE_OPT_VOPTION
+          SELECT 'IS_EE_EXTRA:' || 
+                 CASE WHEN COUNT(*) > 0 THEN 'YES' ELSE 'NO' END
+          FROM user_tab_columns
+          WHERE table_name = 'ORACLE_OPT_VOPTION' 
+            AND column_name = 'IS_EE_EXTRA';
+          
+          SELECT 'IS_INUSE:' || 
+                 CASE WHEN COUNT(*) > 0 THEN 'YES' ELSE 'NO' END
+          FROM user_tab_columns
+          WHERE table_name = 'ORACLE_OPT_VOPTION' 
+            AND column_name = 'IS_INUSE';
+          
+          EXIT;
+          EOSQL
+      register: _schema_check
+      changed_when: false
+
+    - name: Parse schema validation results
+      ansible.builtin.set_fact:
+        _table_count:    "{{ _schema_check.stdout_lines | select('match', '^TABLES:') | first | regex_replace('TABLES:', '') | trim | int }}"
+        _index_count:    "{{ _schema_check.stdout_lines | select('match', '^INDEXES:') | first | regex_replace('INDEXES:', '') | trim | int }}"
+        _sequence_count: "{{ _schema_check.stdout_lines | select('match', '^SEQUENCES:') | first | regex_replace('SEQUENCES:', '') | trim | int }}"
+        _view_count:     "{{ _schema_check.stdout_lines | select('match', '^VIEWS:') | first | regex_replace('VIEWS:', '') | trim | int }}"
+        _has_ee_extra:   "{{ _schema_check.stdout_lines | select('match', '^IS_EE_EXTRA:YES') | list | length > 0 }}"
+        _has_inuse:      "{{ _schema_check.stdout_lines | select('match', '^IS_INUSE:YES') | list | length > 0 }}"
+
+    - name: Display validation results
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════════════
+          Repository Schema Validation Summary
+          ════════════════════════════════════════════════════════════════
+          Database:          {{ repo_sid | upper }} ({{ repo_host }}:{{ repo_port }})
+          Schema:            {{ repo_schema }}
+          Connection:        {{ _conn_string }}
+          
+          Object Counts:
+            Tables:          {{ _table_count }} (expected: 11)
+            Indexes:         {{ _index_count }} (expected: 23)
+            Sequences:       {{ _sequence_count }} (expected: 11)
+            Views:           {{ _view_count }} (expected: 5)
+          
+          Required Columns:
+            IS_EE_EXTRA:     {{ '✓ Present' if _has_ee_extra else '✗ MISSING' }}
+            IS_INUSE:        {{ '✓ Present' if _has_inuse else '✗ MISSING' }}
+          ════════════════════════════════════════════════════════════════
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Step 3: Validate Expected Table Count
+    # ──────────────────────────────────────────────────────────────────────
+    - name: Fail if tables are missing
+      ansible.builtin.fail:
+        msg: |
+          ✗ VALIDATION FAILED: Expected 11 ORACLE_OPT_* tables, found {{ _table_count }}
+          
+          Run the setup playbook to create tables:
+            ansible-playbook playbooks/_setup_audit_tables.yml -i "localhost," -c local -e "repo_tns_alias={{ repo_tns_alias }}"
+      when: _table_count | int != 11
+
+    - name: Fail if required columns are missing
+      ansible.builtin.fail:
+        msg: |
+          ✗ VALIDATION FAILED: Required columns missing in ORACLE_OPT_VOPTION
+          IS_EE_EXTRA: {{ 'YES' if _has_ee_extra else 'NO' }}
+          IS_INUSE:    {{ 'YES' if _has_inuse else 'NO' }}
+          
+          Run the setup playbook to add missing columns:
+            ansible-playbook playbooks/_setup_audit_tables.yml -i "localhost," -c local -e "repo_tns_alias={{ repo_tns_alias }}"
+      when: not (_has_ee_extra | bool and _has_inuse | bool)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Step 4: Check Current Data
+    # ──────────────────────────────────────────────────────────────────────
+    - name: Query current row counts
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          SELECT COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_RUNS;
+          EXIT;
+          EOSQL
+      register: _run_count
+      changed_when: false
+
+    - name: Display data status
+      ansible.builtin.debug:
+        msg: |
+          ════════════════════════════════════════════════════════════════
+          Current Data Status
+          ════════════════════════════════════════════════════════════════
+          Total Runs:        {{ _run_count.stdout | trim }}
+          
+          {% if _run_count.stdout | trim | int == 0 %}
+          ⚠ Repository is empty (no data collected yet)
+          
+          To collect data:
+            ansible-playbook playbooks/collect_oracle_options.yml \
+              -i ansibleInventory/inv_key.yml \
+              -e "repo_tns_alias={{ repo_tns_alias }} run_label=Initial-Run"
+          {% else %}
+          ✓ Repository contains historical data
+          
+          To view latest run:
+            sqlplus {{ repo_user }}/***@{{ _conn_string }} << EOF
+            SELECT run_id, run_date, run_label, total_instances
+            FROM {{ repo_schema }}.ORACLE_OPT_RUNS
+            ORDER BY run_date DESC
+            FETCH FIRST 5 ROWS ONLY;
+            EOF
+          {% endif %}
+          ════════════════════════════════════════════════════════════════
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Final Status
+    # ──────────────────────────────────────────────────────────────────────
+    - name: Validation successful
+      ansible.builtin.debug:
+        msg: "✓✓✓ REPOSITORY VALIDATION PASSED ✓✓✓"

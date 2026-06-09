@@ -1,0 +1,3 @@
+---
+# vars file for oracle_backup
+report_timestamp: "{{ ansible_date_time.date | replace('-', '') }}"

@@ -1,0 +1,283 @@
+---
+# Compliance check for a single instance
+# Called from main.yml with loop_var: current_sid
+
+  - name: "{{ current_sid }} - Get ORACLE_HOME"
+    ansible.builtin.set_fact:
+      _current_oracle_home: "{{ _oratab_map[current_sid] | default(_oratab_map.values() | first) }}"
+
+  - name: "{{ current_sid }} - Display instance info"
+    ansible.builtin.debug:
+      msg: "Checking compliance for: {{ current_sid }} | ORACLE_HOME: {{ _current_oracle_home }}"
+
+  # ============================================
+  # Password Policy Check
+  # ============================================
+  - name: "{{ current_sid }} - Check password policies"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export ORACLE_SID={{ current_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 200
+        SET PAGESIZE 100
+        SET HEADING ON
+        SET FEEDBACK OFF
+        COL profile FORMAT A25
+        COL resource_name FORMAT A30
+        COL limit FORMAT A20
+        SELECT profile, resource_name, limit 
+        FROM dba_profiles 
+        WHERE resource_type = 'PASSWORD'
+        ORDER BY profile, resource_name;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: password_policies
+    failed_when: false
+
+  # ============================================
+  # Audit Configuration Check
+  # ============================================
+  - name: "{{ current_sid }} - Check audit configuration"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export ORACLE_SID={{ current_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 200
+        SET PAGESIZE 100
+        SET HEADING ON
+        SET FEEDBACK OFF
+        COL name FORMAT A40
+        COL value FORMAT A40
+        SELECT name, value FROM v$parameter 
+        WHERE name LIKE '%audit%'
+        ORDER BY name;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: audit_config
+    failed_when: false
+
+  # ============================================
+  # Privileged Users Check
+  # ============================================
+  - name: "{{ current_sid }} - Check privileged users"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export ORACLE_SID={{ current_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 200
+        SET PAGESIZE 100
+        SET HEADING ON
+        SET FEEDBACK OFF
+        COL grantee FORMAT A30
+        COL granted_role FORMAT A30
+        SELECT grantee, granted_role 
+        FROM dba_role_privs 
+        WHERE granted_role IN ('DBA','SYSDBA','SYSOPER')
+        AND grantee NOT IN ('SYS','SYSTEM')
+        ORDER BY grantee;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: privileged_users
+    failed_when: false
+
+  # ============================================
+  # Default Password Check
+  # ============================================
+  - name: "{{ current_sid }} - Check for default passwords"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export ORACLE_SID={{ current_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 200
+        SET PAGESIZE 100
+        SET HEADING ON
+        SET FEEDBACK OFF
+        COL username FORMAT A30
+        COL account_status FORMAT A20
+        SELECT username, account_status
+        FROM dba_users_with_defpwd
+        WHERE username NOT LIKE '%$%';
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: default_passwords
+    failed_when: false
+
+  # ============================================
+  # Security Parameters Check
+  # ============================================
+  - name: "{{ current_sid }} - Check security parameters"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export ORACLE_SID={{ current_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 200
+        SET PAGESIZE 100
+        SET HEADING ON
+        SET FEEDBACK OFF
+        COL name FORMAT A40
+        COL value FORMAT A30
+        SELECT name, value FROM v$parameter 
+        WHERE name IN (
+          'remote_login_passwordfile',
+          'sec_case_sensitive_logon',
+          'sec_max_failed_login_attempts',
+          'sec_protocol_error_trace_action',
+          'sql92_security',
+          'o7_dictionary_accessibility'
+        )
+        ORDER BY name;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: security_params
+    failed_when: false
+
+  # ============================================
+  # PUBLIC Privileges Check
+  # ============================================
+  - name: "{{ current_sid }} - Check PUBLIC privileges"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ _current_oracle_home }}
+        export ORACLE_SID={{ current_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba << 'EOSQL'
+        SET LINESIZE 200
+        SET PAGESIZE 100
+        SET HEADING ON
+        SET FEEDBACK OFF
+        COL privilege FORMAT A30
+        COL table_name FORMAT A40
+        SELECT privilege, table_name 
+        FROM dba_tab_privs 
+        WHERE grantee = 'PUBLIC'
+        AND privilege IN ('EXECUTE','DELETE','INSERT','UPDATE')
+        AND table_name IN ('UTL_FILE','UTL_TCP','UTL_HTTP','UTL_SMTP','DBMS_LOB','DBMS_SYS_SQL')
+        ORDER BY table_name;
+        EXIT;
+        EOSQL
+    become: yes
+    become_user: "{{ _oracle_user }}"
+    register: public_privs
+    failed_when: false
+
+  # ============================================
+  # Save Compliance Report
+  # ============================================
+  - name: "{{ current_sid }} - Save compliance report"
+    ansible.builtin.copy:
+      content: |
+        ================================================================================
+                         ORACLE COMPLIANCE AUDIT REPORT
+        ================================================================================
+        Host:        {{ inventory_hostname }}
+        Database:    {{ current_sid }}
+        Oracle User: {{ _oracle_user }}
+        ORACLE_HOME: {{ _current_oracle_home }}
+        Generated:   {{ ansible_date_time.iso8601 }}
+        ================================================================================
+        
+        
+        ================================================================================
+        1. PASSWORD POLICIES
+        ================================================================================
+        {{ password_policies.stdout | default('No data available') }}
+        
+        
+        ================================================================================
+        2. AUDIT CONFIGURATION
+        ================================================================================
+        {{ audit_config.stdout | default('No data available') }}
+        
+        RECOMMENDED:
+        - audit_trail should be DB, XML, or OS
+        - unified_audit should be TRUE for 12c+
+        
+        
+        ================================================================================
+        3. PRIVILEGED USERS (Non-SYS/SYSTEM with DBA role)
+        ================================================================================
+        {% if privileged_users.stdout | default('') | trim == '' or 'no rows selected' in privileged_users.stdout | lower %}
+        ✅ No non-system users with DBA privileges
+        {% else %}
+        ⚠️  REVIEW REQUIRED:
+        {{ privileged_users.stdout }}
+        {% endif %}
+        
+        
+        ================================================================================
+        4. DEFAULT PASSWORDS
+        ================================================================================
+        {% if default_passwords.stdout | default('') | trim == '' or 'no rows selected' in default_passwords.stdout | lower %}
+        ✅ No accounts with default passwords detected
+        {% else %}
+        ⚠️  SECURITY RISK - Accounts with default passwords:
+        {{ default_passwords.stdout }}
+        {% endif %}
+        
+        
+        ================================================================================
+        5. SECURITY PARAMETERS
+        ================================================================================
+        {{ security_params.stdout | default('No data available') }}
+        
+        RECOMMENDATIONS:
+        - remote_login_passwordfile = EXCLUSIVE
+        - sec_case_sensitive_logon = TRUE
+        - sql92_security = TRUE
+        - o7_dictionary_accessibility = FALSE
+        
+        
+        ================================================================================
+        6. PUBLIC EXECUTE PRIVILEGES (Sensitive Packages)
+        ================================================================================
+        {% if public_privs.stdout | default('') | trim == '' or 'no rows selected' in public_privs.stdout | lower %}
+        ✅ No risky PUBLIC privileges on sensitive packages
+        {% else %}
+        ⚠️  REVIEW - PUBLIC has access to sensitive packages:
+        {{ public_privs.stdout }}
+        {% endif %}
+        
+        
+        ================================================================================
+                                    END OF REPORT
+        ================================================================================
+      dest: "{{ _local_report_dir }}/compliance_{{ current_sid }}.txt"
+    delegate_to: localhost
+    become: no
+
+  - name: "{{ current_sid }} - Display compliance summary"
+    ansible.builtin.debug:
+      msg: |
+        
+        -------- {{ current_sid }} COMPLIANCE --------
+        {% if default_passwords.stdout | default('') | trim != '' and 'no rows selected' not in default_passwords.stdout | lower %}
+        ⚠️  Default Passwords: FOUND
+        {% else %}
+        ✅ Default Passwords: None
+        {% endif %}
+        {% if privileged_users.stdout | default('') | trim != '' and 'no rows selected' not in privileged_users.stdout | lower %}
+        ⚠️  Non-SYS DBA Users: FOUND
+        {% else %}
+        ✅ Non-SYS DBA Users: None
+        {% endif %}
+        📄 Report: compliance_{{ current_sid }}.txt

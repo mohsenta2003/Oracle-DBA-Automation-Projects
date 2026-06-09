@@ -1,0 +1,20 @@
+---
+# defaults file for roles/oracle_monitor
+
+# Oracle environment - can be overridden at playbook/inventory level
+# If not set, will be auto-detected from oracle user environment
+oracle_home: ""
+oracle_base: ""
+
+# Oracle OS user and group - leave empty to auto-detect from running PMON process
+# This supports AD users or any custom oracle owner
+oracle_user: ""
+oracle_group: ""
+
+# Local report directory on control machine (relative to playbook location)
+# Reports will be saved to: {{ local_report_dir }}/{{ report_timestamp }}/{{ inventory_hostname }}/
+# Uses playbook_dir to ensure reports stay inside the project folder
+local_report_dir: "{{ playbook_dir }}/../reports"
+
+# Generate combined report file (all hosts in one file)
+generate_combined_report: true

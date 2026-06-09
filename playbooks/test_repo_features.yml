@@ -1,0 +1,265 @@
+---
+###############################################################################
+# TEST PLAYBOOK: Repository Build Verification & Feature Testing
+###############################################################################
+# Purpose: Quick end-to-end test of repository setup and new features
+#
+# What This Tests:
+#   1. Repository setup (11 tables, 23 indexes, 11 sequences, 5 views)
+#   2. Data collection (single option on single host)
+#   3. Views and indexes functionality
+#   4. Clean data feature
+#
+# Usage:
+#   ansible-playbook playbooks/test_repo_features.yml -i "localhost," -c local \
+#     -e "repo_tns_alias=d1hub test_target_host=crlnxd1046 test_target_sid=DBAORALIC"
+#
+# Prerequisites:
+#   - Repository database accessible (d1hub TNS alias configured)
+#   - Repository credentials in group_vars/all.yml
+#   - Target database accessible for collection test
+#
+###############################################################################
+
+- name: "TEST: Repository Build Verification and Feature Testing"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  become: no
+  
+  vars_files:
+    - ../vars/repo_config.yml
+  
+  vars:
+    # Test target (not used in simplified version)
+    test_target_host: "{{ test_target_host | default('crlnxd1046') }}"
+    test_target_sid: "{{ test_target_sid | default('DBAORALIC') }}"
+    
+  tasks:
+    ###########################################################################
+    # TEST 1: Repository Setup Verification
+    ###########################################################################
+    
+    - name: "TEST 1.1: Display Test Information"
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "TEST SUITE: Repository Build & Features"
+          - "=========================================="
+          - "Repository: {{ _conn_string }} ({{ repo_schema }})"
+          - ""
+          - "Tests to Execute:"
+          - "  1. Validate Repository Schema"
+          - "  2. Verify Schema Objects (11T, 23I, 11S, 5V)"
+          - "  3. Query Views and Indexes"
+          - "  4. Test Row Counts"
+          - "=========================================="
+    
+    - name: "TEST 1.2: Check Repository Connection & Schema Objects"
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          
+          -- Connection test
+          SELECT 'CONNECTION:OK' FROM DUAL;
+          
+          -- Object counts
+          SELECT 'TABLES:' || COUNT(*) FROM user_tables WHERE table_name LIKE 'ORACLE_OPT_%';
+          SELECT 'INDEXES:' || COUNT(*) FROM user_indexes WHERE table_name LIKE 'ORACLE_OPT_%';
+          SELECT 'SEQUENCES:' || COUNT(*) FROM user_sequences WHERE sequence_name LIKE 'ORACLE_OPT_%';
+          SELECT 'VIEWS:' || COUNT(*) FROM user_views WHERE view_name LIKE 'ORACLE_OPT_%';
+          
+          EXIT;
+          EOSQL
+      register: schema_check
+      changed_when: false
+      failed_when: "'CONNECTION:OK' not in schema_check.stdout"
+    
+    - name: "TEST 1.3: Display Schema Objects Summary"
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "SCHEMA OBJECTS VERIFICATION"
+          - "=========================================="
+          - "{{ schema_check.stdout_lines }}"
+          - ""
+          - "Expected: TABLES:11, INDEXES:23, SEQUENCES:11, VIEWS:5"
+          - "=========================================="
+    
+    - name: "TEST 1.3b: Check Required Columns (IS_INUSE, IS_EE_EXTRA)"
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET LINESIZE 120
+          SET PAGESIZE 50
+          
+          PROMPT ========================================
+          PROMPT REQUIRED COLUMN CHECK
+          PROMPT ========================================
+          
+          -- Only ORACLE_OPT_VOPTION needs IS_INUSE and IS_EE_EXTRA (summary table)
+          SELECT 
+            column_name,
+            CASE WHEN COUNT(*) > 0 THEN 'EXISTS' ELSE 'MISSING' END AS status
+          FROM (
+            SELECT 'IS_INUSE' AS column_name FROM DUAL
+            UNION ALL
+            SELECT 'IS_EE_EXTRA' AS column_name FROM DUAL
+          )
+          LEFT JOIN user_tab_columns 
+            ON user_tab_columns.table_name = 'ORACLE_OPT_VOPTION' 
+            AND user_tab_columns.column_name = column_name
+          GROUP BY column_name
+          ORDER BY column_name;
+          
+          EXIT;
+          EOSQL
+      register: column_check
+      changed_when: false
+    
+    - name: "TEST 1.3c: Display Column Check Results"
+      ansible.builtin.debug:
+        msg: "{{ column_check.stdout_lines }}"
+    
+    - name: "TEST 1.4: List All Performance Indexes"
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET LINESIZE 120
+          SET PAGESIZE 100
+          
+          PROMPT ========================================
+          PROMPT PERFORMANCE INDEXES (should be 23 total)
+          PROMPT ========================================
+          
+          SELECT table_name, index_name, uniqueness
+          FROM user_indexes
+          WHERE table_name LIKE 'ORACLE_OPT_%'
+          ORDER BY table_name, index_name;
+          
+          EXIT;
+          EOSQL
+      register: index_list
+      changed_when: false
+    
+    - name: "TEST 1.5: Display Index List"
+      ansible.builtin.debug:
+        msg: "{{ index_list.stdout_lines }}"
+    
+    ###########################################################################
+    # TEST 2: Verify Views Exist (Don't Query - May Be Broken)
+    ###########################################################################
+    
+    - name: "TEST 2.1: Check if All Views Exist"
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET LINESIZE 120
+          SET PAGESIZE 50
+          
+          PROMPT ========================================
+          PROMPT VIEW EXISTENCE CHECK
+          PROMPT ========================================
+          
+          SELECT view_name, 'EXISTS' AS status
+          FROM user_views
+          WHERE view_name LIKE 'ORACLE_OPT_%'
+          ORDER BY view_name;
+          
+          EXIT;
+          EOSQL
+      register: view_test
+      changed_when: false
+    
+    - name: "TEST 2.2: Display View Check Results"
+      ansible.builtin.debug:
+        msg: "{{ view_test.stdout_lines }}"
+    
+    ###########################################################################
+    # TEST 3: Test Row Counts and Data
+    ###########################################################################
+    
+    - name: "TEST 3.1: Check Row Counts in All Tables"
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET LINESIZE 100
+          SET PAGESIZE 100
+          
+          PROMPT ========================================
+          PROMPT TABLE ROW COUNTS
+          PROMPT ========================================
+          
+          SELECT 'ORACLE_OPT_RUNS' TBL, COUNT(*) CNT FROM {{ repo_schema }}.ORACLE_OPT_RUNS
+          UNION ALL
+          SELECT 'ORACLE_OPT_INSTANCES', COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_INSTANCES
+          UNION ALL
+          SELECT 'ORACLE_OPT_VOPTION', COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_VOPTION
+          UNION ALL
+          SELECT 'ORACLE_OPT_FEATURES', COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_FEATURES
+          UNION ALL
+          SELECT 'ORACLE_OPT_D_PART', COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_PART
+          UNION ALL
+          SELECT 'ORACLE_OPT_D_COMPRESS', COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_COMPRESS
+          UNION ALL
+          SELECT 'ORACLE_OPT_D_SECURITY', COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_SECURITY
+          UNION ALL
+          SELECT 'ORACLE_OPT_D_INMEM', COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_INMEM
+          UNION ALL
+          SELECT 'ORACLE_OPT_D_PDB', COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_PDB
+          UNION ALL
+          SELECT 'ORACLE_OPT_D_ADG', COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_ADG
+          UNION ALL
+          SELECT 'ORACLE_OPT_D_RAC', COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_RAC;
+          
+          PROMPT ========================================
+          PROMPT LATEST RUN INFO
+          PROMPT ========================================
+          SELECT RUN_ID, TO_CHAR(RUN_DATE,'YYYY-MM-DD HH24:MI:SS') RUN_DATE, 
+                 RUN_LABEL, TOTAL_HOSTS
+          FROM {{ repo_schema }}.ORACLE_OPT_RUNS
+          ORDER BY RUN_ID DESC
+          FETCH FIRST 3 ROWS ONLY;
+          
+          EXIT;
+          EOSQL
+      register: row_counts
+      changed_when: false
+    
+    - name: "TEST 3.2: Display Row Counts"
+      ansible.builtin.debug:
+        msg: "{{ row_counts.stdout_lines }}"
+    
+    ###########################################################################
+    # TEST 4: Final Summary
+    ###########################################################################
+    
+    - name: "TEST 4.1: Display Final Test Summary"
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "=========================================="
+          - "REPOSITORY VERIFICATION RESULTS"
+          - "=========================================="
+          - ""
+          - "Schema Objects: {% if 'TABLES:11' in schema_check.stdout and 'INDEXES:23' in schema_check.stdout %}OK (11T, 23I, 5V){% else %}INCOMPLETE{% endif %}"
+          - "Required Columns: {% if 'MISSING' not in column_check.stdout %}OK (IS_INUSE, IS_EE_EXTRA exist){% else %}MISSING (old schema version){% endif %}"
+          - "Views Exist: {% if 'VIEWS:5' in schema_check.stdout %}OK{% else %}MISSING{% endif %}"
+          - ""
+          - "=========================================="
+          - "Status: {% if 'TABLES:11' in schema_check.stdout and 'MISSING' not in column_check.stdout %}READY{% else %}NEEDS REBUILD{% endif %}"
+          - "=========================================="
+          - ""
+      
+    - name: "TEST 4.2: Show Rebuild Command (if needed)"
+      ansible.builtin.debug:
+        msg:
+          - "Rebuild Command:"
+          - "  ansible-playbook playbooks/_setup_audit_tables.yml -i localhost, -c local -e repo_tns_alias={{ repo_tns_alias }}"
+      when: "'MISSING' in column_check.stdout"

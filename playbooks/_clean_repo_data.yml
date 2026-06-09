@@ -1,0 +1,288 @@
+---
+# playbooks/_clean_repo_data.yml
+#
+# Clean all data from the repository (truncate tables + reset sequences).
+# Does NOT drop or recreate schema objects — only removes data.
+#
+# Use this to start fresh without rebuilding the entire schema structure.
+#
+# ── DEFAULT (d1hub repository) ────────────────────────────────────────────────
+#   ansible-playbook playbooks/_clean_repo_data.yml -i "localhost," -c local -e "repo_tns_alias=d1hub"
+#
+# ── CUSTOM DATABASE ───────────────────────────────────────────────────────────
+#   ansible-playbook playbooks/_clean_repo_data.yml -i "localhost," -c local \
+#     -e "repo_tns_alias=MYDB repo_user=AUDITUSER repo_password='MyPass' repo_schema=AUDITUSER"
+#
+# ── WITH CONFIRMATION ─────────────────────────────────────────────────────────
+#   ansible-playbook playbooks/_clean_repo_data.yml -i "localhost," -c local \
+#     -e "repo_tns_alias=d1hub confirm_clean=yes"
+#
+- hosts: localhost
+  gather_facts: no
+  
+  vars_files:
+    - ../vars/repo_config.yml
+  
+  vars:
+    confirm_clean:  "no"                  # Set to "yes" to skip confirmation prompt
+
+  tasks:
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 1 — Safety check: confirm operation
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Display repository connection info
+      ansible.builtin.debug:
+        msg: |
+          ⚠️  REPOSITORY DATA CLEAN OPERATION ⚠️
+          
+          This will TRUNCATE all data from:
+            Repository: {{ _repo_conn_string }}
+            Schema:     {{ repo_schema }}
+          
+          Tables to be cleaned:
+            - ORACLE_OPT_RUNS
+            - ORACLE_OPT_INSTANCES
+            - ORACLE_OPT_VOPTION
+            - ORACLE_OPT_FEATURES
+            - ORACLE_OPT_D_PART
+            - ORACLE_OPT_D_COMPRESS
+            - ORACLE_OPT_D_SECURITY
+            - ORACLE_OPT_D_INMEM
+            - ORACLE_OPT_D_PDB
+            - ORACLE_OPT_D_ADG
+            - ORACLE_OPT_D_RAC
+          
+          All sequences will be reset to 1.
+          Schema structure (tables, indexes, views) will NOT be dropped.
+
+    - name: Confirm clean operation
+      ansible.builtin.pause:
+        prompt: |
+          
+          ⚠️  Press ENTER to proceed with data clean, or CTRL+C then 'A' to abort
+      when: confirm_clean != "yes"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 2 — Test repository connection
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Test repository database connection
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          SELECT 'Connected to: ' || sys_context('USERENV','CURRENT_SCHEMA') || '@' || sys_context('USERENV','DB_NAME') FROM dual;
+          EXIT;
+          EOSQL
+      register: _conn_test
+      changed_when: false
+      failed_when: "'ORA-' in _conn_test.stdout or 'SP2-' in _conn_test.stdout"
+
+    - name: Display connection status
+      ansible.builtin.debug:
+        msg: "✓ Repository connection SUCCESSFUL: {{ _conn_test.stdout_lines[0] }}"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 3 — Get current row counts (before clean)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Count rows before clean
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          
+          SELECT 'RUNS:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_RUNS;
+          SELECT 'INSTANCES:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_INSTANCES;
+          SELECT 'VOPTION:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_VOPTION;
+          SELECT 'FEATURES:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_FEATURES;
+          SELECT 'D_PART:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_PART;
+          SELECT 'D_COMPRESS:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_COMPRESS;
+          SELECT 'D_SECURITY:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_SECURITY;
+          SELECT 'D_INMEM:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_INMEM;
+          SELECT 'D_PDB:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_PDB;
+          SELECT 'D_ADG:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_ADG;
+          SELECT 'D_RAC:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_RAC;
+          
+          EXIT;
+          EOSQL
+      register: _before_counts
+      changed_when: false
+      failed_when: "'ORA-' in _before_counts.stdout or 'SP2-' in _before_counts.stdout"
+
+    - name: Display row counts before clean
+      ansible.builtin.debug:
+        msg: |
+          📊 Current row counts BEFORE clean:
+          {{ _before_counts.stdout_lines | join('\n') }}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 4 — Truncate all tables
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Truncate all ORACLE_OPT_* tables
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 SERVEROUTPUT ON
+          
+          BEGIN
+            -- Truncate in reverse dependency order (child tables first)
+            EXECUTE IMMEDIATE 'TRUNCATE TABLE {{ repo_schema }}.ORACLE_OPT_D_RAC';
+            EXECUTE IMMEDIATE 'TRUNCATE TABLE {{ repo_schema }}.ORACLE_OPT_D_ADG';
+            EXECUTE IMMEDIATE 'TRUNCATE TABLE {{ repo_schema }}.ORACLE_OPT_D_PDB';
+            EXECUTE IMMEDIATE 'TRUNCATE TABLE {{ repo_schema }}.ORACLE_OPT_D_INMEM';
+            EXECUTE IMMEDIATE 'TRUNCATE TABLE {{ repo_schema }}.ORACLE_OPT_D_SECURITY';
+            EXECUTE IMMEDIATE 'TRUNCATE TABLE {{ repo_schema }}.ORACLE_OPT_D_COMPRESS';
+            EXECUTE IMMEDIATE 'TRUNCATE TABLE {{ repo_schema }}.ORACLE_OPT_D_PART';
+            EXECUTE IMMEDIATE 'TRUNCATE TABLE {{ repo_schema }}.ORACLE_OPT_FEATURES';
+            EXECUTE IMMEDIATE 'TRUNCATE TABLE {{ repo_schema }}.ORACLE_OPT_VOPTION';
+            EXECUTE IMMEDIATE 'TRUNCATE TABLE {{ repo_schema }}.ORACLE_OPT_INSTANCES';
+            EXECUTE IMMEDIATE 'TRUNCATE TABLE {{ repo_schema }}.ORACLE_OPT_RUNS';
+            
+            DBMS_OUTPUT.PUT_LINE('✓ All tables truncated successfully');
+          EXCEPTION
+            WHEN OTHERS THEN
+              DBMS_OUTPUT.PUT_LINE('✗ ERROR: ' || SQLERRM);
+              RAISE;
+          END;
+          /
+          
+          EXIT;
+          EOSQL
+      register: _truncate_result
+      changed_when: true
+      failed_when: "'ORA-' in _truncate_result.stdout or 'SP2-' in _truncate_result.stdout or '✗' in _truncate_result.stdout"
+
+    - name: Display truncate status
+      ansible.builtin.debug:
+        msg: "{{ _truncate_result.stdout_lines | select | list }}"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 5 — Reset sequences to 1
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Reset all sequences to 1
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 SERVEROUTPUT ON
+          
+          DECLARE
+            v_val NUMBER;
+          BEGIN
+            -- Reset each sequence by dropping and recreating
+            FOR seq IN (SELECT sequence_name 
+                        FROM user_sequences 
+                        WHERE sequence_name LIKE 'ORACLE_OPT_%_SEQ'
+                        ORDER BY sequence_name) 
+            LOOP
+              BEGIN
+                EXECUTE IMMEDIATE 'DROP SEQUENCE {{ repo_schema }}.' || seq.sequence_name;
+                EXECUTE IMMEDIATE 'CREATE SEQUENCE {{ repo_schema }}.' || seq.sequence_name || ' START WITH 1 INCREMENT BY 1 NOCACHE';
+                DBMS_OUTPUT.PUT_LINE('✓ Reset sequence: ' || seq.sequence_name);
+              EXCEPTION
+                WHEN OTHERS THEN
+                  DBMS_OUTPUT.PUT_LINE('✗ ERROR resetting ' || seq.sequence_name || ': ' || SQLERRM);
+              END;
+            END LOOP;
+            
+            DBMS_OUTPUT.PUT_LINE('✓ All sequences reset to 1');
+          END;
+          /
+          
+          EXIT;
+          EOSQL
+      register: _reset_seq_result
+      changed_when: true
+      failed_when: "'ORA-' in _reset_seq_result.stdout or 'SP2-' in _reset_seq_result.stdout"
+
+    - name: Display sequence reset status
+      ansible.builtin.debug:
+        msg: "{{ _reset_seq_result.stdout_lines | select | list }}"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 6 — Verify all tables are empty
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Verify row counts after clean
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          
+          SELECT 'RUNS:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_RUNS;
+          SELECT 'INSTANCES:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_INSTANCES;
+          SELECT 'VOPTION:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_VOPTION;
+          SELECT 'FEATURES:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_FEATURES;
+          SELECT 'D_PART:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_PART;
+          SELECT 'D_COMPRESS:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_COMPRESS;
+          SELECT 'D_SECURITY:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_SECURITY;
+          SELECT 'D_INMEM:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_INMEM;
+          SELECT 'D_PDB:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_PDB;
+          SELECT 'D_ADG:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_ADG;
+          SELECT 'D_RAC:' || COUNT(*) FROM {{ repo_schema }}.ORACLE_OPT_D_RAC;
+          
+          EXIT;
+          EOSQL
+      register: _after_counts
+      changed_when: false
+      failed_when: "'ORA-' in _after_counts.stdout or 'SP2-' in _after_counts.stdout"
+
+    - name: Display row counts after clean
+      ansible.builtin.debug:
+        msg: |
+          📊 Row counts AFTER clean (all should be 0):
+          {{ _after_counts.stdout_lines | join('\n') }}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 7 — Verify sequences reset
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Verify sequences are reset to 1
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          
+          SELECT sequence_name || ':' || last_number 
+          FROM user_sequences 
+          WHERE sequence_name LIKE 'ORACLE_OPT_%_SEQ'
+          ORDER BY sequence_name;
+          
+          EXIT;
+          EOSQL
+      register: _seq_check
+      changed_when: false
+      failed_when: "'ORA-' in _seq_check.stdout or 'SP2-' in _seq_check.stdout"
+
+    - name: Display sequence status
+      ansible.builtin.debug:
+        msg: |
+          🔢 Sequence status (should all show :1):
+          {{ _seq_check.stdout_lines | join('\n') }}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 8 — Final summary
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: Clean operation successful
+      ansible.builtin.debug:
+        msg: |
+          
+          ✓✓✓ REPOSITORY DATA CLEAN COMPLETED ✓✓✓
+          
+          Repository: {{ _repo_conn_string }}
+          Schema:     {{ repo_schema }}
+          
+          Summary:
+            ✓ All 11 tables truncated
+            ✓ All sequences reset to 1
+            ✓ Schema structure preserved (tables, indexes, views still exist)
+          
+          Next Steps:
+            1. Run data collection:
+               ansible-playbook playbooks/collect_oracle_options.yml -i ansibleInventory/inv_key.yml -e "repo_tns_alias={{ repo_tns_alias if repo_tns_alias else _repo_conn_string }}"
+            
+            2. Generate report:
+               ansible-playbook playbooks/report_audit_run.yml -i "localhost," -c local -e "repo_tns_alias={{ repo_tns_alias if repo_tns_alias else _repo_conn_string }}"

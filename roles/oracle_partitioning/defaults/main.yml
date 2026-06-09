@@ -1,0 +1,4 @@
+---
+# roles/oracle_partitioning/defaults/main.yml
+# oracle_user is auto-detected from PMON process
+# Override with -e 'oracle_user=myuser' if needed

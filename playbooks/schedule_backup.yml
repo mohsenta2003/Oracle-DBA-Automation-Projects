@@ -1,0 +1,49 @@
+---
+# ================================================================================
+# Oracle Backup Scheduling Playbook - MULTI-INSTANCE SUPPORT
+# ================================================================================
+#
+# This playbook generates and optionally creates cron-based RMAN backup schedules
+# for ALL database instances running on each target host.
+#
+# BASIC USAGE (dry-run - generates report only):
+#   ansible-playbook playbooks/schedule_backup.yml --limit us_lnx_test
+#   ansible-playbook playbooks/schedule_backup.yml --limit crlnxd2201
+#
+# SPECIFIC INSTANCE:
+#   ansible-playbook playbooks/schedule_backup.yml --limit crlnxd2201 -e "db_sid=ORCL1"
+#
+# APPLY SCHEDULE (creates scripts and cron jobs):
+#   ansible-playbook playbooks/schedule_backup.yml --limit crlnxd2201 \
+#     -e "apply_schedule=true"
+#
+# SCHEDULE OPTIONS:
+#   -e "backup_type=full"           # full, incremental, archivelog (default: full)
+#   -e "schedule_hour=22"           # Hour to run (default: 22 = 10 PM)
+#   -e "schedule_minute=0"          # Minute (default: 0)
+#   -e "schedule_day=*"             # Day of month (* = daily, default)
+#   -e "retention_days=7"           # Backup retention period (default: 7)
+#   -e "backup_dest=/u01/backup"    # Custom backup location
+#   -e "apply_schedule=true"        # Actually create cron (default: false)
+#
+# GENERATED CONTENT:
+#   - Complete RMAN backup script
+#   - Cron job entry
+#   - Existing cron jobs review
+#   - Manual execution commands
+#
+# AUTO-DETECTION:
+#   - Oracle user detected from PMON process owner
+#   - ORACLE_HOME/ORACLE_BASE resolved from /etc/oratab
+#   - All running instances processed automatically
+#
+# REPORTS:
+#   Saved to: reports/YYYY-MM-DD/hostname/schedule_<SID>.txt
+# ================================================================================
+
+- name: Schedule RMAN Backups
+  hosts: all
+  become: no
+  gather_facts: no
+  roles:
+    - backup_schedulePure

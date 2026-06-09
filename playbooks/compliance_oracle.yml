@@ -1,0 +1,38 @@
+---
+# ================================================================================
+# Oracle Compliance Check Playbook - MULTI-INSTANCE SUPPORT
+# ================================================================================
+#
+# This playbook automatically detects and audits ALL database instances
+# running on each target host for security compliance.
+#
+# BASIC USAGE:
+#   ansible-playbook playbooks/compliance_oracle.yml --limit us_lnx_test
+#   ansible-playbook playbooks/compliance_oracle.yml --limit crlnxd2201
+#
+# SPECIFIC INSTANCE:
+#   ansible-playbook playbooks/compliance_oracle.yml --limit crlnxd2201 -e "db_sid=ORCL1"
+#
+# COMPLIANCE CHECKS:
+#   - Password policy verification
+#   - Profile settings audit
+#   - Default password detection
+#   - User privilege review
+#   - Audit configuration
+#   - Security parameter settings
+#
+# AUTO-DETECTION:
+#   - Oracle user detected from PMON process owner
+#   - ORACLE_HOME resolved from /etc/oratab for each instance
+#   - All running instances processed automatically
+#
+# REPORTS:
+#   Saved to: reports/YYYY-MM-DD/hostname/compliance_<SID>.txt
+# ================================================================================
+
+- name: Oracle Compliance Checks
+  hosts: all
+  become: no
+  gather_facts: no
+  roles:
+    - oracle_compliance

@@ -1,0 +1,234 @@
+---
+# ================================================================================
+# Manage Services Instance Tasks - Called for each Oracle instance
+# ================================================================================
+
+- name: "{{ current_sid }} - Set instance ORACLE_HOME"
+  ansible.builtin.set_fact:
+    current_oracle_home: "{{ oracle_home_map[current_sid] | default(oracle_home_map.values() | list | first | default('/u01/app/oracle/product/19.0.0/dbhome_1')) }}"
+
+- name: "{{ current_sid }} - Set environment"
+  ansible.builtin.set_fact:
+    oracle_env:
+      ORACLE_HOME: "{{ current_oracle_home }}"
+      ORACLE_SID: "{{ current_sid }}"
+      LD_LIBRARY_PATH: "{{ current_oracle_home }}/lib"
+      PATH: "{{ current_oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+
+- name: "{{ current_sid }} - Set report timestamp"
+  ansible.builtin.set_fact:
+    report_timestamp: "{{ ansible_date_time.iso8601 }}"
+
+# ============================================
+# LIST - List all services
+# ============================================
+- name: "{{ current_sid }} - List all services from dba_services"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    SELECT RPAD(name, 30) || ' | Network: ' || RPAD(NVL(network_name, 'N/A'), 30) || ' | Goal: ' || NVL(goal, 'N/A')
+    FROM dba_services
+    ORDER BY name;
+    EXIT;
+    EOF
+  register: services_list
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'list'
+
+- name: "{{ current_sid }} - Get active services from v$services"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    SELECT RPAD(name, 30) || ' | Sessions: ' || 
+           (SELECT COUNT(*) FROM v\$session WHERE service_name = s.name)
+    FROM v\$services s
+    WHERE s.name NOT IN ('SYS\$BACKGROUND', 'SYS\$USERS')
+    ORDER BY name;
+    EXIT;
+    EOF
+  register: active_services
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'list'
+
+# ============================================
+# CREATE - Create new service
+# ============================================
+- name: "{{ current_sid }} - Create service"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    BEGIN
+      DBMS_SERVICE.CREATE_SERVICE(
+        service_name => '{{ service_name }}',
+        network_name => '{{ network_name | default(service_name) }}'
+      );
+    END;
+    /
+    EXIT;
+    EOF
+  register: create_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'create' and service_name != ''
+  failed_when: false
+
+# ============================================
+# START - Start service
+# ============================================
+- name: "{{ current_sid }} - Start service"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    BEGIN
+      DBMS_SERVICE.START_SERVICE('{{ service_name }}');
+    END;
+    /
+    EXIT;
+    EOF
+  register: start_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'start' and service_name != ''
+  failed_when: false
+
+# ============================================
+# STOP - Stop service
+# ============================================
+- name: "{{ current_sid }} - Stop service"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    BEGIN
+      DBMS_SERVICE.STOP_SERVICE('{{ service_name }}');
+    END;
+    /
+    EXIT;
+    EOF
+  register: stop_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'stop' and service_name != ''
+  failed_when: false
+
+# ============================================
+# DELETE - Delete service
+# ============================================
+- name: "{{ current_sid }} - Stop service before delete"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    BEGIN
+      DBMS_SERVICE.STOP_SERVICE('{{ service_name }}');
+    EXCEPTION WHEN OTHERS THEN NULL;
+    END;
+    /
+    EXIT;
+    EOF
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'delete' and service_name != ''
+  failed_when: false
+
+- name: "{{ current_sid }} - Delete service"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    BEGIN
+      DBMS_SERVICE.DELETE_SERVICE('{{ service_name }}');
+    END;
+    /
+    EXIT;
+    EOF
+  register: delete_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'delete' and service_name != ''
+  failed_when: false
+
+# ============================================
+# Build Service Report
+# ============================================
+- name: "{{ current_sid }} - Build service report"
+  ansible.builtin.set_fact:
+    service_report: |
+      ╔═══════════════════════════════════════════════════════════════════════════════════╗
+      ║                          SERVICE MANAGEMENT REPORT                                ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ Report Time: {{ report_timestamp }}
+      ║ Host:        {{ inventory_hostname }}
+      ║ Instance:    {{ current_sid }}
+      ║ ORACLE_HOME: {{ current_oracle_home }}
+      ║ Action:      {{ action | upper }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if action == 'list' %}
+      ║ ALL SERVICES (dba_services):                                                      ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ services_list.stdout | default('No services found') }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ ACTIVE SERVICES (v$services):                                                     ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ active_services.stdout | default('No active services') }}
+      {% elif action == 'create' %}
+      ║ CREATE SERVICE: {{ service_name }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if create_result is defined and create_result.rc == 0 %}
+      ║ ✅ Service {{ service_name }} created successfully
+      ║ Network Name: {{ network_name | default(service_name) }}
+      {% else %}
+      ║ ❌ Failed to create service
+      ║ {{ create_result.stdout | default('') }}
+      {% endif %}
+      {% elif action == 'start' %}
+      ║ START SERVICE: {{ service_name }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if start_result is defined and start_result.rc == 0 %}
+      ║ ✅ Service {{ service_name }} started successfully
+      {% else %}
+      ║ ❌ Failed to start service
+      ║ {{ start_result.stdout | default('') }}
+      {% endif %}
+      {% elif action == 'stop' %}
+      ║ STOP SERVICE: {{ service_name }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if stop_result is defined and stop_result.rc == 0 %}
+      ║ ✅ Service {{ service_name }} stopped successfully
+      {% else %}
+      ║ ❌ Failed to stop service
+      ║ {{ stop_result.stdout | default('') }}
+      {% endif %}
+      {% elif action == 'delete' %}
+      ║ DELETE SERVICE: {{ service_name }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if delete_result is defined and delete_result.rc == 0 %}
+      ║ ✅ Service {{ service_name }} deleted successfully
+      {% else %}
+      ║ ❌ Failed to delete service
+      ║ {{ delete_result.stdout | default('') }}
+      {% endif %}
+      {% endif %}
+      ╚═══════════════════════════════════════════════════════════════════════════════════╝
+
+- name: "{{ current_sid }} - Display service report"
+  ansible.builtin.debug:
+    msg: "{{ service_report }}"
+
+- name: "{{ current_sid }} - Save service report"
+  ansible.builtin.copy:
+    content: "{{ service_report }}"
+    dest: "{{ report_base_dir }}/{{ report_date }}/{{ inventory_hostname }}/services_{{ current_sid }}.txt"
+    mode: '0644'
+  delegate_to: localhost
+  become: no

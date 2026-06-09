@@ -1,0 +1,273 @@
+---
+# playbooks/remediate_java_safe.yml
+#
+# Tier GREEN remediation — applies ONLY changes that are safe to perform
+# without DBA/OEM coordination:
+#
+#   1. dnf/yum update java-1.8.0-openjdk (and java-11/17/21-openjdk)
+#   2. dnf/yum remove java-1.6.0-openjdk and java-1.7.0-openjdk
+#      (only when no other RPM requires it)
+#   3. Cleanup of stale OPatch_b4_update_* backup directories
+#
+# YELLOW and RED tier items (Oracle home JDKs, OEM, EOL DB versions) are
+# NEVER touched by this playbook — they require DBA/OEM change tickets.
+#
+# ─── Safety model ─────────────────────────────────────────────────────────
+#   * Defaults to ansible --check (dry-run). To actually apply changes pass
+#       -e "apply=true"
+#   * Per-host opt-in: must use --limit <host(s)> OR -e "confirm_all=true".
+#     Without one of those the play refuses to run.
+#   * Each action is gated by an individual flag:
+#       -e "do_update_openjdk=true"
+#       -e "do_remove_legacy_java=true"
+#       -e "do_clean_opatch_backups=true"
+#     None are enabled by default; you must opt in to each.
+#   * Per-action pre-checks: legacy Java removal verifies no other RPM
+#     depends on it; OPatch backup cleanup verifies parent OPatch dir.
+#
+# ─── Usage examples ───────────────────────────────────────────────────────
+#   # 1. Dry-run for one host, all GREEN actions
+#   ansible-playbook playbooks/remediate_java_safe.yml \
+#     -i ansibleInventory/inv_key.yml \
+#     -e "@ansibleInventory/inv_var.yml" --ask-vault-pass \
+#     --limit crlnxt1054 \
+#     -e "do_update_openjdk=true do_remove_legacy_java=true do_clean_opatch_backups=true"
+#
+#   # 2. Apply OpenJDK 8 update for real on a single host
+#   ansible-playbook playbooks/remediate_java_safe.yml \
+#     -i ansibleInventory/inv_key.yml \
+#     -e "@ansibleInventory/inv_var.yml" --ask-vault-pass \
+#     --limit crlnxp1086 \
+#     -e "do_update_openjdk=true apply=true"
+#
+#   # 3. Apply across all US Linux non-prod (explicit confirm)
+#   ansible-playbook playbooks/remediate_java_safe.yml \
+#     -i ansibleInventory/inv_key.yml \
+#     -e "@ansibleInventory/inv_var.yml" --ask-vault-pass \
+#     --limit us_lnx_nonprod \
+#     -e "do_update_openjdk=true apply=true confirm_all=true"
+
+- name: Java footprint - Tier GREEN remediation (safe, opt-in)
+  hosts: all
+  gather_facts: true
+  become: "{{ java_remediate_become | default(true) }}"
+
+  vars:
+    apply: false
+    confirm_all: false
+    do_update_openjdk: false
+    do_remove_legacy_java: false
+    do_clean_opatch_backups: false
+
+    # Packages to update (existing installs only; missing pkgs are skipped).
+    openjdk_update_packages:
+      - java-1.8.0-openjdk
+      - java-11-openjdk
+      - java-17-openjdk
+      - java-21-openjdk
+
+    # Packages to remove (only if no other RPM requires them).
+    legacy_java_packages:
+      - java-1.6.0-openjdk
+      - java-1.7.0-openjdk
+
+    # OPatch backup directory glob pattern.
+    opatch_backup_glob: "/u01/app/oracle/product/*/OPatch_b4_update_*"
+
+  pre_tasks:
+
+    - name: Safety - require explicit target scope
+      ansible.builtin.assert:
+        that:
+          - (ansible_limit | default('')) | length > 0 or (confirm_all | bool)
+        fail_msg: >-
+          Refusing to run without explicit scope.
+          Use --limit <host(s)|group> OR pass -e "confirm_all=true".
+        success_msg: "Scope OK ({{ ansible_limit | default('confirm_all=true') }})."
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    - name: Safety - require at least one action flag
+      ansible.builtin.assert:
+        that:
+          - (do_update_openjdk | bool) or (do_remove_legacy_java | bool) or (do_clean_opatch_backups | bool)
+        fail_msg: >-
+          No action selected. Pass at least one of:
+          do_update_openjdk=true, do_remove_legacy_java=true, do_clean_opatch_backups=true.
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    - name: Announce mode
+      ansible.builtin.debug:
+        msg:
+          - "Mode: {{ 'APPLY (changes will be made)' if (apply | bool) else 'CHECK (dry-run only)' }}"
+          - "Targets: {{ ansible_limit | default('confirm_all=true') }}"
+          - "Actions: openjdk_update={{ do_update_openjdk }}  remove_legacy={{ do_remove_legacy_java }}  clean_opatch_backups={{ do_clean_opatch_backups }}"
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+  tasks:
+
+    # ───────────────────────────────────────────────────────────────────────
+    # ACTION 1 — Update OS OpenJDK packages
+    # ───────────────────────────────────────────────────────────────────────
+    - name: "[1] Detect installed OpenJDK packages"
+      ansible.builtin.shell: "rpm -q {{ item }} 2>/dev/null || true"
+      register: _openjdk_present
+      changed_when: false
+      failed_when: false
+      loop: "{{ openjdk_update_packages }}"
+      when: do_update_openjdk | bool
+
+    - name: "[1] Build list of installed OpenJDK packages"
+      ansible.builtin.set_fact:
+        _installed_openjdk: >-
+          {{ _openjdk_present.results
+             | selectattr('stdout','search','^[a-z0-9]')
+             | rejectattr('stdout','search','is not installed')
+             | map(attribute='item') | list }}
+      when: do_update_openjdk | bool
+
+    - name: "[1] Plan: OpenJDK packages that will be updated"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} -> dnf update {{ _installed_openjdk | join(' ') if _installed_openjdk else '(none installed; skip)' }}"
+      when: do_update_openjdk | bool
+
+    - name: "[1] APPLY: dnf update OpenJDK packages"
+      ansible.builtin.dnf:
+        name: "{{ _installed_openjdk }}"
+        state: latest
+      register: _dnf_update
+      when:
+        - do_update_openjdk | bool
+        - apply | bool
+        - _installed_openjdk | length > 0
+
+    - name: "[1] APPLY: post-update version"
+      ansible.builtin.shell: "java -version 2>&1 | head -2"
+      register: _java_after
+      changed_when: false
+      when:
+        - do_update_openjdk | bool
+        - apply | bool
+        - _installed_openjdk | length > 0
+
+    - name: "[1] APPLY: result"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} java -version after update: {{ _java_after.stdout_lines | default([]) }}"
+      when:
+        - do_update_openjdk | bool
+        - apply | bool
+        - _installed_openjdk | length > 0
+
+    # ───────────────────────────────────────────────────────────────────────
+    # ACTION 2 — Remove legacy Java (1.6 / 1.7) when nothing depends on it
+    # ───────────────────────────────────────────────────────────────────────
+    - name: "[2] Check if legacy Java pkg is installed"
+      ansible.builtin.shell: "rpm -q {{ item }} >/dev/null 2>&1 && echo INSTALLED || echo MISSING"
+      register: _legacy_present
+      changed_when: false
+      loop: "{{ legacy_java_packages }}"
+      when: do_remove_legacy_java | bool
+
+    - name: "[2] Check what depends on legacy Java pkg"
+      ansible.builtin.shell: "rpm -q --whatrequires {{ item.item }} 2>&1 | grep -v 'no package requires' || true"
+      register: _legacy_deps
+      changed_when: false
+      loop: "{{ _legacy_present.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - do_remove_legacy_java | bool
+        - item.stdout | default('') | trim == 'INSTALLED'
+
+    - name: "[2] Plan: legacy Java removal decisions"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} -> {{ item.item.item }}:
+          {% if item.skipped | default(false) %}not installed (skip)
+          {% elif (item.stdout | default('') | trim) | length > 0 %}HAS DEPENDENTS - SKIP REMOVAL: {{ item.stdout_lines | default([]) | join(', ') }}
+          {% else %}safe to remove ({{ 'WILL REMOVE' if (apply | bool) else 'dry-run' }})
+          {% endif %}
+      loop: "{{ _legacy_deps.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.item if item.item is mapping else 'n/a' }}"
+      when: do_remove_legacy_java | bool
+
+    - name: "[2] APPLY: remove legacy Java where safe"
+      ansible.builtin.dnf:
+        name: "{{ item.item.item }}"
+        state: absent
+      loop: "{{ _legacy_deps.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.item if item.item is mapping else 'n/a' }}"
+      when:
+        - do_remove_legacy_java | bool
+        - apply | bool
+        - not (item.skipped | default(false))
+        - (item.stdout | default('') | trim) | length == 0
+
+    # ───────────────────────────────────────────────────────────────────────
+    # ACTION 3 — Cleanup stale OPatch_b4_update_* backup dirs
+    # ───────────────────────────────────────────────────────────────────────
+    - name: "[3] Find stale OPatch backup dirs"
+      ansible.builtin.find:
+        paths:
+          - /u01/app/oracle/product
+          - /u01/app/grid/product
+          - /opt/oracle/product
+        patterns: "OPatch_b4_update_*"
+        recurse: true
+        file_type: directory
+        depth: 6
+      register: _opatch_backups
+      when: do_clean_opatch_backups | bool
+      failed_when: false
+
+    - name: "[3] Verify parent OPatch dir exists alongside each backup"
+      ansible.builtin.stat:
+        path: "{{ (item.path | dirname) ~ '/OPatch' }}"
+      register: _opatch_parent
+      loop: "{{ _opatch_backups.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: do_clean_opatch_backups | bool
+
+    - name: "[3] Plan: OPatch backup dir cleanup decisions"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} -> {{ item.item.path }}:
+          {% if item.stat.exists | default(false) %}parent OPatch present - {{ 'WILL REMOVE' if (apply | bool) else 'dry-run remove' }}
+          {% else %}parent OPatch missing - SKIP (manual review)
+          {% endif %}
+      loop: "{{ _opatch_parent.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+      when: do_clean_opatch_backups | bool
+
+    - name: "[3] APPLY: remove stale OPatch backup dirs"
+      ansible.builtin.file:
+        path: "{{ item.item.path }}"
+        state: absent
+      loop: "{{ _opatch_parent.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+      when:
+        - do_clean_opatch_backups | bool
+        - apply | bool
+        - item.stat.exists | default(false)
+
+  post_tasks:
+
+    - name: Final reminder
+      ansible.builtin.debug:
+        msg:
+          - "Tier GREEN remediation complete on {{ ansible_play_hosts | length }} host(s)."
+          - "{{ 'CHANGES APPLIED. Re-run the Java footprint scan to refresh the repo.' if (apply | bool) else 'DRY-RUN ONLY. Re-run with -e \"apply=true\" to make changes.' }}"
+          - "YELLOW/RED tier items (Oracle home JDKs, OEM, EOL DBs) still require DBA/OEM tickets — not touched by this play."
+      run_once: true
+      delegate_to: localhost
+      become: false

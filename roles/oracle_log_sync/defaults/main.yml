@@ -1,0 +1,81 @@
+---
+# defaults file for oracle_log_sync
+
+# ============================================
+# NFS Configuration
+# ============================================
+# NFS destination path - change this to your shared path
+nfs_log_path: "/local/utils/AIX_ORA_LOGS"
+
+# Optional: Mount NFS if not already mounted
+mount_nfs: false
+use_nfs: true   # Set to false to pull logs to control server instead of using NFS mount
+nfs_server: ""
+nfs_export: ""
+nfs_mount_options: "bg,hard,intr,rsize=32768,wsize=32768"
+
+# ============================================
+# Sync Configuration
+# ============================================
+# Sync mode: initial (full) or incremental (changes only)
+sync_mode: "initial"
+
+# Force resync: If true, ignore file times and re-transfer all files (like first run)
+force_resync: false
+
+# Instances to skip during auto-detection (e.g., MGMTDB, ASM)
+skip_instances: ["-MGMTDB", "+ASM"]
+
+# Setup cron job for continuous sync
+setup_cron: false
+cron_interval: 15  # minutes
+
+# Log retention on NFS (days) - 0 to disable cleanup
+log_retention_days: 30
+
+# Compress logs older than 1 day
+compress_logs: true
+
+# ============================================
+# Job Configuration (Agile Mode)
+# ============================================
+# job_type:
+#   - full:        Sync logs AND generate HTML reports (Default)
+#   - sync_only:   Sync logs only (Fast, for cron/frequent runs)
+#   - report_only: Generate reports from existing data (No sync)
+job_type: "full"
+
+# ============================================
+# Log Types to Sync (Selective Sync)
+# ============================================
+sync_alert_logs: true
+sync_listener_logs: true
+sync_audit_logs: true
+
+# ============================================
+# Oracle Environment (auto-detected if empty)
+# ============================================
+oracle_user: ""
+oracle_group: ""
+oracle_home: ""
+oracle_base: ""
+
+# ============================================
+# Rsync Options
+# ============================================
+# AIX rsync options (adjust if using different rsync version)
+rsync_options: "-avz --progress"
+rsync_incremental_options: "-avz --progress --update"
+
+# ============================================
+# Continuous Sync (Cron) Refinements
+# ============================================
+# Local path for the sync script (must be oracle-writable)
+# Redirected to /tmp/ for limited AD user access compatibility
+oracle_script_path: "/tmp/oracle_log_sync"
+oracle_sync_log: "/tmp/oracle_log_sync/sync_execution.log"
+
+# ============================================
+# Reporting
+# ============================================
+local_report_dir: "{{ playbook_dir }}/../reports"

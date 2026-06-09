@@ -1,0 +1,403 @@
+---
+# roles/java_scanner/tasks/scan_host.yml
+#
+# Pure-Ansible Java scanner. No external .sh script. Discovers Java
+# installations on the target host and emits structured records the role
+# uses to populate JAVA_SCAN_INSTALLS.
+#
+# Output format (one block per Java found):
+#   === Found Java at: <path> ===
+#   Type: <Oracle JDK|OpenJDK|IBM JDK|Amazon Corretto|Other JDK>
+#   <version line containing 'version "X.Y.Z"'>
+#   <build/runtime line>
+#   Source: <oratab|opatch|filesystem|path>
+
+- name: "{{ inventory_hostname }} - Execute inline Java scanner"
+  ansible.builtin.shell:
+    executable: "{{ ansible_shell_executable | default('/bin/sh') }}"
+    cmd: |
+      set +e
+      TMPF=$(mktemp 2>/dev/null || echo /tmp/jscan.$$)
+      : > "$TMPF"
+
+      add_path() { [ -x "$1" ] && echo "$1" >> "$TMPF"; }
+
+      # 1) java in PATH
+      JP=$(command -v java 2>/dev/null)
+      [ -n "$JP" ] && add_path "$JP"
+
+      # 2) Oracle homes from /etc/oratab
+      if [ -r /etc/oratab ]; then
+          awk -F: '!/^#/ && NF>=2 && $2!="" {print $2}' /etc/oratab | sort -u | while read OH; do
+              [ -n "$OH" ] || continue
+              add_path "$OH/jdk/bin/java"
+              add_path "$OH/jdk/jre/bin/java"
+              add_path "$OH/jre/bin/java"
+              add_path "$OH/OPatch/jre/bin/java"
+              add_path "$OH/oui/jdk/bin/java"
+              add_path "$OH/oracle_common/jdk/bin/java"
+          done
+      fi
+
+      # 3) Common Oracle / EM agent / GI install roots
+      for ROOT in /oracle /u01 /u02 /opt/oracle /opt/oracle.* ; do
+          [ -d "$ROOT" ] || continue
+          find "$ROOT" -maxdepth 7 -type f -path "*/bin/java" 2>/dev/null
+      done >> "$TMPF"
+
+      # 4) System OpenJDK locations
+      for D in /usr/lib/jvm /usr/java /opt/jdk /opt/java /opt/IBM/java* ; do
+          [ -d "$D" ] || continue
+          find "$D" -maxdepth 5 -type f -path "*/bin/java" 2>/dev/null
+      done >> "$TMPF"
+
+      # 5) PuppetLabs / agents / common 3rd-party jres
+      for D in /opt/puppetlabs /opt/quest /opt/IBM /opt/CA /opt/dynatrace ; do
+          [ -d "$D" ] || continue
+          find "$D" -maxdepth 8 -type f -path "*/bin/java" 2>/dev/null
+      done >> "$TMPF"
+
+      # ---------------------------------------------------------------
+      # Pre-compute HOST-level evidence ONCE (Tier 2)
+      # ---------------------------------------------------------------
+      # /etc/alternatives/java — system default JVM
+      ALTS_DEFAULT=$(readlink -f /etc/alternatives/java 2>/dev/null)
+      [ -z "$ALTS_DEFAULT" ] && ALTS_DEFAULT=$(readlink -f /usr/bin/java 2>/dev/null)
+
+      # Live java processes — try /proc/*/exe (most authoritative)
+      PROC_HOMES=$(for E in /proc/[0-9]*/exe; do
+          readlink -f "$E" 2>/dev/null
+      done 2>/dev/null | grep 'java$' | sort | uniq -c | awk '{print $2"="$1}' | tr '\n' ';' )
+      PROC_COUNT=$(pgrep -c -f '[j]ava' 2>/dev/null)
+      [ -z "$PROC_COUNT" ] && PROC_COUNT=0
+      PROC_USERS=$(ps -eo user=,cmd= 2>/dev/null | awk '/[j]ava/{print $1}' | sort -u | tr '\n' ',' | sed 's/,$//')
+
+      # Listening ports owned by java processes
+      LPORTS=$(ss -ltnp 2>/dev/null | awk '/java/{print $4}' | awk -F: '{print $NF}' | sort -un | tr '\n' ',' | sed 's/,$//')
+      [ -z "$LPORTS" ] && LPORTS=$(netstat -ltnp 2>/dev/null | awk '/java/{print $4}' | awk -F: '{print $NF}' | sort -un | tr '\n' ',' | sed 's/,$//')
+
+      # Hard-coded JAVA_HOME / legacy paths in shell init files
+      ENV_FILES_LIST=$(grep -rIlE 'JAVA_HOME|java-1\.[6-7]|/usr/lib/jvm/jre-1\.[6-7]' \
+            /etc/profile /etc/profile.d 2>/dev/null
+            grep -lE 'JAVA_HOME|java-1\.[6-7]' /etc/bashrc /etc/environment 2>/dev/null
+            grep -rIlE 'JAVA_HOME|java-1\.[6-7]' /root 2>/dev/null
+            for H in /home/*; do
+                [ -d "$H" ] && grep -lE 'JAVA_HOME|java-1\.[6-7]' \
+                    "$H/.bash_profile" "$H/.bashrc" "$H/.profile" "$H/.kshrc" 2>/dev/null
+            done)
+      ENV_FILES=$(echo "$ENV_FILES_LIST" | sort -u | grep -v '^$' | tr '\n' ';' | sed 's/;$//')
+      ENV_COUNT=$(echo "$ENV_FILES_LIST" | sort -u | grep -v '^$' | wc -l | tr -d ' ')
+
+      # systemd units that reference java
+      SD_UNITS=$(systemctl list-units --type=service --no-legend --no-pager 2>/dev/null \
+                  | awk '{print $1}' \
+                  | while read U; do
+                        systemctl cat "$U" 2>/dev/null | grep -qE '(/java\b|JAVA_HOME|/jvm/|/jdk)' && echo "$U"
+                    done | sort -u | tr '\n' ';' | sed 's/;$//')
+
+      # cron references
+      CRON_REFS=$(grep -rIlE 'java\b|JAVA_HOME' /etc/cron.d /etc/cron.daily /etc/cron.hourly \
+                                                /etc/cron.weekly /etc/crontab /var/spool/cron 2>/dev/null \
+                  | sort -u | tr '\n' ';' | sed 's/;$//')
+
+      # legacy 1.6/1.7 RPMs present
+      LEGACY_RPMS=$(rpm -qa 2>/dev/null \
+                    | grep -E '^(java-1\.6\.0|java-1\.7\.0|jdk1\.6|jdk1\.7)' \
+                    | sort -u | tr '\n' ',' | sed 's/,$//')
+
+      # Resolve symlinks, dedupe install paths
+      RESOLVED=$(mktemp 2>/dev/null || echo /tmp/jscan_r.$$)
+      : > "$RESOLVED"
+      while read JBIN; do
+          [ -x "$JBIN" ] || continue
+          REAL=$(readlink -f "$JBIN" 2>/dev/null || echo "$JBIN")
+          # Remember original path -> real path mapping in sortable form
+          echo "$JBIN|$REAL"
+      done < "$TMPF" | sort -u -t'|' -k2,2 | awk -F'|' '!seen[$2]++' > "$RESOLVED"
+
+      classify_source() {
+          case "$1" in
+              */OPatch/jre/bin/java)            echo "opatch" ;;
+              /oracle/*|/u01/*|/u02/*|/opt/oracle*|*/oracle_common/*) echo "oratab" ;;
+              "$JP")                            echo "path" ;;
+              *)                                echo "filesystem" ;;
+          esac
+      }
+
+      classify_app() {
+          P=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+          case "$P" in
+              */opatch/jre/bin/java)                          echo "OPatch" ;;
+              */em_grid_agent/*|*/agent_*/*|*/sysman/*|*/oraagent*) echo "OEM Agent" ;;
+              */oms*/*|*/middleware/*oms*)                    echo "OEM OMS" ;;
+              */oracle_common/jdk/*|*/oui/jdk/*)              echo "Oracle Common (Installer/JDK)" ;;
+              */grid/*/jdk/*|*/grid/*/jre/*|*/crs/*/jdk/*|*/grid_home/*) echo "Oracle Grid Infrastructure" ;;
+              */product/*/jdk/*|*/product/*/jre/*|*/dbhome*/jdk/*|*/dbhome*/jre/*) echo "Oracle DB Home" ;;
+              */ohs/*|*/webtier/*)                            echo "Oracle HTTP Server" ;;
+              */weblogic*/*|*/wls*/*|*/fmw*/*)                echo "WebLogic / FMW" ;;
+              */goldengate/*|*/ogg*/*)                        echo "GoldenGate" ;;
+              */tomcat*/*)                                    echo "Tomcat" ;;
+              */puppetlabs/*|*/puppet/*)                      echo "PuppetLabs" ;;
+              */dynatrace/*)                                  echo "Dynatrace" ;;
+              */splunk*/*)                                    echo "Splunk" ;;
+              */ibm/*|*/was/*|*/websphere/*)                  echo "IBM WebSphere/JDK" ;;
+              */quest/*|*/toad*/*)                            echo "Quest/Toad" ;;
+              */ca/*nimsoft*|*/nimsoft/*)                     echo "CA Nimsoft" ;;
+              */jvm/*|*/openjdk*)                             echo "OS OpenJDK" ;;
+              /usr/bin/java|/usr/local/bin/java)              echo "OS Default" ;;
+              */oracle/*|/u01/*|/u02/*|/opt/oracle*)          echo "Oracle (Other)" ;;
+              *)                                              echo "Other / Unknown" ;;
+          esac
+      }
+
+      classify_type() {
+          case "$1" in
+              *openjdk*)                                  echo "OpenJDK" ;;
+              *"java(tm)"*|*"java se"*|*"hotspot"*)       echo "Oracle JDK" ;;
+              *"ibm j9"*|*"ibm semeru"*)                  echo "IBM JDK" ;;
+              *corretto*)                                 echo "Amazon Corretto" ;;
+              *)                                          echo "Other JDK" ;;
+          esac
+      }
+
+      while IFS='|' read JB REAL; do
+          [ -z "$JB" ] && continue
+          [ -z "$REAL" ] && REAL="$JB"
+          OUT=$("$JB" -version 2>&1 | head -3)
+          [ -z "$OUT" ] && continue
+          VLINE=$(echo "$OUT" | grep -E 'version "' | head -1)
+          BLINE=$(echo "$OUT" | sed -n '2p')
+          [ -z "$BLINE" ] && BLINE=$(echo "$OUT" | sed -n '1p')
+          LOWER=$(echo "$OUT" | tr '[:upper:]' '[:lower:]')
+          JTYPE=$(classify_type "$LOWER")
+          SRC=$(classify_source "$JB")
+          APP=$(classify_app "$JB")
+          OWNER=$(ls -ld "$JB" 2>/dev/null | awk '{print $3}')
+          GROUP=$(ls -ld "$JB" 2>/dev/null | awk '{print $4}')
+          PERMS=$(ls -ld "$JB" 2>/dev/null | awk '{print $1}')
+
+          # Tier-1 enrichment per install
+          if [ -L "$JB" ]; then SLINK="Y"; STARGET="$REAL"; else SLINK="N"; STARGET=""; fi
+          RPM_OWNER=$(rpm -qf "$REAL" 2>/dev/null | head -1)
+          case "$RPM_OWNER" in *"not owned"*|*"no path"*|"") RPM_OWNER="" ;; esac
+          if [ -n "$RPM_OWNER" ]; then
+              RPM_DATE=$(rpm -q --qf '%{INSTALLTIME:date}' "$RPM_OWNER" 2>/dev/null | head -1 | awk '{print $1,$2,$3,$4}')
+          else
+              RPM_DATE=""
+          fi
+          F_MTIME=$(stat -c '%y' "$REAL" 2>/dev/null | awk '{print $1" "$2}' | cut -c1-19)
+          # java -XshowSettings — silence stderr noise but keep properties
+          PROPS=$("$JB" -XshowSettings:properties -version 2>&1)
+          VENDOR_PROP=$(echo "$PROPS" | awk -F'= ' '/java\.vendor =/{print $2; exit}')
+          RUNTIME_NAME=$(echo "$PROPS" | awk -F'= ' '/java\.runtime\.name =/{print $2; exit}')
+          ARCH_BITS=$(echo "$PROPS" | awk -F'= ' '/sun\.arch\.data\.model =/{print $2; exit}')
+          [ -z "$ARCH_BITS" ] && ARCH_BITS="0"
+          # headless: presence of awt libs — full JDK has libawt.so; headless does not
+          JHOME=$(echo "$REAL" | sed 's|/bin/java$||;s|/jre$||')
+          if find "$JHOME" -maxdepth 4 -name 'libawt.so' 2>/dev/null | grep -q .; then HEADLESS="N"; else HEADLESS="Y"; fi
+          if [ "$REAL" = "$ALTS_DEFAULT" ]; then ALTSD="Y"; else ALTSD="N"; fi
+          # live procs targeting THIS install
+          LIVE_HERE=$(echo "$PROC_HOMES" | tr ';' '\n' | awk -F= -v p="$REAL" '$1==p{print $2}')
+          [ -z "$LIVE_HERE" ] && LIVE_HERE="0"
+
+          echo "=== Found Java at: $JB ==="
+          echo "Type: $JTYPE"
+          echo "$VLINE"
+          echo "$BLINE"
+          echo "Source: $SRC"
+          echo "App: $APP"
+          echo "Owner: $OWNER"
+          echo "Group: $GROUP"
+          echo "Perms: $PERMS"
+          echo "Symlink: $SLINK"
+          echo "SymlinkTarget: $STARGET"
+          echo "RpmOwner: $RPM_OWNER"
+          echo "RpmInstallDate: $RPM_DATE"
+          echo "FileMtime: $F_MTIME"
+          echo "VendorProp: $VENDOR_PROP"
+          echo "RuntimeName: $RUNTIME_NAME"
+          echo "ArchBits: $ARCH_BITS"
+          echo "Headless: $HEADLESS"
+          echo "AltsDefault: $ALTSD"
+          echo "LiveProcs: $LIVE_HERE"
+      done < "$RESOLVED"
+
+      # ---------------------------------------------------------------
+      # Emit host-level evidence block (single block, end of output)
+      # ---------------------------------------------------------------
+      echo "=== Host Evidence ==="
+      echo "RunningProcCount: $PROC_COUNT"
+      echo "RunningProcUsers: $PROC_USERS"
+      echo "RunningProcHomes: $PROC_HOMES"
+      echo "ListeningPorts: $LPORTS"
+      echo "EnvRefsCount: $ENV_COUNT"
+      echo "EnvRefsFiles: $ENV_FILES"
+      echo "SystemdUnits: $SD_UNITS"
+      echo "CronRefs: $CRON_REFS"
+      echo "LegacyRpmsPresent: $LEGACY_RPMS"
+      echo "AlternativesTarget: $ALTS_DEFAULT"
+      echo "=== End Host Evidence ==="
+
+      rm -f "$TMPF" "$RESOLVED" 2>/dev/null
+      exit 0
+  become: false
+  register: _java_scan_output
+  changed_when: false
+  failed_when: false
+
+- name: "{{ inventory_hostname }} - Parse scanner output into _java_installs"
+  ansible.builtin.set_fact:
+    _java_installs: >-
+      {%- set ns = namespace(path='', jtype='', ver='', build='', src='filesystem', app='', owner='', grp='', perms='',
+                              slink='N', starget='', rpm_owner='', rpm_date='', f_mtime='',
+                              vendor_prop='', runtime_name='', arch_bits=0, headless='', alts='N', live=0,
+                              installs=[], in_evidence=false) -%}
+      {%- for line in (_java_scan_output.stdout_lines | default([])) -%}
+        {%- set l = line | trim -%}
+        {%- if l == '=== Host Evidence ===' -%}
+          {%- set ns.in_evidence = true -%}
+        {%- elif ns.in_evidence -%}
+          {# host-evidence lines are handled in the next set_fact #}
+        {%- elif l.startswith('=== Found Java at: ') -%}
+          {%- set ns.path = l | regex_replace('^=== Found Java at: ', '') | regex_replace(' ===$', '') -%}
+          {%- set ns.jtype = '' -%}{%- set ns.ver = '' -%}{%- set ns.build = '' -%}
+          {%- set ns.src = 'filesystem' -%}{%- set ns.app = '' -%}
+          {%- set ns.owner = '' -%}{%- set ns.grp = '' -%}{%- set ns.perms = '' -%}
+          {%- set ns.slink = 'N' -%}{%- set ns.starget = '' -%}
+          {%- set ns.rpm_owner = '' -%}{%- set ns.rpm_date = '' -%}{%- set ns.f_mtime = '' -%}
+          {%- set ns.vendor_prop = '' -%}{%- set ns.runtime_name = '' -%}{%- set ns.arch_bits = 0 -%}
+          {%- set ns.headless = '' -%}{%- set ns.alts = 'N' -%}{%- set ns.live = 0 -%}
+        {%- elif l.startswith('Type: ') -%}
+          {%- set ns.jtype = l | regex_replace('^Type: ', '') -%}
+        {%- elif 'version "' in l and (ns.ver | length == 0) -%}
+          {%- set ns.ver = l | regex_replace('^[^"]*"', '') | regex_replace('".*$', '') -%}
+        {%- elif l.startswith('Source: ') -%}
+          {%- set ns.src = l | regex_replace('^Source: ', '') -%}
+        {%- elif l.startswith('App: ') -%}
+          {%- set ns.app = l | regex_replace('^App: ', '') -%}
+        {%- elif l.startswith('Owner: ') -%}
+          {%- set ns.owner = l | regex_replace('^Owner: ', '') -%}
+        {%- elif l.startswith('Group: ') -%}
+          {%- set ns.grp = l | regex_replace('^Group: ', '') -%}
+        {%- elif l.startswith('Perms: ') -%}
+          {%- set ns.perms = l | regex_replace('^Perms: ', '') -%}
+        {%- elif l.startswith('Symlink: ') -%}
+          {%- set ns.slink = l | regex_replace('^Symlink: ', '') -%}
+        {%- elif l.startswith('SymlinkTarget: ') -%}
+          {%- set ns.starget = l | regex_replace('^SymlinkTarget: ', '') -%}
+        {%- elif l.startswith('RpmOwner: ') -%}
+          {%- set ns.rpm_owner = l | regex_replace('^RpmOwner: ', '') -%}
+        {%- elif l.startswith('RpmInstallDate: ') -%}
+          {%- set ns.rpm_date = l | regex_replace('^RpmInstallDate: ', '') -%}
+        {%- elif l.startswith('FileMtime: ') -%}
+          {%- set ns.f_mtime = l | regex_replace('^FileMtime: ', '') -%}
+        {%- elif l.startswith('VendorProp: ') -%}
+          {%- set ns.vendor_prop = l | regex_replace('^VendorProp: ', '') -%}
+        {%- elif l.startswith('RuntimeName: ') -%}
+          {%- set ns.runtime_name = l | regex_replace('^RuntimeName: ', '') -%}
+        {%- elif l.startswith('ArchBits: ') -%}
+          {%- set _ab = l | regex_replace('^ArchBits: ', '') | trim -%}
+          {%- set ns.arch_bits = (_ab | int) if (_ab | length > 0 and _ab.isdigit()) else 0 -%}
+        {%- elif l.startswith('Headless: ') -%}
+          {%- set ns.headless = l | regex_replace('^Headless: ', '') -%}
+        {%- elif l.startswith('AltsDefault: ') -%}
+          {%- set ns.alts = l | regex_replace('^AltsDefault: ', '') -%}
+        {%- elif l.startswith('LiveProcs: ') -%}
+          {%- set _lp = l | regex_replace('^LiveProcs: ', '') | trim -%}
+          {%- set ns.live = (_lp | int) if (_lp | length > 0 and _lp.isdigit()) else 0 -%}
+          {# LiveProcs is the last field — flush install record #}
+          {%- if ns.path | length > 0 -%}
+            {%- set home = ns.path | regex_replace('/bin/java$', '') | regex_replace('/jre$', '') -%}
+            {%- set lpath = ns.path | lower -%}
+            {%- if '/oracle' in lpath or '/em_grid' in lpath or '/opatch' in lpath or '/grid' in lpath or '/oms' in lpath or '/agent' in lpath -%}
+              {%- set ctx = 'Oracle' -%}
+            {%- elif '/puppetlabs' in lpath or '/puppet' in lpath -%}
+              {%- set ctx = 'PuppetLabs' -%}
+            {%- elif '/jvm' in lpath or 'openjdk' in lpath -%}
+              {%- set ctx = 'OS' -%}
+            {%- else -%}
+              {%- set ctx = 'Other' -%}
+            {%- endif -%}
+            {%- set b = ns.build | replace('|', ':') -%}
+            {%- set lb = b | lower -%}
+            {%- if 'se runtime' in lb or 'openjdk runtime' in lb or 'corretto' in lb -%}
+              {%- set edition = 'SE' -%}
+            {%- elif 'ee' in lb -%}
+              {%- set edition = 'EE' -%}
+            {%- else -%}
+              {%- set edition = 'Unknown' -%}
+            {%- endif -%}
+            {%- set ver = ns.ver | trim -%}
+            {%- if ver.startswith('1.') -%}
+              {%- set major = ver.split('.')[1] | default('0') | int -%}
+            {%- else -%}
+              {%- set major = ver.split('.')[0] | default('0') | int -%}
+            {%- endif -%}
+            {%- set _ = ns.installs.append({
+              'java_type': (ns.jtype | default('Other JDK') | trim),
+              'java_vendor': (ns.vendor_prop | default('') | trim),
+              'java_version': ver,
+              'java_major': major,
+              'java_edition': edition,
+              'build_info': b,
+              'java_bin': ns.path,
+              'java_home': home,
+              'symlink_target': (ns.starget | default('') | trim),
+              'install_context': ctx,
+              'install_source': (ns.src | default('filesystem') | trim),
+              'is_default_path': ('Y' if (ns.src | lower) == 'path' else 'N'),
+              'related_oracle_home': (ns.app | default('') | trim),
+              'related_oracle_sid': '',
+              'file_owner': (ns.owner | default('') | trim),
+              'file_group': (ns.grp | default('') | trim),
+              'file_perms': (ns.perms | default('') | trim),
+              'file_modified': (ns.f_mtime | default('') | trim),
+              'arch_bits': (ns.arch_bits if ns.arch_bits > 0 else none),
+              'is_symlink': (ns.slink | default('N') | trim),
+              'rpm_owner': (ns.rpm_owner | default('') | trim),
+              'rpm_install_date': (ns.rpm_date | default('') | trim),
+              'runtime_name': (ns.runtime_name | default('') | trim),
+              'is_headless': (ns.headless | default('') | trim),
+              'is_alternatives_default': (ns.alts | default('N') | trim),
+              'live_procs': ns.live
+            }) -%}
+          {%- endif -%}
+          {%- set ns.path = '' -%}
+        {%- elif ns.path | length > 0 and ns.build | length == 0 and (l | length > 0) and (not l.startswith('Summary of Java Installations')) and (not l.startswith('Java Type')) and (not l.startswith('---------')) -%}
+          {%- set ns.build = l -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ns.installs }}
+    _java_host_evidence: >-
+      {%- set ev = namespace(in=false, d={}) -%}
+      {%- for line in (_java_scan_output.stdout_lines | default([])) -%}
+        {%- set l = line | trim -%}
+        {%- if l == '=== Host Evidence ===' -%}{%- set ev.in = true -%}
+        {%- elif l == '=== End Host Evidence ===' -%}{%- set ev.in = false -%}
+        {%- elif ev.in and ': ' in l -%}
+          {%- set k = l.split(': ', 1)[0] -%}
+          {%- set v = l.split(': ', 1)[1] | default('') -%}
+          {%- set _ = ev.d.update({k: v}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ev.d }}
+    _java_scan_rc: "{{ _java_scan_output.rc | default(0) | int }}"
+    _java_scan_err: "{{ _java_scan_output.stderr | default('') | trim }}"
+
+- name: "{{ inventory_hostname }} - Show scanner summary"
+  ansible.builtin.debug:
+    msg:
+      - "scanner_rc={{ _java_scan_rc }}"
+      - "java_installs={{ _java_installs | length }}"
+      - "scanner_msg={{ _java_scan_output.msg | default('') }}"
+
+- name: "{{ inventory_hostname }} - DEBUG raw scanner output (no installs found)"
+  ansible.builtin.debug:
+    msg:
+      - "=== STDOUT ==="
+      - "{{ _java_scan_output.stdout | default('') }}"
+      - "=== STDERR ==="
+      - "{{ _java_scan_output.stderr | default('') }}"
+      - "=== MSG ==="
+      - "{{ _java_scan_output.msg | default('') }}"
+  when: (_java_installs | length) == 0

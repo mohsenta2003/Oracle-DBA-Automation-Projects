@@ -1,0 +1,52 @@
+---
+# ============================================================================
+# Java Footprint Audit - EU Repository Configuration
+# ============================================================================
+# EU jumpbox repo (different from US):
+#   TNS alias  : DBAINFO
+#   Host/Port  : UKLNXAGT0107:1525
+#   Service    : DBAINFO   (NOTE: SERVICE_NAME, not SID)
+#
+# Use this file from the EU jumpbox by passing it explicitly, e.g.:
+#   ansible-playbook -i ansibleInventory/inv_key.yml \
+#       playbooks/collect_java_footprint.yml \
+#       -e @vars/java_scanner_config_eu.yml \
+#       -e "run_label=Java-Scan-EU-LNX-$(date +%Y%m%d) repo_password='<eu_pwd>'"
+#
+# Or rename to java_scanner_config.yml on the EU jumpbox so it's the default.
+# ============================================================================
+
+# Repository database connection (EU)
+repo_tns_alias: "DBAINFO"        # TNS alias resolved by EU sqlnet.ora/tnsnames.ora
+repo_host:      "UKLNXAGT0107"   # EU repo DB host (info only when alias is set)
+repo_port:      "1525"           # EU listener port
+repo_service:   "DBAINFO"        # Service name (EU uses SERVICE_NAME, not SID)
+repo_sid:       "DBAINFO"        # Kept for back-compat; alias takes precedence
+repo_user:      "mtaheri"        # Confirmed working on EU repo
+repo_schema:    "mtaheri"        # Schema owning JAVA_SCAN_* tables in EU repo
+repo_password:  ""               # Pass at runtime: -e "repo_password=<pwd>"
+
+# Auto-built connection string (uses SERVICE_NAME for EU)
+repo_dsn: "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={{ repo_host }})(PORT={{ repo_port }}))(CONNECT_DATA=(SERVICE_NAME={{ repo_service }})))"
+_repo_conn_string: "{{ repo_tns_alias if (repo_tns_alias | default('')) else repo_dsn }}"
+
+# ============================================================================
+# Reporting & Email Notification (EU)
+# ============================================================================
+report_output_dir: "/tmp"
+
+log_dir: "{{ playbook_dir }}/../logs/java_scanner/{{ lookup('pipe', 'date +%Y-%m-%d') }}"
+
+send_summary_email: true
+email_to:   "Mohsen.Taheri@transamerica.com"
+email_from: "svcorapeu@uklnxagt0107.us.aegon.com"
+smtp_host:  "mail1.us.aegon.com"              # Reachable from EU jumpbox
+smtp_port:  25
+email_subject_prefix: "[Java-Footprint-Audit-EU]"
+
+# ============================================================================
+# Scanner behaviour
+# ============================================================================
+java_scan_become_root: false
+
+run_label: "java-scan-eu-{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%SZ') }}"

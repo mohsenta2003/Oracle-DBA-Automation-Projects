@@ -1,0 +1,96 @@
+---
+- name: Test parsing voption data
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: no
+  
+  vars_files:
+    - ../vars/repo_config.yml
+  
+  vars:
+    _eff_run_id: "81,101,121"
+    _report_mode: "all_hosts"
+    _nl: "\n"
+    
+    ee_extra_options:
+      - "Active Data Guard"
+      - "Partitioning"
+      - "In-Memory Column Store"
+  
+  tasks:
+    - name: Fetch voption rows
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500 WRAP OFF TRIMSPOOL ON
+          WITH host_latest_run AS (
+            SELECT i.hostname, MAX(i.run_id) AS run_id
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i
+            WHERE i.run_id IN ({{ _eff_run_id }})
+            GROUP BY i.hostname
+          ),
+          voption_with_instance AS (
+            SELECT 
+              v.option_name,
+              v.hostname,
+              v.sid,
+              v.option_enabled,
+              v.is_inuse,
+              v.run_id,
+              i.os_type,
+              i.region
+            FROM {{ repo_schema | upper }}.ORACLE_OPT_VOPTION v
+            JOIN host_latest_run hlr ON hlr.hostname = v.hostname AND hlr.run_id = v.run_id
+            JOIN {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES i ON i.hostname = hlr.hostname AND i.run_id = hlr.run_id AND i.sid = v.sid
+            WHERE v.is_ee_extra = 'Y'
+          )
+          SELECT 
+            vi.option_name || '|' ||
+            vi.hostname || '|' ||
+            vi.sid || '|' ||
+            vi.option_enabled || '|' ||
+            vi.is_inuse || '|' ||
+            CASE WHEN UPPER(vi.os_type) = 'AIX' THEN 'AIX' ELSE 'US-Linux' END || '|' ||
+            CASE WHEN UPPER(vi.hostname) LIKE 'CRLNXP%' THEN 'Production' ELSE 'Test' END || '|' ||
+            '1|121' AS result
+          FROM voption_with_instance vi
+          WHERE ROWNUM <= 20
+          ORDER BY vi.option_name;
+          EXIT;
+          EOSQL
+      register: _voption_raw
+      changed_when: false
+      become: false
+
+    - name: Parse and count matches
+      ansible.builtin.set_fact:
+        _parse_result: >-
+          {%- set vopts = [] -%}
+          {%- for line in (_voption_raw.stdout | default('') | trim).split('\n') -%}
+            {%- if '|' in line -%}
+              {%- set p = line.split('|') -%}
+              {%- if p | length >= 9 -%}
+                {%- set _ = vopts.append({'name': p[0]|trim, 'host': p[1]|trim, 'inuse': p[4]|trim}) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          PARSED {{ vopts | length }} records.
+          {%- for opt_name in ee_extra_options -%}
+            {{ _nl }}Checking: {{ opt_name }}
+            {%- set matches = [] -%}
+            {%- for o in vopts -%}
+              {%- if o.name == opt_name or (o.name | upper) == (opt_name | upper) -%}
+                {%- set _ = matches.append(o) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {{ _nl }}  Found {{ matches | length }} matches
+            {%- if matches | length > 0 -%}
+              {{ _nl }}  First match: {{ matches[0].name }} on {{ matches[0].host }} (inuse={{ matches[0].inuse }})
+            {%- endif -%}
+          {%- endfor -%}
+
+    - name: Show parsing results
+      ansible.builtin.debug:
+        msg: "{{ _parse_result }}"

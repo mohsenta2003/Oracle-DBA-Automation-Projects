@@ -1,0 +1,65 @@
+---
+- hosts: localhost
+  gather_facts: no
+  
+  vars_files:
+    - ../vars/repo_config.yml
+  
+  tasks:
+    - name: Query audit tables
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn_string }}
+          SET LINESIZE 220
+          SET PAGESIZE 80
+          SET FEEDBACK ON
+
+          PROMPT ── 1. LATEST RUNS ──
+          SELECT RUN_ID, TO_CHAR(RUN_DATE,'YYYY-MM-DD HH24:MI') RUN_DATE,
+                 TOTAL_HOSTS, TOTAL_INSTANCES, RUN_LABEL
+          FROM   {{ repo_schema | upper }}.ORACLE_OPT_RUNS
+          ORDER  BY RUN_ID DESC FETCH FIRST 5 ROWS ONLY;
+
+          PROMPT ── 2. INSTANCES ──
+          SELECT HOSTNAME, SID, ORACLE_VERSION, DB_ROLE, OPEN_MODE,
+                 REGION, OS_TYPE, CPU_COUNT, DB_TOTAL_SIZE_GB
+          FROM   {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES
+          WHERE  RUN_ID = (SELECT MAX(RUN_ID) FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS);
+
+          PROMPT ── 3. ROW COUNTS ──
+          SELECT 'ORACLE_OPT_INSTANCES' TBL, COUNT(*) CNT
+          FROM   {{ repo_schema | upper }}.ORACLE_OPT_INSTANCES
+          WHERE  RUN_ID=(SELECT MAX(RUN_ID) FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS)
+          UNION ALL
+          SELECT 'ORACLE_OPT_VOPTION', COUNT(*)
+          FROM   {{ repo_schema | upper }}.ORACLE_OPT_VOPTION
+          WHERE  RUN_ID=(SELECT MAX(RUN_ID) FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS)
+          UNION ALL
+          SELECT 'ORACLE_OPT_FEATURES', COUNT(*)
+          FROM   {{ repo_schema | upper }}.ORACLE_OPT_FEATURES
+          WHERE  RUN_ID=(SELECT MAX(RUN_ID) FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS);
+
+          PROMPT ── 4. EE EXTRA-COST OPTIONS ──
+          SELECT OPTION_NAME, OPTION_ENABLED, IS_EE_EXTRA, IS_INUSE
+          FROM   {{ repo_schema | upper }}.ORACLE_OPT_VOPTION
+          WHERE  IS_EE_EXTRA = 'Y'
+          AND    RUN_ID = (SELECT MAX(RUN_ID) FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS)
+          ORDER  BY OPTION_NAME;
+
+          PROMPT ── 5. TOP FEATURES WITH USAGE ──
+          SELECT FEATURE_NAME, DETECTED_USAGES, CURRENTLY_USED,
+                 TO_CHAR(LAST_USAGE_DATE,'YYYY-MM-DD') LAST_USAGE_DATE
+          FROM   {{ repo_schema | upper }}.ORACLE_OPT_FEATURES
+          WHERE  RUN_ID=(SELECT MAX(RUN_ID) FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS)
+          AND    DETECTED_USAGES > 0
+          ORDER  BY DETECTED_USAGES DESC FETCH FIRST 15 ROWS ONLY;
+
+          EXIT;
+          EOSQL
+      register: _result
+      changed_when: false
+
+    - name: Show results
+      ansible.builtin.debug:
+        msg: "{{ _result.stdout_lines }}"

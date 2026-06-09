@@ -1,0 +1,162 @@
+---
+# ================================================================================
+# Oracle Parameter Management with cx_Oracle Modules
+# ================================================================================
+#
+# This playbook uses the ansible-oracle-modules (cx_Oracle based) for 
+# idempotent init parameter management (ALTER SYSTEM SET).
+#
+# PREREQUISITES:
+#   - cx_Oracle Python library installed
+#   - Network connectivity to Oracle listener
+#   - SYSDBA credentials for underscore parameters
+#
+# USAGE:
+#   # Set a single parameter (BOTH scope)
+#   ansible-playbook playbooks/oracle_parameter_manage.yml --limit crlnxd2201 \
+#     -e "db_service=ORCL" \
+#     -e "param_name=open_cursors" \
+#     -e "param_value=500"
+#
+#   # Set parameter in SPFILE only (requires restart)
+#   ansible-playbook playbooks/oracle_parameter_manage.yml --limit crlnxd2201 \
+#     -e "db_service=ORCL" \
+#     -e "param_name=sga_target" \
+#     -e "param_value=2G" \
+#     -e "scope=spfile"
+#
+#   # Set underscore parameter (requires sysdba)
+#   ansible-playbook playbooks/oracle_parameter_manage.yml --limit crlnxd2201 \
+#     -e "db_service=ORCL" \
+#     -e "db_user=sys" \
+#     -e "db_mode=sysdba" \
+#     -e "param_name=_parallel_statement_queuing" \
+#     -e "param_value=true"
+#
+#   # Reset parameter to default
+#   ansible-playbook playbooks/oracle_parameter_manage.yml --limit crlnxd2201 \
+#     -e "db_service=ORCL" \
+#     -e "param_name=open_cursors" \
+#     -e "action=reset"
+#
+#   # Apply multiple parameters from a list
+#   ansible-playbook playbooks/oracle_parameter_manage.yml --limit crlnxd2201 \
+#     -e "db_service=ORCL" \
+#     -e "@params.yml"
+#
+#   Where params.yml contains:
+#   parameters:
+#     - { name: open_cursors, value: 500, scope: both }
+#     - { name: processes, value: 500, scope: spfile }
+#     - { name: pga_aggregate_target, value: 1G, scope: both }
+# ================================================================================
+
+- name: Oracle Parameter Management (cx_Oracle Module)
+  hosts: all
+  become: no
+  gather_facts: no
+  
+  vars:
+    # Connection defaults
+    db_hostname: "{{ inventory_hostname }}"
+    db_port: 1521
+    db_service: "{{ db_sid | default('ORCL') }}"
+    db_user: "{{ oracle_dba_user | default('system') }}"
+    db_password: "{{ oracle_dba_password | default('') }}"
+    db_mode: normal
+    # Parameter defaults
+    scope: both  # memory, spfile, or both
+    action: set  # set or reset
+    parameters: []  # For bulk parameter changes
+
+  environment:
+    ORACLE_HOME: "{{ oracle_home | default('/u01/app/oracle/product/19.0.0/dbhome_1') }}"
+    LD_LIBRARY_PATH: "{{ oracle_home | default('/u01/app/oracle/product/19.0.0/dbhome_1') }}/lib"
+
+  tasks:
+    # ============================================
+    # Set Single Parameter
+    # ============================================
+    - name: Set Oracle parameter
+      oracle_parameter:
+        hostname: "{{ db_hostname }}"
+        port: "{{ db_port }}"
+        service_name: "{{ db_service }}"
+        user: "{{ db_user }}"
+        password: "{{ db_password }}"
+        mode: "{{ db_mode }}"
+        name: "{{ param_name }}"
+        value: "{{ param_value }}"
+        scope: "{{ scope }}"
+        state: present
+      when: 
+        - param_name is defined
+        - param_value is defined
+        - action == 'set'
+      register: param_result
+
+    - name: Display parameter result
+      ansible.builtin.debug:
+        msg: "Parameter {{ param_name }} set to {{ param_value }} (scope={{ scope }})"
+      when: 
+        - param_result.changed | default(false)
+
+    # ============================================
+    # Reset Parameter to Default
+    # ============================================
+    - name: Reset Oracle parameter
+      oracle_parameter:
+        hostname: "{{ db_hostname }}"
+        port: "{{ db_port }}"
+        service_name: "{{ db_service }}"
+        user: "{{ db_user }}"
+        password: "{{ db_password }}"
+        mode: "{{ db_mode }}"
+        name: "{{ param_name }}"
+        state: absent
+      when: 
+        - param_name is defined
+        - action == 'reset'
+      register: reset_result
+
+    - name: Display reset result
+      ansible.builtin.debug:
+        msg: "Parameter {{ param_name }} reset to default"
+      when: 
+        - reset_result.changed | default(false)
+
+    # ============================================
+    # Set Multiple Parameters (from list)
+    # ============================================
+    - name: Set multiple Oracle parameters
+      oracle_parameter:
+        hostname: "{{ db_hostname }}"
+        port: "{{ db_port }}"
+        service_name: "{{ db_service }}"
+        user: "{{ db_user }}"
+        password: "{{ db_password }}"
+        mode: "{{ db_mode }}"
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        scope: "{{ item.scope | default('both') }}"
+        state: present
+      loop: "{{ parameters }}"
+      when: parameters | length > 0
+      register: multi_param_result
+
+    - name: Display multi-parameter results
+      ansible.builtin.debug:
+        msg: "Set {{ parameters | length }} parameters"
+      when: 
+        - parameters | length > 0
+        - multi_param_result.changed | default(false)
+
+    # ============================================
+    # Restart Warning
+    # ============================================
+    - name: Check if restart needed
+      ansible.builtin.debug:
+        msg: |
+          ⚠️  WARNING: Parameter changes with scope=spfile require database restart!
+          To restart: srvctl stop database -d {{ db_service }} && srvctl start database -d {{ db_service }}
+      when: scope == 'spfile' or (parameters | selectattr('scope', 'equalto', 'spfile') | list | length > 0)

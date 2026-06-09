@@ -1,0 +1,929 @@
+---
+# roles/oracle_security_check/tasks/main.yml
+#
+# NOTE: This role checks Oracle Advanced Security features (TDE, Data Redaction)
+# - Auto-detects Oracle user, ORACLE_HOME
+# - Supports MULTIPLE instances on same host
+# - Saves reports locally per instance
+#
+
+  # ============================================
+  # Gather minimal facts
+  # ============================================
+  - name: Gather minimal facts
+    ansible.builtin.setup:
+      gather_subset:
+        - '!all'
+        - '!min'
+        - date_time
+    become: no
+
+  - name: Set report timestamp (date + time to prevent overwrites)
+    ansible.builtin.set_fact:
+      _report_date: "{{ ansible_date_time.date }}"
+      _report_timestamp: "{{ ansible_date_time.date }}_{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}{{ ansible_date_time.second }}"
+    run_once: true
+
+  # ============================================
+  # Auto-detect Oracle user from PMON process
+  # ============================================
+  - name: Detect Oracle user from PMON process
+    ansible.builtin.shell:
+      cmd: "ps -eo user:32,args | grep '[o]ra_pmon_' | head -1 | awk '{print $1}'"
+    register: detected_oracle_user
+    changed_when: false
+    become: no
+    failed_when: false
+    when: oracle_user | default('') == ''
+
+  - name: Set detected oracle user
+    ansible.builtin.set_fact:
+      _oracle_user: "{{ oracle_user | default('') or (detected_oracle_user.stdout | default('') | trim) }}"
+
+  - name: Set skip flag if no Oracle detected
+    ansible.builtin.set_fact:
+      _skip_host: "{{ _oracle_user == '' }}"
+      _skip_reason: "{{ 'No Oracle ora_pmon processes found - Oracle database not running on this host' if _oracle_user == '' else '' }}"
+
+  - name: Display skip message
+    ansible.builtin.debug:
+      msg: "SKIPPING {{ inventory_hostname }}: {{ _skip_reason }}"
+    when: _skip_host | bool
+
+  - name: Display detected Oracle user
+    ansible.builtin.debug:
+      msg: "Detected Oracle owner: {{ _oracle_user }}"
+    when: not (_skip_host | bool)
+
+  # ============================================
+  # Detect ALL instances from PMON processes
+  # ============================================
+  - name: Detect all database instances from PMON
+    ansible.builtin.shell:
+      cmd: "ps -eo args | grep '[o]ra_pmon_' | grep -v 'awk' | awk -F'ora_pmon_' '{print $2}' | awk '{print $1}' | sort -u"
+    register: pmon_instances
+    changed_when: false
+    failed_when: false
+    become: no
+    when: not (_skip_host | bool)
+
+  - name: Debug raw pmon output
+    ansible.builtin.debug:
+      var: pmon_instances
+    when: not (_skip_host | bool)
+
+  - name: Set instances list
+    ansible.builtin.set_fact:
+      _all_instances: "{{ [db_sid] if (db_sid | default('')) else (pmon_instances.stdout_lines | default([])) }}"
+    when: not (_skip_host | bool)
+
+  - name: Set empty instances list for skipped hosts
+    ansible.builtin.set_fact:
+      _all_instances: []
+    when: _skip_host | bool
+
+  - name: Update skip flag if no instances found
+    ansible.builtin.set_fact:
+      _skip_host: true
+      _skip_reason: "No Oracle instances detected on this host"
+    when: not (_skip_host | bool) and (_all_instances | length == 0)
+
+  - name: Display detected instances
+    ansible.builtin.debug:
+      msg: "Found {{ _all_instances | length }} instance(s): {{ _all_instances | join(', ') }}"
+    when: not (_skip_host | bool) and (_all_instances | length > 0)
+
+  # ============================================
+  # Get ORACLE_HOME mapping from oratab
+  # ============================================
+  - name: Get oratab contents
+    ansible.builtin.shell:
+      cmd: "cat /etc/oratab | grep -v '^#' | grep -v '^$' | grep ':'"
+    register: oratab_contents
+    changed_when: false
+    failed_when: false
+    become: no
+    when: not (_skip_host | bool)
+
+  - name: Parse oratab into dictionary
+    ansible.builtin.set_fact:
+      _oratab_map: "{{ _oratab_map | default({}) | combine({item.split(':')[0]: item.split(':')[1]}) }}"
+    loop: "{{ oratab_contents.stdout_lines | default([]) }}"
+    when: not (_skip_host | bool) and (item | regex_search('^[^:]+:[^:]+'))
+
+  # ============================================
+  # Setup local report directory
+  # ============================================
+  - name: Set local report path
+    ansible.builtin.set_fact:
+      _local_report_dir: "{{ playbook_dir }}/../reports/{{ _report_date }}/{{ inventory_hostname }}"
+
+  - name: Create local reports directory
+    ansible.builtin.file:
+      path: "{{ _local_report_dir }}"
+      state: directory
+      mode: '0755'
+    delegate_to: localhost
+    become: no
+    when: not (_skip_host | bool)
+
+  # ============================================
+  # Process each instance
+  # ============================================
+  - name: Check security features for each instance (Enhanced Query)
+    ansible.builtin.include_tasks: security_check_instance_advsec.yml
+    loop: "{{ _all_instances }}"
+    loop_control:
+      loop_var: current_sid
+    when: not (_skip_host | bool) and (_all_instances | length > 0)
+
+  # ============================================
+  # Collect results for consolidated report
+  # ============================================
+  - name: Initialize empty instance results for skipped hosts
+    ansible.builtin.set_fact:
+      _instance_results: []
+    when: _skip_host | bool
+
+  - name: Add host results to consolidated list
+    ansible.builtin.set_fact:
+      _host_security_results: "{{ _host_security_results | default([]) + [{'host': inventory_hostname, 'oracle_user': _oracle_user | default('N/A'), 'instances': _all_instances | default([]), 'results': _instance_results | default([]), 'skipped': _skip_host | default(false), 'skip_reason': _skip_reason | default('')}] }}"
+
+  - name: Share results with all hosts
+    ansible.builtin.set_fact:
+      _all_hosts_results: "{{ hostvars | dict2items | selectattr('value._host_security_results', 'defined') | map(attribute='value._host_security_results') | flatten | list }}"
+    run_once: true
+
+  # ============================================
+  # Generate CSV Report for Analysis
+  # ============================================
+  - name: Set CSV report path
+    ansible.builtin.set_fact:
+      _csv_report_path: "{{ playbook_dir }}/../reports/{{ _report_date }}/security_check_results_{{ _report_timestamp }}.csv"
+    run_once: true
+
+  - name: Generate CSV report
+    ansible.builtin.copy:
+      content: |
+        SERVER,INSTANCE,DB_ROLE,OPEN_MODE,TDE_STATUS,REDACTION_STATUS,BACKUP_ENC_STATUS,SECUREFILES_ENC_STATUS,TDE_IN_USE,REDACTION_IN_USE,BACKUP_ENC_IN_USE,SECUREFILES_ENC_IN_USE,IS_STANDBY,REQUIRES_LICENSE
+        {% for host in ansible_play_hosts %}
+        {% set host_vars = hostvars[host] %}
+        {% for result in host_vars._instance_results | default([]) %}
+        {{ host }},{{ result.sid }},{{ result.db_role | default('UNKNOWN') }},{{ result.open_mode | default('UNKNOWN') }},{{ 'IN_USE' if result.tde_used else 'NOT_USED' }},{{ 'IN_USE' if result.redaction_used else 'NOT_USED' }},{{ 'IN_USE' if result.backup_enc_used | default(false) else 'NOT_USED' }},{{ 'IN_USE' if result.securefiles_enc_used | default(false) else 'NOT_USED' }},{{ result.tde_used }},{{ result.redaction_used }},{{ result.backup_enc_used | default(false) }},{{ result.securefiles_enc_used | default(false) }},{{ result.is_standby | default(false) }},{{ result.tde_used or result.redaction_used or result.backup_enc_used | default(false) or result.securefiles_enc_used | default(false) }}
+        {% endfor %}
+        {% endfor %}
+      dest: "{{ _csv_report_path }}"
+    delegate_to: localhost
+    become: no
+    run_once: true
+
+  # ============================================
+  # Build Summary Lists
+  # ============================================
+  - name: Build list of instances with TDE
+    ansible.builtin.set_fact:
+      _tde_instances: |
+        {% for host in ansible_play_hosts %}
+        {% set host_vars = hostvars[host] %}
+        {% for result in host_vars._instance_results | default([]) %}
+        {% if result.tde_used %}{{ host }}/{{ result.sid }}
+        {% endif %}
+        {% endfor %}
+        {% endfor %}
+    run_once: true
+
+  - name: Convert TDE list to proper format
+    ansible.builtin.set_fact:
+      _tde_instances: "{{ _tde_instances.split('\n') | map('trim') | select | list }}"
+    run_once: true
+
+  - name: Build list of instances with Data Redaction
+    ansible.builtin.set_fact:
+      _redaction_instances: |
+        {% for host in ansible_play_hosts %}
+        {% set host_vars = hostvars[host] %}
+        {% for result in host_vars._instance_results | default([]) %}
+        {% if result.redaction_used %}{{ host }}/{{ result.sid }}
+        {% endif %}
+        {% endfor %}
+        {% endfor %}
+    run_once: true
+
+  - name: Convert Redaction list to proper format
+    ansible.builtin.set_fact:
+      _redaction_instances: "{{ _redaction_instances.split('\n') | map('trim') | select | list }}"
+    run_once: true
+
+  - name: Build list of instances without license requirements
+    ansible.builtin.set_fact:
+      _no_license_instances: |
+        {% for host in ansible_play_hosts %}
+        {% set host_vars = hostvars[host] %}
+        {% for result in host_vars._instance_results | default([]) %}
+        {% if not result.tde_used and not result.redaction_used and not (result.is_standby | default(false)) %}{{ host }}/{{ result.sid }}
+        {% endif %}
+        {% endfor %}
+        {% endfor %}
+    run_once: true
+
+  - name: Convert no-license list to proper format
+    ansible.builtin.set_fact:
+      _no_license_instances: "{{ _no_license_instances.split('\n') | map('trim') | select | list }}"
+    run_once: true
+
+  - name: Build list of standby databases
+    ansible.builtin.set_fact:
+      _standby_instances: |
+        {% for host in ansible_play_hosts %}
+        {% set host_vars = hostvars[host] %}
+        {% for result in host_vars._instance_results | default([]) %}
+        {% if result.is_standby | default(false) %}{{ host }}/{{ result.sid }}
+        {% endif %}
+        {% endfor %}
+        {% endfor %}
+    run_once: true
+
+  - name: Convert standby list to proper format
+    ansible.builtin.set_fact:
+      _standby_instances: "{{ _standby_instances.split('\n') | map('trim') | select | list }}"
+    run_once: true
+
+  - name: Build list of skipped hosts
+    ansible.builtin.set_fact:
+      _skipped_hosts: |
+        {% for host in ansible_play_hosts %}
+        {% set host_vars = hostvars[host] %}
+        {% if host_vars._skip_host | default(false) %}{{ host }} ({{ host_vars._skip_reason | default('Unknown reason') }})
+        {% endif %}
+        {% endfor %}
+    run_once: true
+
+  - name: Convert skipped hosts list to proper format
+    ansible.builtin.set_fact:
+      _skipped_hosts: "{{ _skipped_hosts.split('\n') | map('trim') | select | list }}"
+    run_once: true
+
+  - name: Build list of successful hosts
+    ansible.builtin.set_fact:
+      _successful_hosts: |
+        {% for host in ansible_play_hosts %}
+        {% set host_vars = hostvars[host] %}
+        {% if not (host_vars._skip_host | default(false)) and (host_vars._instance_results | default([]) | length > 0) %}{{ host }}
+        {% endif %}
+        {% endfor %}
+    run_once: true
+
+  - name: Convert successful hosts list to proper format
+    ansible.builtin.set_fact:
+      _successful_hosts: "{{ _successful_hosts.split('\n') | map('trim') | select | list }}"
+    run_once: true
+
+  - name: Build list of failed hosts (errors during execution)
+    ansible.builtin.set_fact:
+      _failed_hosts: |
+        {% for host in ansible_play_hosts %}
+        {% set host_vars = hostvars[host] %}
+        {% if not (host_vars._skip_host | default(false)) and (host_vars._instance_results | default([]) | length == 0) %}{{ host }} ({{ host_vars._fail_reason | default('No results collected') }})
+        {% endif %}
+        {% endfor %}
+    run_once: true
+
+  - name: Convert failed hosts list to proper format
+    ansible.builtin.set_fact:
+      _failed_hosts: "{{ _failed_hosts.split('\n') | map('trim') | select | list }}"
+    run_once: true
+
+  # ============================================
+  # Generate consolidated report
+  # ============================================
+  - name: Set consolidated report path
+    ansible.builtin.set_fact:
+      _consolidated_report_path: "{{ playbook_dir }}/../reports/{{ _report_date }}/security_check_consolidated_{{ _report_timestamp }}.txt"
+    run_once: true
+
+  - name: Generate consolidated report
+    ansible.builtin.copy:
+      content: |
+        ================================================================================
+                    ORACLE ADVANCED SECURITY FEATURES - CONSOLIDATED REPORT
+        ================================================================================
+        Generated:   {{ ansible_date_time.iso8601 }}
+        Total Hosts: {{ ansible_play_hosts | length }}
+        ================================================================================
+        
+        FEATURES CHECKED:
+        - Transparent Data Encryption (TDE)
+        - Data Redaction
+        - Backup Encryption
+        - SecureFiles Encryption
+        
+        ================================================================================
+        SUMMARY TABLE
+        ================================================================================
+        
+        +--------------------+----------+--------+------------+----------+----------+----------+----------+------------+----------+
+        | SERVER/INSTANCE    | DB ROLE  | IN-USE | START DATE | TDE      | REDACT   | BACKUP   | SECFILE  | AUDIT DATE | LICENSE  |
+        +--------------------+----------+--------+------------+----------+----------+----------+----------+------------+----------+
+        {% for host in ansible_play_hosts %}
+        {% set host_vars = hostvars[host] %}
+        {%for result in host_vars._instance_results | default([]) %}
+        {% set license_required = result.tde_used or result.redaction_used or result.backup_enc_used | default(false) or result.securefiles_enc_used | default(false) %}
+        | {{ "%-18s" | format(((("[!]" if license_required else "") ~ host ~ "/" ~ result.sid))[:18]) }} | {{ "%-8s" | format(result.db_role[:8]) }} | {{ "%-6s" | format(result.in_use_count | default(0)) }} | {{ "%-10s" | format(result.start_date | default('N/A')) }} | {{ "%-8s" | format(("YES" if result.tde_used else ("INSTALLED" if result.tde_installed == 'TRUE' else ("N/A" if result.is_standby else "NO")))[:8]) }} | {{ "%-8s" | format(("YES" if result.redaction_used else ("INSTALLED" if result.redaction_installed == 'TRUE' else ("N/A" if result.is_standby else "NO")))[:8]) }} | {{ "%-8s" | format(("YES" if result.backup_enc_used | default(false) else ("INSTALLED" if result.backup_enc_installed == 'TRUE' else ("N/A" if result.is_standby else "NO")))[:8]) }} | {{ "%-8s" | format(("YES" if result.securefiles_enc_used | default(false) else ("INSTALLED" if result.securefiles_enc_installed == 'TRUE' else ("N/A" if result.is_standby else "NO")))[:8]) }} | {{ "%-10s" | format((result.audit_date | default('N/A'))[:10]) }} | {{ "%-8s" | format(("REQ" if license_required else "NO")[:8]) }} |
+        {% endfor %}
+        {% endfor %}
+        +--------------------+----------+--------+------------+----------+----------+----------+----------+------------+----------+
+        
+        Legend: YES=In-Use | INSTALLED=Installed but Not Used | NO=Not Installed | N/A=Standby
+        
+        ================================================================================
+        DETAILED OUTPUT BY HOST
+        ================================================================================
+        {% for host in ansible_play_hosts %}
+        {% set host_vars = hostvars[host] %}
+        
+        --------------------------------------------------------------------------------
+        HOST: {{ host }}
+        --------------------------------------------------------------------------------
+        Oracle User: {{ host_vars._oracle_user | default('N/A') }}
+        Instances:   {{ host_vars._all_instances | default([]) | join(', ') }}
+        
+        {% for result in host_vars._instance_results | default([]) %}
+        --- {{ result.sid }} ---
+        {{ result.output }}
+        
+        {% endfor %}
+        {% endfor %}
+        
+        ================================================================================
+        LICENSE SUMMARY
+        ================================================================================
+        
+        INSTANCES WITH TDE IN USE (REQUIRES ADVANCED SECURITY LICENSE):
+        ----------------------------------------------------------------
+        {% if _tde_instances | default([]) | length > 0 %}
+        {% for item in _tde_instances | default([]) %}
+        - {{ item }}
+        {% endfor %}
+        {% else %}
+        (None)
+        {% endif %}
+        
+        INSTANCES WITH DATA REDACTION IN USE (REQUIRES ADVANCED SECURITY LICENSE):
+        ---------------------------------------------------------------------------
+        {% if _redaction_instances | default([]) | length > 0 %}
+        {% for item in _redaction_instances | default([]) %}
+        - {{ item }}
+        {% endfor %}
+        {% else %}
+        (None)
+        {% endif %}
+        
+        INSTANCES WITH BACKUP ENCRYPTION IN USE (REQUIRES ADVANCED SECURITY LICENSE):
+        ------------------------------------------------------------------------------
+        {% if _backup_enc_instances | default([]) | length > 0 %}
+        {% for item in _backup_enc_instances | default([]) %}
+        - {{ item }}
+        {% endfor %}
+        {% else %}
+        (None)
+        {% endif %}
+        
+        INSTANCES WITH SECUREFILES ENCRYPTION IN USE (REQUIRES ADVANCED SECURITY LICENSE):
+        ----------------------------------------------------------------------------------
+        {% if _securefiles_enc_instances | default([]) | length > 0 %}
+        {% for item in _securefiles_enc_instances | default([]) %}
+        - {{ item }}
+        {% endfor %}
+        {% else %}
+        (None)
+        {% endif %}
+        
+        INSTANCES WITHOUT ADVANCED SECURITY FEATURES (NO LICENSE REQUIRED):
+        --------------------------------------------------------------------
+        {% if _no_license_instances | default([]) | length > 0 %}
+        {% for item in _no_license_instances | default([]) %}
+        - {{ item }}
+        {% endfor %}
+        {% else %}
+        (None - All primary instances use at least one Advanced Security feature)
+        {% endif %}
+        
+        STANDBY/MOUNTED DATABASES (CANNOT QUERY - CHECK PRIMARY):
+        ----------------------------------------------------------
+        {% if _standby_instances | default([]) | length > 0 %}
+        {% for item in _standby_instances | default([]) %}
+        - {{ item }}
+        {% endfor %}
+        {% else %}
+        (None)
+        {% endif %}
+        
+        SKIPPED HOSTS (NO ORACLE RUNNING):
+        -----------------------------------
+        {% if _skipped_hosts | default([]) | length > 0 %}
+        {% for item in _skipped_hosts | default([]) %}
+        - {{ item }}
+        {% endfor %}
+        {% else %}
+        (None - All hosts have Oracle instances)
+        {% endif %}
+        
+        FAILED HOSTS (ERRORS DURING EXECUTION):
+        ----------------------------------------
+        {% if _failed_hosts | default([]) | length > 0 %}
+        {% for item in _failed_hosts | default([]) %}
+        - {{ item }}
+        {% endfor %}
+        {% else %}
+        (None)
+        {% endif %}
+        
+        NOTE: Unreachable hosts (SSH connection failures) are not listed here.
+              Check Ansible output for hosts marked as UNREACHABLE.
+        
+        ================================================================================
+        HOST STATUS SUMMARY
+        ================================================================================
+        Successful Hosts:                {{ _successful_hosts | default([]) | length }}
+        Skipped (No Oracle):             {{ _skipped_hosts | default([]) | length }}
+        Failed (Execution Errors):       {{ _failed_hosts | default([]) | length }}
+        -------------------------------------------------------------------------------
+        Total Hosts Processed:           {{ ansible_play_hosts | length }}
+        
+        ================================================================================
+        INSTANCE TOTALS
+        ================================================================================
+        Total Instances Checked:         {% set total = [] %}{% for host in ansible_play_hosts %}{% set host_vars = hostvars[host] %}{% for result in host_vars._instance_results | default([]) %}{% set _ = total.append(1) %}{% endfor %}{% endfor %}{{ total | length }}
+        Primary Instances with TDE:      {{ _tde_instances | default([]) | length }}
+        Primary Instances with Redact:   {{ _redaction_instances | default([]) | length }}
+        Primary with Backup Enc:         {{ _backup_enc_instances | default([]) | length }}
+        Primary with SecureFiles Enc:    {{ _securefiles_enc_instances | default([]) | length }}
+        Primary without ASO features:    {{ _no_license_instances | default([]) | length }}
+        Standby/Mounted (not checked):   {{ _standby_instances | default([]) | length }}
+        
+        ================================================================================
+        LEGEND
+        ================================================================================
+        IN USE     : Feature is actively used (license required)
+        NOT USED   : Feature is not in use (no license required)
+        
+        CSV FILE: security_check_results_{{ _report_timestamp }}.csv (for spreadsheet analysis)
+        
+        ================================================================================
+                              END OF CONSOLIDATED REPORT
+        ================================================================================
+      dest: "{{ _consolidated_report_path }}"
+    delegate_to: localhost
+    become: no
+    run_once: true
+
+  # ============================================
+  # Generate HTML Report with Colors
+  # ============================================
+  - name: Set HTML report path
+    ansible.builtin.set_fact:
+      _html_report_path: "{{ playbook_dir }}/../reports/{{ _report_date }}/security_check_report_{{ _report_timestamp }}.html"
+    run_once: true
+
+  - name: Generate HTML report with colors
+    ansible.builtin.copy:
+      content: |
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Oracle Advanced Security Report - {{ ansible_date_time.iso8601 }}</title>
+            <style>
+                :root {
+                    --primary: #1e3a8a;
+                    --success: #10b981;
+                    --warning: #f59e0b;
+                    --danger: #dc2626;
+                    --danger-bg: #fef2f2;
+                    --info: #3b82f6;
+                    --light: #f8fafc;
+                    --dark: #1e293b;
+                    --muted: #64748b;
+                    --border: #e2e8f0;
+                }
+                body {
+                    font-family: 'Inter', -apple-system, system-ui, sans-serif;
+                    background: #f1f5f9;
+                    margin: 0;
+                    padding: 40px;
+                    min-height: 100vh;
+                    color: #1e293b;
+                }
+                .container {
+                    max-width: 1400px;
+                    margin: 0 auto;
+                    background: white;
+                    border-radius: 16px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.08);
+                    overflow: hidden;
+                    border: 1px solid var(--border);
+                }
+                .header {
+                    background: linear-gradient(135deg, var(--primary) 0%, #3b82f6 100%);
+                    color: white;
+                    padding: 40px 30px;
+                    text-align: center;
+                }
+                .header h1 {
+                    margin: 0;
+                    font-size: 2.2rem;
+                    font-weight: 800;
+                    letter-spacing: -0.02em;
+                }
+                .header .subtitle {
+                    opacity: 0.9;
+                    margin-top: 10px;
+                    font-size: 1rem;
+                    font-weight: 500;
+                }
+                .content {
+                    padding: 40px;
+                }
+                .summary-cards {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+                    gap: 24px;
+                    margin-bottom: 40px;
+                }
+                .card {
+                    background: white;
+                    border-radius: 12px;
+                    padding: 24px;
+                    text-align: center;
+                    border: 1px solid var(--border);
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+                    transition: transform 0.2s;
+                }
+                .card:hover { transform: translateY(-4px); }
+                .card .number {
+                    font-size: 3rem;
+                    font-weight: 800;
+                    color: var(--primary);
+                    line-height: 1;
+                    margin-bottom: 10px;
+                }
+                .card .label {
+                    color: var(--muted);
+                    font-size: 0.85rem;
+                    font-weight: 600;
+                    text-transform: uppercase;
+                    letter-spacing: 0.05em;
+                }
+                
+                .section-title {
+                    font-size: 1.25rem;
+                    font-weight: 700;
+                    color: var(--dark);
+                    border-bottom: 2px solid var(--border);
+                    padding-bottom: 12px;
+                    margin-bottom: 24px;
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                }
+
+                table {
+                    width: 100%;
+                    border-collapse: separate;
+                    border-spacing: 0;
+                    margin-bottom: 30px;
+                    border: 1px solid var(--border);
+                    border-radius: 10px;
+                    overflow: hidden;
+                }
+                th {
+                    background: #f8fafc;
+                    color: var(--muted);
+                    padding: 14px 16px;
+                    text-align: left;
+                    font-weight: 600;
+                    font-size: 0.75rem;
+                    text-transform: uppercase;
+                    letter-spacing: 0.05em;
+                    border-bottom: 2px solid var(--border);
+                }
+                td {
+                    padding: 14px 16px;
+                    border-bottom: 1px solid var(--border);
+                    font-size: 0.9rem;
+                    vertical-align: middle;
+                }
+                tr:last-child td { border-bottom: none; }
+                tr:hover { background: #fcfdfe; }
+
+                .server-name { color: var(--primary); font-weight: 700; }
+                
+                .status-badge {
+                    display: inline-flex;
+                    align-items: center;
+                    padding: 4px 12px;
+                    border-radius: 20px;
+                    font-size: 0.75rem;
+                    font-weight: 700;
+                    text-transform: uppercase;
+                    white-space: nowrap;
+                }
+                .status-in-use { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
+                .status-installed { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+                .status-not-used { background: #f1f5f9; color: #475569; border: 1px solid var(--border); }
+                .status-na { background: #fef3c7; color: #92400e; }
+                .status-standby { background: #dbeafe; color: #1e40af; }
+
+                .host-list { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
+                .host-list li {
+                    padding: 12px 16px;
+                    border-radius: 8px;
+                    background: var(--light);
+                    border-left: 4px solid var(--primary);
+                    font-size: 0.9rem;
+                    font-weight: 500;
+                }
+                .host-list.success li { border-left-color: var(--success); }
+                .host-list.warning li { border-left-color: var(--warning); }
+                .host-list.danger li { border-left-color: var(--danger); }
+                
+                .footer {
+                    background: var(--light);
+                    padding: 30px;
+                    text-align: center;
+                    color: var(--muted);
+                    font-size: 0.85rem;
+                    border-top: 1px solid var(--border);
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>🔐 Oracle Advanced Security Features Report</h1>
+                    <div class="subtitle">Generated: {{ ansible_date_time.iso8601 }}</div>
+                </div>
+                
+            <div class="content">
+                    <!-- Summary Cards -->
+                    <div class="summary-cards">
+                        <div class="card success">
+                            <div class="number">{{ _successful_hosts | default([]) | length }}</div>
+                            <div class="label">Successful Hosts</div>
+                        </div>
+                        <div class="card info">
+                            <div class="number">{% set total = [] %}{% for host in ansible_play_hosts %}{% set host_vars = hostvars[host] %}{% for result in host_vars._instance_results | default([]) %}{% set _ = total.append(1) %}{% endfor %}{% endfor %}{{ total | length }}</div>
+                            <div class="label">Instances Checked</div>
+                        </div>
+                        <div class="card warning">
+                            <div class="number">{{ (_tde_instances | default([]) | length) + (_redaction_instances | default([]) | length) + (_backup_enc_instances | default([]) | length) + (_securefiles_enc_instances | default([]) | length) }}</div>
+                            <div class="label">Total Features In Use</div>
+                        </div>
+                        <div class="card danger">
+                            <div class="number">{{ _skipped_hosts | default([]) | length + (_failed_hosts | default([]) | length) }}</div>
+                            <div class="label">Skipped/Failed</div>
+                        </div>
+                    </div>
+        
+                    <!-- Instance Results Table -->
+                    <div class="section">
+                        <h2 class="section-title">📊 Instance Security Status</h2>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th style="width: 12%">Server</th>
+                                    <th style="width: 10%">Instance</th>
+                                    <th style="width: 8%">In-Use</th>
+                                    <th style="width: 10%">Start Date</th>
+                                    <th style="width: 8%">DB Role</th>
+                                    <th style="width: 12%">TDE Status</th>
+                                    <th style="width: 12%">Data Redaction</th>
+                                    <th style="width: 12%">Backup Enc</th>
+                                    <th style="width: 8%">SecureFiles</th>
+                                    <th style="width: 8%; text-align: center;">Audit Date</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for host in ansible_play_hosts %}
+                                {% set host_vars = hostvars[host] %}
+                                {% for result in host_vars._instance_results | default([]) %}
+                                {% set license_required = result.tde_used or result.redaction_used or result.backup_enc_used | default(false) or result.securefiles_enc_used | default(false) %}
+                                <tr {% if license_required %}style="background-color: var(--danger-bg); border-left: 4px solid var(--danger);"{% endif %}>
+                                    <td class="server-name" {% if license_required %}style="color: var(--danger); font-weight: 900; filter: drop-shadow(0 0 1px rgba(220, 38, 38, 0.2));"{% endif %}>{{ host }}</td>
+                                    <td><a href="{{ host }}/{{ result.report_file }}" target="_blank" style="color: {{ 'var(--danger)' if license_required else 'var(--primary)' }}; text-decoration: none; font-weight: 800; border-bottom: 2px solid {{ 'var(--danger)' if license_required else 'var(--primary)' }};">{{ result.sid }}</a></td>
+                                    <td style="text-align: center;"><span class="status-badge {{ 'status-in-use' if result.in_use_count | int > 0 else 'status-not-used' }}">{{ result.in_use_count | default(0) }}</span></td>
+                                    <td style="text-align: center; font-weight: 600;">{{ result.start_date | default('N/A') }}</td>
+                                    <td>{% if result.is_standby | default(false) %}<span class="status-badge status-standby">{{ result.db_role | default('STANDBY') }}</span>{% else %}<span style="font-weight: 600;">{{ result.db_role | default('PRIMARY') }}</span>{% endif %}</td>
+                                    <td>
+                                        {% if result.is_standby | default(false) %}<span class="status-badge status-na">N/A</span>
+                                        {% elif result.tde_used %}
+                                            <span class="status-badge status-in-use">IN USE</span>
+                                            <div style="color:var(--status-used-text); font-size:0.7rem; font-weight:600; margin-top:5px;">TBS: {{ result.tde_details }}</div>
+                                        {% elif result.tde_installed == 'TRUE' %}
+                                            <span class="status-badge status-installed">INSTALLED</span>
+                                        {% else %}<span class="status-badge status-not-used">NO</span>{% endif %}
+                                    </td>
+                                    <td>
+                                        {% if result.is_standby | default(false) %}<span class="status-badge status-na">N/A</span>
+                                        {% elif result.redaction_used %}
+                                            <span class="status-badge status-in-use">IN USE</span>
+                                            <div style="color:var(--status-used-text); font-size:0.7rem; font-weight:600; margin-top:5px;">Policies: {{ result.redaction_details }}</div>
+                                        {% elif result.redaction_installed == 'TRUE' %}
+                                            <span class="status-badge status-installed">INSTALLED</span>
+                                        {% else %}<span class="status-badge status-not-used">NO</span>{% endif %}
+                                    </td>
+                                    <td>
+                                        {% if result.is_standby | default(false) %}<span class="status-badge status-na">N/A</span>
+                                        {% elif result.backup_enc_used | default(false) %}
+                                            <span class="status-badge status-in-use">IN USE</span>
+                                            <div style="color:var(--status-used-text); font-size:0.7rem; font-weight:600; margin-top:5px;">Pieces: {{ result.backup_enc_details }}</div>
+                                        {% elif result.backup_enc_installed == 'TRUE' %}
+                                            <span class="status-badge status-installed">INSTALLED</span>
+                                        {% else %}<span class="status-badge status-not-used">NO</span>{% endif %}
+                                    </td>
+                                    <td>
+                                        {% if result.is_standby | default(false) %}<span class="status-badge status-na">N/A</span>
+                                        {% elif result.securefiles_enc_used | default(false) %}
+                                            <span class="status-badge status-in-use">IN USE</span>
+                                            <div style="color:var(--status-used-text); font-size:0.7rem; font-weight:600; margin-top:5px;">LOBs: {{ result.securefiles_enc_details }}</div>
+                                        {% elif result.securefiles_enc_installed == 'TRUE' %}
+                                            <span class="status-badge status-installed">INSTALLED</span>
+                                        {% else %}<span class="status-badge status-not-used">NO</span>{% endif %}
+                                    </td>
+                                    <td style="text-align: center; color: var(--muted); font-family: monospace;">{{ result.audit_date | default('N/A') }}</td>
+                                </tr>
+                                {% endfor %}
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+        
+                    <!-- License Summary -->
+                    <div class="section">
+                        <h2 class="section-title">📋 License Summary</h2>
+                        
+                        <h4>🔒 Instances with TDE (License Required)</h4>
+                        {% if _tde_instances | default([]) | length > 0 %}
+                        <ul class="host-list warning">
+                            {% for item in _tde_instances | default([]) %}
+                            <li>{{ item }}</li>
+                            {% endfor %}
+                        </ul>
+                        {% else %}
+                        <p class="no-items">No instances using TDE</p>
+                        {% endif %}
+                        
+                        <h4>🎭 Instances with Data Redaction (License Required)</h4>
+                        {% if _redaction_instances | default([]) | length > 0 %}
+                        <ul class="host-list warning">
+                            {% for item in _redaction_instances | default([]) %}
+                            <li>{{ item }}</li>
+                            {% endfor %}
+                        </ul>
+                        {% else %}
+                        <p class="no-items">No instances using Data Redaction</p>
+                        {% endif %}
+                        
+                        <h4>💾 Instances with Backup Encryption (License Required)</h4>
+                        {% if _backup_enc_instances | default([]) | length > 0 %}
+                        <ul class="host-list warning">
+                            {% for item in _backup_enc_instances | default([]) %}
+                            <li>{{ item }}</li>
+                            {% endfor %}
+                        </ul>
+                        {% else %}
+                        <p class="no-items">No instances using Backup Encryption</p>
+                        {% endif %}
+                        
+                        <h4>📂 Instances with SecureFiles Encryption (License Required)</h4>
+                        {% if _securefiles_enc_instances | default([]) | length > 0 %}
+                        <ul class="host-list warning">
+                            {% for item in _securefiles_enc_instances | default([]) %}
+                            <li>{{ item }}</li>
+                            {% endfor %}
+                        </ul>
+                        {% else %}
+                        <p class="no-items">No instances using SecureFiles Encryption</p>
+                        {% endif %}
+                        
+                        <h4>✅ Instances without ASO Features (No License Required)</h4>
+                        {% if _no_license_instances | default([]) | length > 0 %}
+                        <ul class="host-list success">
+                            {% for item in _no_license_instances | default([]) %}
+                            <li>{{ item }}</li>
+                            {% endfor %}
+                        </ul>
+                        {% else %}
+                        <p class="no-items">All instances use at least one ASO feature</p>
+                        {% endif %}
+                    </div>
+        
+                    <!-- Host Status -->
+                    <div class="section">
+                        <h2 class="section-title">🖥️ Host Status Details</h2>
+                        
+                        <h4>✅ Successful Hosts ({{ _successful_hosts | default([]) | length }})</h4>
+                        {% if _successful_hosts | default([]) | length > 0 %}
+                        <ul class="host-list success">
+                            {% for item in _successful_hosts | default([]) %}
+                            <li>{{ item }}</li>
+                            {% endfor %}
+                        </ul>
+                        {% else %}
+                        <p class="no-items">No successful hosts</p>
+                        {% endif %}
+                        
+                        <h4>⏭️ Skipped Hosts - No Oracle Running ({{ _skipped_hosts | default([]) | length }})</h4>
+                        {% if _skipped_hosts | default([]) | length > 0 %}
+                        <ul class="host-list info">
+                            {% for item in _skipped_hosts | default([]) %}
+                            <li>{{ item }}</li>
+                            {% endfor %}
+                        </ul>
+                        {% else %}
+                        <p class="no-items">All hosts have Oracle instances</p>
+                        {% endif %}
+                        
+                        <h4>❌ Failed Hosts ({{ _failed_hosts | default([]) | length }})</h4>
+                        {% if _failed_hosts | default([]) | length > 0 %}
+                        <ul class="host-list danger">
+                            {% for item in _failed_hosts | default([]) %}
+                            <li>{{ item }}</li>
+                            {% endfor %}
+                        </ul>
+                        {% else %}
+                        <p class="no-items">No failed hosts</p>
+                        {% endif %}
+                        
+                        <h4>🔄 Standby Databases ({{ _standby_instances | default([]) | length }})</h4>
+                        {% if _standby_instances | default([]) | length > 0 %}
+                        <ul class="host-list info">
+                            {% for item in _standby_instances | default([]) %}
+                            <li>{{ item }}</li>
+                            {% endfor %}
+                        </ul>
+                        {% else %}
+                        <p class="no-items">No standby databases</p>
+                        {% endif %}
+                    </div>
+                </div>
+                
+                <div class="footer">
+                    <p>Oracle Advanced Security Check | Total Hosts Processed: {{ ansible_play_hosts | length }}</p>
+                    <p>Report generated by Ansible playbook: check_advanced_security.yml</p>
+                </div>
+            </div>
+        </body>
+        </html>
+      dest: "{{ _html_report_path }}"
+    delegate_to: localhost
+    become: no
+    run_once: true
+
+  # ============================================
+  # Final summary
+  # ============================================
+  - name: Display final summary
+    ansible.builtin.debug:
+      msg: |
+        
+        ========================================
+        SECURITY CHECK COMPLETE
+        ========================================
+        Host: {{ inventory_hostname }}
+        Instances checked: {{ _all_instances | length }}
+        
+        Reports saved to: reports/{{ _report_date }}/{{ inventory_hostname }}/
+        {% for sid in _all_instances %}
+        - security_check_{{ sid }}_{{ _report_timestamp }}.txt
+        {% endfor %}
+        ========================================
+    when: not (_skip_host | default(false))
+
+  - name: Display skipped host notice
+    ansible.builtin.debug:
+      msg: "SKIPPED: {{ inventory_hostname }} - {{ _skip_reason | default('No Oracle running') }}"
+    when: _skip_host | default(false)
+
+  - name: Display consolidated report location
+    ansible.builtin.debug:
+      msg: |
+        
+        ========================================
+        CONSOLIDATED REPORTS
+        ========================================
+        HTML Report: reports/{{ _report_date }}/security_check_report_{{ _report_timestamp }}.html  (with colors!)
+        Text Report: reports/{{ _report_date }}/security_check_consolidated_{{ _report_timestamp }}.txt
+        CSV Report:  reports/{{ _report_date }}/security_check_results_{{ _report_timestamp }}.csv
+        
+        HOST STATUS SUMMARY:
+        - Successful:           {{ _successful_hosts | default([]) | length }}
+        - Skipped (no Oracle):  {{ _skipped_hosts | default([]) | length }}
+        - Failed (errors):      {{ _failed_hosts | default([]) | length }}
+        - Total processed:      {{ ansible_play_hosts | length }}
+        
+        NOTE: Unreachable hosts (SSH failures) show in
+              Ansible output as UNREACHABLE, not in report.
+        ========================================
+    run_once: true

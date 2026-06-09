@@ -1,0 +1,56 @@
+---
+# playbooks/collect_inmemory_specific_hosts.yml
+#
+# Re-collect In-Memory evidence ONLY for hosts that show IS_INUSE=Y
+# Use this to gather missing details without re-running entire estate
+#
+# Usage:
+#   ansible-playbook playbooks/collect_inmemory_specific_hosts.yml \
+#     -i ansibleInventory/inv_key.yml \
+#     -e "run_label=InMemory-Followup-$(date +%Y-%m-%d)"
+#
+# Target hosts: crlnxm145 (aahd), crlnxt222 (aahsb)
+#
+
+- name: Collect In-Memory Evidence for Specific Hosts
+  hosts: 
+    - crlnxm145
+    - crlnxt222
+  gather_facts: yes
+  
+  vars:
+    # Force full evidence collection
+    collect_partitioning: true
+    collect_compression: true
+    collect_security: true
+    collect_inmemory: true    # ← KEY: Enable In-Memory collection
+    collect_pdbs: true
+    collect_adg: true
+    collect_rac: true
+    
+    # Repository connection (use d1hub)
+    repo_tns_alias: "d1hub"
+    repo_host: "crlnxd1046"
+    repo_port: "1535"
+    repo_sid: "d1hub"
+    repo_user: "DBAORALIC_SCH"
+    repo_schema: "DBAORALIC_SCH"
+    repo_password: "PP1_mQo84M8G"
+    
+    # Run label
+    run_label: "InMemory-Followup-{{ lookup('pipe', 'date +%Y-%m-%d') }}"
+
+  roles:
+    - oracle_options_audit
+
+  post_tasks:
+    - name: Summary - Hosts Audited
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          In-Memory Evidence Collection Complete
+          ============================================
+          Hosts: {{ ansible_play_hosts | join(', ') }}
+          Run Label: {{ run_label }}
+          
+          Next: Run report_audit_run.yml to generate report

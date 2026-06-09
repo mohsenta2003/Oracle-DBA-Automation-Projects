@@ -1,0 +1,240 @@
+---
+# Sync logs for a specific Oracle listener
+# Variables: current_listener, _oracle_user, nfs_log_path, _adr_base (from main.yml)
+#
+# AIX Note: Listener names include port (e.g., mrptprs.1611, mafp1wp.1651)
+# Listener logs are in ADR location: <diagnostic_dest>/diag/tnslsnr/<hostname>/<listener_name>/trace/
+#
+# Example paths on dcup60:
+#   ADR Base: /u01/mod/backup
+#   Listener: hzarcmo.1682
+#   Log Path: /u01/mod/backup/diag/tnslsnr/dcup60/hzarcmo.1682/trace/
+#
+
+  - name: "{{ current_listener }} - Initialize listener log path"
+    ansible.builtin.set_fact:
+      listener_log_dir: ""
+
+  # ============================================
+  # Build listener base path (parent of alert/trace)
+  # ============================================
+  - name: "{{ current_listener }} - Get hostname for ADR path"
+    ansible.builtin.shell:
+      cmd: "hostname | cut -d'.' -f1"
+    register: short_hostname
+    changed_when: false
+
+  - name: "{{ current_listener }} - Build tentative ADR listener base path"
+    ansible.builtin.set_fact:
+      listener_base_dir: "{{ _adr_base }}/diag/tnslsnr/{{ short_hostname.stdout | trim }}/{{ current_listener }}"
+    when: _adr_base | default('') != ''
+
+  - name: "{{ current_listener }} - Verify listener base directory exists"
+    ansible.builtin.shell:
+      cmd: |
+        # Check tentative path first
+        if [ -n "{{ listener_base_dir | default('') }}" ] && [ -d "{{ listener_base_dir | default('') }}" ]; then
+          echo "{{ listener_base_dir }}"
+        else
+          # Robust fallback: Find directory ending in listener name containing 'alert' or 'trace'
+          # Case-insensitive grep to handle hostname variations
+          find /u01 /u02 /opt /oracle -type d -name "{{ current_listener }}" 2>/dev/null | while read dir; do
+            if [ -d "$dir/alert" ] || [ -d "$dir/trace" ]; then
+              echo "$dir"
+              break
+            fi
+          done
+        fi
+    register: listener_base_check
+    changed_when: false
+    failed_when: false
+
+  - name: "{{ current_listener }} - Set confirmed listener base dir"
+    ansible.builtin.set_fact:
+      listener_base_dir: "{{ listener_base_check.stdout | trim }}"
+    when: 
+      - listener_base_check.stdout | default('') | trim != ''
+
+  - name: "{{ current_listener }} - Display listener base path"
+    ansible.builtin.debug:
+      msg: |
+        Listener: {{ current_listener }}
+        Base Directory: {{ listener_base_dir | default('NOT FOUND') }}
+
+  - name: "{{ current_listener }} - Process listener logs"
+    when: listener_base_dir | default('') != ''
+    block:
+      # ============================================
+      # Create NFS directory for listener
+      # ============================================
+      - name: "{{ current_listener }} - Create NFS directory for listener"
+        ansible.builtin.file:
+          path: "{{ nfs_log_path }}/{{ inventory_hostname }}/listener/{{ current_listener }}"
+          state: directory
+          mode: '0755'
+
+      # ============================================
+      # Sync Listener Logs (Trace)
+      # ============================================
+      - name: "{{ current_listener }} - Sync listener trace logs to NFS"
+        ansible.builtin.shell:
+          cmd: |
+            TRACE_DIR="{{ listener_base_dir }}/trace"
+            if [ -d "$TRACE_DIR" ]; then
+              {% if sync_mode == 'incremental' %}
+              rsync {{ rsync_incremental_options }} \
+              {% else %}
+              rsync {{ rsync_options }} \
+              {% endif %}
+                --include='*.log' \
+                --include='*.xml' \
+                --exclude='*' \
+                "$TRACE_DIR/" \
+                "{{ nfs_log_path }}/{{ inventory_hostname }}/listener/{{ current_listener }}/"
+              echo "SYNC_SUCCESS: Listener trace logs synced"
+            else
+              echo "SKIP: Listener trace directory not found at $TRACE_DIR"
+            fi
+        register: listener_sync_result
+        changed_when: "'SYNC_SUCCESS' in listener_sync_result.stdout"
+        failed_when: false
+        when: job_type in ['full', 'sync_only']
+
+      # ============================================
+      # Also sync listener alert directory if exists
+      # ============================================
+      - name: "{{ current_listener }} - Sync listener alert logs"
+        ansible.builtin.shell:
+          cmd: |
+            ALERT_DIR="{{ listener_base_dir }}/alert"
+            if [ -d "$ALERT_DIR" ]; then
+              rsync {{ rsync_options }} \
+                --include='*.xml' \
+                --include='*.log' \
+                --exclude='*' \
+                "$ALERT_DIR/" \
+                "{{ nfs_log_path }}/{{ inventory_hostname }}/listener/{{ current_listener }}/alert/"
+              echo "SYNC_SUCCESS: Listener alert logs synced"
+            else
+              echo "SKIP: Listener alert directory not found at $ALERT_DIR"
+            fi
+        register: listener_alert_sync_result
+        changed_when: "'SYNC_SUCCESS' in listener_alert_sync_result.stdout"
+        failed_when: false
+        when: job_type in ['full', 'sync_only']
+
+  # ============================================
+  # Metric Collection (Advanced Reporting)
+  # ============================================
+  - name: "{{ current_listener }} - Collect Listener Log Metrics (Source)"
+    ansible.builtin.stat:
+      path: "{{ listener_base_dir }}/trace/listener.log"
+    register: lsnr_log_stat
+    ignore_errors: true
+    when: listener_base_dir | default('') != ''
+
+  - name: "{{ current_listener }} - Find latest listener log on NFS (Fallback)"
+    ansible.builtin.shell:
+      cmd: "ls -1t {{ nfs_log_path }}/{{ inventory_hostname }}/listener/{{ current_listener }}/*.log {{ nfs_log_path }}/{{ inventory_hostname }}/listener/{{ current_listener }}/*.xml 2>/dev/null | head -1"
+    register: nfs_lsnr_find
+    changed_when: false
+    when: listener_base_dir | default('') != ''
+
+  - name: "{{ current_listener }} - Collect Listener Log Metrics (NFS Destination)"
+    ansible.builtin.stat:
+      path: "{{ nfs_lsnr_find.stdout }}"
+    register: nfs_lsnr_stat
+    ignore_errors: true
+    when: 
+      - listener_base_dir | default('') != ''
+      - nfs_lsnr_find.stdout | default('') != ''
+
+  # ============================================
+  # Record sync status for report (Always run)
+  # ============================================
+  - name: "{{ current_listener }} - Record listener sync status"
+    ansible.builtin.set_fact:
+      listener_sync_results: "{{ listener_sync_results | default([]) + [{
+        'listener': current_listener,
+        'log_dir': listener_base_dir | default('N/A'),
+        'sync_result': listener_sync_result.stdout | default('N/A'),
+        'synced_files': (listener_sync_result.stdout_lines | default([]) + listener_alert_sync_result.stdout_lines | default([])) | reject('search', 'building file list') | reject('search', 'files...') | reject('search', 'files to consider') | reject('search', 'sending incremental file list') | reject('search', 'SYNC_SUCCESS') | reject('search', 'sent') | reject('search', 'wrote') | reject('search', 'total size') | reject('match', '^\\s') | reject('match', '^\\./$') | reject('match', '^$') | list,
+        'check_lsnr_mtime': lsnr_log_stat.stat.mtime | default(0),
+        'check_lsnr_size': lsnr_log_stat.stat.size | default(0),
+        'nfs_lsnr_mtime': nfs_lsnr_stat.stat.mtime | default(0),
+        'nfs_lsnr_size': nfs_lsnr_stat.stat.size | default(0),
+        'nfs_log_file': nfs_lsnr_find.stdout | default('N/A')
+        }] }}"
+
+  # ============================================
+  # Update Sync Manifest (Listener State)
+  # ============================================
+  - name: "{{ current_listener }} - Consolidate synced file list for manifest"
+    ansible.builtin.set_fact:
+      _lsnr_synced_files: >-
+        {{
+          (listener_sync_result.stdout_lines | default([]) + listener_alert_sync_result.stdout_lines | default([])) 
+          | reject('search', 'building file list') 
+          | reject('search', 'files...') 
+          | reject('search', 'files to consider') 
+          | reject('search', 'sending incremental file list') 
+          | reject('search', 'SYNC_SUCCESS') 
+          | reject('search', 'sent') 
+          | reject('search', 'wrote') 
+          | reject('search', 'total size') 
+          | reject('match', '^\\s') 
+          | reject('match', '^\\./$') 
+          | reject('match', '^$') 
+          | list
+        }}
+
+  - name: "{{ current_listener }} - Update Sync History File on NFS"
+    ansible.builtin.shell:
+      cmd: |
+        TIMESTAMP="{{ ansible_date_time.iso8601 }}"
+        MANIFEST="{{ nfs_log_path }}/{{ inventory_hostname }}/listener/{{ current_listener }}/sync_history.log"
+        {% for file in _lsnr_synced_files %}
+        echo "{{ file }} | $TIMESTAMP" >> "$MANIFEST"
+        {% endfor %}
+    changed_when: false
+    when: _lsnr_synced_files | length > 0
+
+  - name: "{{ current_listener }} - Check for existing sync state"
+    ansible.builtin.stat:
+      path: "{{ nfs_log_path }}/{{ inventory_hostname }}/listener/{{ current_listener }}/sync_state.json"
+    register: lsnr_state_file
+
+  - name: "{{ current_listener }} - Read existing sync state"
+    ansible.builtin.slurp:
+      src: "{{ nfs_log_path }}/{{ inventory_hostname }}/listener/{{ current_listener }}/sync_state.json"
+    register: existing_sync_state
+    when:
+      - lsnr_state_file.stat.exists
+      - _lsnr_synced_files | length > 0
+    ignore_errors: true
+
+  - name: "{{ current_listener }} - Parse existing sync state"
+    ansible.builtin.set_fact:
+      _sync_state_data: "{{ existing_sync_state.content | b64decode | from_json }}"
+    when:
+      - lsnr_state_file.stat.exists
+      - existing_sync_state.content is defined
+    ignore_errors: true
+
+  - name: "{{ current_listener }} - Define new sync state"
+    ansible.builtin.set_fact:
+      _new_sync_state:
+        created_at: "{{ (_sync_state_data | default({})).created_at | default(ansible_date_time.iso8601) }}"
+        updated_at: "{{ ansible_date_time.iso8601 }}"
+        listener: "{{ current_listener }}"
+        host: "{{ inventory_hostname }}"
+        sync_mode: "{{ sync_mode }}"
+        last_batch_count: "{{ _lsnr_synced_files | length }}"
+    when: _lsnr_synced_files | length > 0 or not lsnr_state_file.stat.exists
+
+  - name: "{{ current_listener }} - Write sync state to NFS"
+    ansible.builtin.copy:
+      dest: "{{ nfs_log_path }}/{{ inventory_hostname }}/listener/{{ current_listener }}/sync_state.json"
+      content: "{{ _new_sync_state | to_nice_json }}"
+      mode: '0644'
+    when: _lsnr_synced_files | length > 0 or not lsnr_state_file.stat.exists

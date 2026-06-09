@@ -1,0 +1,233 @@
+---
+# vars/java_action_rules.yml
+#
+# Classification rules that map a discovered Java install (row in
+# JAVA_SCAN_INSTALLS) to a supported remediation method.
+#
+# Loaded by playbooks/update_java_action_rules.yml into the
+# JAVA_ACTION_RULES table. The report and remediation playbooks then
+# look up the highest-priority matching rule for each install row.
+#
+# Matching:
+#   path_pattern    - SQL LIKE pattern matched against JAVA_BIN_PATH (required)
+#   java_major_min  - inclusive lower bound on JAVA_MAJOR (optional)
+#   java_major_max  - inclusive upper bound on JAVA_MAJOR (optional)
+#   priority        - lower wins. First match (after ORDER BY priority) is used.
+#
+# Risk tiers:
+#   GREEN   - safe to remediate via Ansible / OS package mgmt; no Oracle restart
+#   YELLOW  - vendor-supported update path exists, but requires DBA/OEM change
+#             window (OPatch JDK BP, OEM OMS bundle, etc.)
+#   RED     - no in-place JDK update path; product is EOL, requires upgrade /
+#             decommission project
+#   INFO    - do nothing here; component is updated via its parent (e.g. OPatch)
+
+java_action_rules:
+
+  # ── 1. OPatch's bundled JRE - DO NOT touch directly ──────────────────────
+  - rule_id: "OPATCH-BUNDLED-JRE"
+    path_pattern: "%/OPatch/jre/%"
+    priority: 10
+    risk_tier: "INFO"
+    action_method: "Bundled with OPatch - no direct action"
+    owner: "DBA"
+    precheck_notes: "Refreshed when OPatch itself is updated (MOS 274526.1). Do not patch in-place."
+
+  - rule_id: "OPATCH-STALE-BACKUP"
+    path_pattern: "%OPatch_b4_update_%/%"
+    priority: 15
+    risk_tier: "GREEN"
+    action_method: "Cleanup - rm -rf stale OPatch_b4_update_* dir"
+    owner: "DBA"
+    precheck_notes: "Confirm parent OPatch already upgraded successfully; backup dir is safe to remove."
+
+  # ── 2. OEM OMS / Agent JDK ──────────────────────────────────────────────
+  - rule_id: "OEM-OMS-JDK"
+    path_pattern: "%/oms/jdk/%"
+    priority: 20
+    risk_tier: "YELLOW"
+    action_method: "OEM OMS JDK Bundle Patch (per MOS-noted procedure)"
+    owner: "OEM admin"
+    precheck_notes: "Requires OMS downtime; coordinate with OEM admin."
+
+  - rule_id: "OEM-OMS-JDK-VERSIONED"
+    path_pattern: "%/oms\\_%/jdk/%"
+    priority: 20
+    risk_tier: "YELLOW"
+    action_method: "OEM OMS JDK Bundle Patch (per MOS-noted procedure)"
+    owner: "OEM admin"
+    precheck_notes: "Requires OMS downtime; coordinate with OEM admin."
+
+  - rule_id: "OEM-AGENT-JDK"
+    path_pattern: "%/agent\\_%/jdk/%"
+    priority: 25
+    risk_tier: "YELLOW"
+    action_method: "OEM Agent JDK update (emctl agent procedure)"
+    owner: "OEM admin"
+    precheck_notes: "Coordinate with OEM admin; agent restart required."
+
+  - rule_id: "OEM-AGENT-INST"
+    path_pattern: "%/agent\\_inst/%"
+    priority: 25
+    risk_tier: "YELLOW"
+    action_method: "OEM Agent JDK update"
+    owner: "OEM admin"
+    precheck_notes: "Coordinate with OEM admin."
+
+  # ── 3. Oracle Gateway home ──────────────────────────────────────────────
+  - rule_id: "ORACLE-GATEWAY-JDK"
+    path_pattern: "%/tg\\_%/jdk/%"
+    priority: 30
+    risk_tier: "YELLOW"
+    action_method: "Oracle Gateway JDK Bundle Patch (OPatch)"
+    owner: "DBA"
+    precheck_notes: "Apply Gateway JDK BP via OPatch; requires gateway restart."
+
+  # ── 4. Oracle 19c (DB and GI homes) ─────────────────────────────────────
+  - rule_id: "ORACLE-19C-GI"
+    path_pattern: "%/19.%/grid/%"
+    priority: 40
+    risk_tier: "YELLOW"
+    action_method: "Oracle 19c GI Home JDK Bundle Patch (MOS 2118136.2)"
+    owner: "DBA"
+    precheck_notes: "Test on TEST GI first; rolling per-node; OPatch JDK BP into GRID_HOME/jdk."
+
+  - rule_id: "ORACLE-19C-DBHOME"
+    path_pattern: "%/19.%/dbhome%/%"
+    priority: 45
+    risk_tier: "YELLOW"
+    action_method: "Oracle 19c DB Home JDK Bundle Patch (MOS 2843164.1)"
+    owner: "DBA"
+    precheck_notes: "Test on TEST DB; planned downtime; OPatch JDK BP into ORACLE_HOME/jdk. Validate OJVM, datapump, GG."
+
+  - rule_id: "ORACLE-19C-PRODUCT"
+    path_pattern: "%/product/19.%/%"
+    priority: 50
+    risk_tier: "YELLOW"
+    action_method: "Oracle 19c JDK Bundle Patch (MOS 2843164.1 / 2118136.2)"
+    owner: "DBA"
+    precheck_notes: "Test on TEST first; OPatch JDK BP only - do not replace JDK manually."
+
+  # ── 5. Oracle 12.2 (extended/sustaining) ────────────────────────────────
+  - rule_id: "ORACLE-122-PRODUCT"
+    path_pattern: "%/product/12.2%/%"
+    priority: 60
+    risk_tier: "YELLOW"
+    action_method: "Oracle 12.2 JDK Bundle Patch (verify ESS coverage)"
+    owner: "DBA"
+    precheck_notes: "Confirm extended-support coverage; OPatch JDK BP if available, else plan upgrade."
+
+  # ── 6. Oracle EOL homes - RED, no JDK patch path ────────────────────────
+  - rule_id: "ORACLE-121-EOL"
+    path_pattern: "%/product/12.1%/%"
+    priority: 70
+    risk_tier: "RED"
+    action_method: "Migrate to 19c+ (no JDK patch path)"
+    owner: "DBA / Project"
+    precheck_notes: "12cR1 EOL. No supported JDK update; plan database upgrade or decommission."
+
+  - rule_id: "ORACLE-112-EOL"
+    path_pattern: "%/product/11.2%/%"
+    priority: 70
+    risk_tier: "RED"
+    action_method: "Migrate to 19c+ (no JDK patch path)"
+    owner: "DBA / Project"
+    precheck_notes: "11gR2 EOL. No supported JDK update; plan database upgrade or decommission."
+
+  - rule_id: "ORACLE-11G-EOL"
+    path_pattern: "%/product/11g%/%"
+    priority: 70
+    risk_tier: "RED"
+    action_method: "Migrate to 19c+ (no JDK patch path)"
+    owner: "DBA / Project"
+    precheck_notes: "11g EOL. No supported JDK update; plan database upgrade or decommission."
+
+  - rule_id: "ORACLE-10G-EOL"
+    path_pattern: "%/product/10.%/%"
+    priority: 70
+    risk_tier: "RED"
+    action_method: "Migrate / decommission (10g EOL)"
+    owner: "DBA / Project"
+    precheck_notes: "10g EOL. No supported JDK update path."
+
+  # ── 7. Catch-all for any other Oracle home path ─────────────────────────
+  - rule_id: "ORACLE-HOME-GENERIC"
+    path_pattern: "%/app/oracle/product/%"
+    priority: 100
+    risk_tier: "YELLOW"
+    action_method: "Oracle Home JDK Bundle Patch (review version)"
+    owner: "DBA"
+    precheck_notes: "Identify exact ORACLE_HOME version, apply MOS-noted JDK BP via OPatch."
+
+  - rule_id: "ORACLE-HOME-GENERIC-2"
+    path_pattern: "%/oracle/product/%"
+    priority: 105
+    risk_tier: "YELLOW"
+    action_method: "Oracle Home JDK Bundle Patch (review version)"
+    owner: "DBA"
+    precheck_notes: "Identify exact ORACLE_HOME version, apply MOS-noted JDK BP via OPatch."
+
+  # ── 8. OS-level OpenJDK - GREEN, dnf/yum ────────────────────────────────
+  - rule_id: "OS-OPENJDK-LEGACY"
+    path_pattern: "%/usr/lib/jvm/%"
+    java_major_min: 0
+    java_major_max: 7
+    priority: 200
+    risk_tier: "GREEN"
+    action_method: "dnf remove java-1.6.0-openjdk java-1.7.0-openjdk"
+    owner: "Linux / DBA"
+    precheck_notes: "Verify no app/service depends on Java <8 (rpm -q --whatrequires) before removal."
+
+  - rule_id: "OS-OPENJDK-8"
+    path_pattern: "%/usr/lib/jvm/%"
+    java_major_min: 8
+    java_major_max: 8
+    priority: 210
+    risk_tier: "GREEN"
+    action_method: "dnf update java-1.8.0-openjdk"
+    owner: "Linux / DBA"
+    precheck_notes: "Standard OS package update; on OEM agent hosts coordinate maintenance window."
+
+  - rule_id: "OS-OPENJDK-MODERN"
+    path_pattern: "%/usr/lib/jvm/%"
+    java_major_min: 11
+    java_major_max: 25
+    priority: 215
+    risk_tier: "GREEN"
+    action_method: "dnf update java-{major}-openjdk"
+    owner: "Linux / DBA"
+    precheck_notes: "Standard OS package update."
+
+  # ── 9. Vendor-bundled JDKs ──────────────────────────────────────────────
+  - rule_id: "PUPPETLABS-JRE"
+    path_pattern: "%/opt/puppetlabs/%"
+    priority: 300
+    risk_tier: "GREEN"
+    action_method: "Update via puppet-agent / pe-client-tools package"
+    owner: "Puppet team"
+    precheck_notes: "Upgrade vendor bundle; do not modify embedded JRE in place."
+
+  - rule_id: "AWS-AGENT-JRE"
+    path_pattern: "%/opt/aws/%"
+    priority: 310
+    risk_tier: "YELLOW"
+    action_method: "Update via AWS agent vendor bundle"
+    owner: "Linux / Cloud"
+    precheck_notes: "Refresh CloudWatch / SSM / Inspector agent package."
+
+  - rule_id: "IBM-WAS-JRE"
+    path_pattern: "%/IBM/WebSphere/%"
+    priority: 320
+    risk_tier: "YELLOW"
+    action_method: "WebSphere fixpack (vendor-supplied JRE)"
+    owner: "Middleware"
+    precheck_notes: "Apply WAS fixpack; do not replace JRE in place."
+
+  # ── 10. Catch-all (no rule matched) ─────────────────────────────────────
+  - rule_id: "DEFAULT-UNCLASSIFIED"
+    path_pattern: "%"
+    priority: 9999
+    risk_tier: "YELLOW"
+    action_method: "Manual review required"
+    owner: "DBA"
+    precheck_notes: "No specific rule matched; investigate path, owner, and dependencies."

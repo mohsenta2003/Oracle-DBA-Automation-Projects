@@ -1,0 +1,9 @@
+# Test Inventory - Small subset for testing
+# Usage: ansible-playbook playbooks/collect_oracle_options.yml -i inventory_test
+
+[oracle_servers_test]
+crlnxd1046 ansible_host=crlnxd1046 ansible_user=oracle
+
+# Add 1-2 more servers for testing if needed:
+# crlnxp1086 ansible_host=crlnxp1086 ansible_user=oracle
+# hostname2  ansible_host=hostname2  ansible_user=oracle

@@ -1,0 +1,33 @@
+---
+# roles/java_scanner/defaults/main.yml
+#
+# Java installation scanner — scans every target host for JDK/JRE installations
+# and stores results in the central repository on dbai under mtaheri schema.
+#
+# Tables populated:
+#   MTAHERI.JAVA_SCAN_RUNS      — one row per playbook execution
+#   MTAHERI.JAVA_SCAN_SERVERS   — one row per server scanned
+#   MTAHERI.JAVA_SCAN_INSTALLS  — one row per Java installation found
+#
+# ── Repository connection (dbai / mtaheri) ────────────────────────────────────
+#
+# Override: -e "repo_password=<pwd>" or use ansible-vault
+#
+repo_tns_alias: ""               # TNS alias (leave empty to use host/port/sid)
+repo_host:      "crlnxd1046"     # Repository DB host
+repo_port:      "1535"           # Listener port
+repo_sid:       "dbai"           # Repository SID
+repo_user:      "mtaheri"        # Schema owner / connection user
+repo_schema:    "{{ repo_user }}"
+repo_password:  ""               # TODO: move to ansible-vault!
+
+# ── Run identification ────────────────────────────────────────────────────────
+run_label: "java-scan-{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%SZ') }}"
+
+# ── File paths ────────────────────────────────────────────────────────────────
+log_dir:               "logs/java_scanner"
+
+# ── Scanner behaviour ─────────────────────────────────────────────────────────
+# Run scanner as root for complete access to all Oracle/system paths.
+# Set to false to run as the Ansible SSH user (may miss some paths).
+java_scan_become_root: true

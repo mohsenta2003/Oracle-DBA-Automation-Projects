@@ -1,0 +1,74 @@
+---
+# Test Playbook for Reporting
+# Run this locally to verify the Dashboard, Banner, History, and Consolidated Summary
+# Command: ansible-playbook tests/test_reporting.yml
+
+- hosts: localhost
+  connection: local
+  gather_facts: yes
+  vars:
+    # --- Mock Variables usually set by the main playbook ---
+    inventory_hostname: "AIX-TEST-DB01"
+    os_type: { "stdout": "AIX" }
+    report_timestamp: "{{ ansible_date_time.date }}"
+    local_report_dir: "./test_reports"
+    nfs_log_path: "/nfs/oracle_logs"
+    sync_mode: "PUSH"
+    cron_interval: 15
+    log_retention_days: 90
+    compress_logs: true
+    setup_cron: true
+    oracle_sync_log: "/tmp/oracle_sync.log"
+    oracle_script_path: "/home/oracle/scripts"
+    _oracle_user: "oracle"
+    nfs_disk_check: { "stdout": "/dev/fslv00      10.00      5.00   50% /nfs/oracle_logs" }
+    
+    _all_instances: ["PROD", "DEV"]
+    oracle_home_map:
+      PROD: "/u01/app/oracle/product/19.0.0/dbhome_1"
+      DEV: "/u01/app/oracle/product/19.0.0/dbhome_1"
+      
+    _all_listeners: ["LISTENER", "LISTENER_SCAN1"]
+
+    # --- Simulated Sync Results (Instance) ---
+    instance_sync_results:
+      - sid: "PROD"
+        alert_dir: "/u01/app/oracle/diag/rdbms/prod/PROD/trace"
+        audit_dir: "/u01/app/oracle/admin/prod/adump"
+        alert_files: ["alert_PROD.log", "prod_ora_1234.trc"]
+        audit_files: ["prod_ora_5678.aud"]
+        check_alert_mtime: "{{ (ansible_date_time.epoch | int) - 300 }}" # 5 mins lag
+        check_alert_size: 10485760 # 10MB
+        check_audit_count: 500 # Good count
+
+      - sid: "DEV"
+        alert_dir: "/u01/app/oracle/diag/rdbms/dev/DEV/trace"
+        audit_dir: "/u01/app/oracle/admin/dev/adump"
+        alert_files: []
+        audit_files: []
+        check_alert_mtime: "{{ (ansible_date_time.epoch | int) - 90000 }}" # > 24h lag (RED)
+        check_alert_size: 3221225472 # > 3GB (RED Size)
+        check_audit_count: 120000 # > 100k (RED Audit)
+
+    # --- Simulated Sync Results (Listener) ---
+    listener_sync_results:
+      - listener: "LISTENER"
+        log_dir: "/u01/app/oracle/diag/tnslsnr/host/listener/trace"
+        synced_files: ["listener.log", "listener.xml"]
+        check_lsnr_mtime: "{{ (ansible_date_time.epoch | int) - 100 }}"
+        check_lsnr_size: 500000
+
+      - listener: "LISTENER_SCAN1"
+        log_dir: "/u01/app/19.0.0/grid/diag/tnslsnr/host/listener_scan1/trace"
+        synced_files: []
+        check_lsnr_mtime: "{{ (ansible_date_time.epoch | int) - 3601 }}" # > 1h lag (ORANGE)
+        check_lsnr_size: 200
+
+  tasks:
+    - name: Clean up previous test reports
+      ansible.builtin.file:
+        path: "{{ local_report_dir }}"
+        state: absent
+
+    - name: Generate the Sync Report (Run Task Locally)
+      ansible.builtin.include_tasks: ../roles/oracle_log_sync/tasks/generate_report.yml

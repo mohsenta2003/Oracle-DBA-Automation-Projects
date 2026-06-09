@@ -1,0 +1,73 @@
+---
+# playbooks/collect_oracle_options.yml
+#
+# Collects Oracle v$option + dba_feature_usage_statistics from every running
+# instance across the estate and stores the results in the central repository
+# on d1hub (crlnxd1046:1535).
+#
+# Central tables populated:
+#   DBAORALIC_SCH.ORACLE_OPT_RUNS        — one row per execution
+#   DBAORALIC_SCH.ORACLE_OPT_INSTANCES   — one row per SID
+#   DBAORALIC_SCH.ORACLE_OPT_VOPTION     — all v$option rows per SID
+#   DBAORALIC_SCH.ORACLE_OPT_FEATURES    — all dba_feature_usage_statistics rows per SID
+#
+# Reporting views:
+#   DBAORALIC_SCH.ORACLE_OPT_LATEST_VW   — latest run snapshot
+#   DBAORALIC_SCH.ORACLE_OPT_ENABLED_VW  — enabled options, latest run
+#   DBAORALIC_SCH.ORACLE_OPT_INUSE_VW    — features ever used, latest run
+#   DBAORALIC_SCH.ORACLE_OPT_TREND_VW    — usage trend over time
+#   DBAORALIC_SCH.ORACLE_OPT_HISTORY_VW  — full point-in-time history
+#
+# Usage:
+#   # All hosts
+#   ansible-playbook playbooks/collect_oracle_options.yml -i inv_key.yml
+#
+#   # Specific host group
+#   ansible-playbook playbooks/collect_oracle_options.yml -i inv_key.yml -l all_eu_linux
+#
+#   # Single host
+#   ansible-playbook playbooks/collect_oracle_options.yml -i inv_key.yml -l crlnxp316
+#
+#   # Single SID on a multi-instance host
+#   ansible-playbook playbooks/collect_oracle_options.yml -i inv_key.yml -l crlnxd2201 -e "db_sid=MYDB"
+#
+#   # Override Oracle user if auto-detection fails
+#   ansible-playbook playbooks/collect_oracle_options.yml -i inv_key.yml -l ukaixpuk0001 -e "oracle_user=oracle"
+#
+#   # Tag the run for easy retrieval later
+#   ansible-playbook playbooks/collect_oracle_options.yml -i inv_key.yml -e "run_label=Weekly-2026-W19"
+#
+#   # Collect ONLY TDE/Security evidence (skip all other detail queries)
+#   ansible-playbook playbooks/collect_oracle_options.yml -i inv_key.yml \
+#       -e "collect_partitioning=false collect_compression=false collect_inmemory=false \
+#           collect_pdbs=false collect_adg=false collect_rac=false"
+#
+#   # Collect ONLY partitioning evidence
+#   ansible-playbook playbooks/collect_oracle_options.yml -i inv_key.yml \
+#       -e "collect_compression=false collect_security=false collect_inmemory=false \
+#           collect_pdbs=false collect_adg=false collect_rac=false"
+#
+#   # Collect v$option + features ONLY (no detail object lists at all)
+#   ansible-playbook playbooks/collect_oracle_options.yml -i inv_key.yml \
+#       -e "collect_partitioning=false collect_compression=false collect_security=false \
+#           collect_inmemory=false collect_pdbs=false collect_adg=false collect_rac=false"
+#
+#   # Compact email — hide sections with no objects found
+#   ansible-playbook playbooks/collect_oracle_options.yml -i inv_key.yml \
+#       -e "send_summary_email=true email_skip_empty_sections=true"
+#
+#   # Override repository credentials
+#   ansible-playbook playbooks/collect_oracle_options.yml -i inv_key.yml \
+#       -e "repo_host=crlnxp1086 repo_port=1535 repo_sid=dbai repo_user=mtaheri repo_password=secret"
+#
+# NOTE: This playbook is completely independent of check_partitioning.yml.
+#       It does not modify or depend on the oracle_partitioning role in any way.
+#
+
+- name: Collect Oracle Options & Features Audit
+  hosts: all
+  gather_facts: no
+  serial: 0                    # parallel — all hosts at once
+
+  roles:
+    - oracle_options_audit

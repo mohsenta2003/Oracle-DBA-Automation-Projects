@@ -1,0 +1,423 @@
+---
+# Generate sync summary report
+#
+
+  - name: Create local report directory
+    ansible.builtin.file:
+      path: "{{ local_report_dir }}/{{ report_timestamp }}/{{ inventory_hostname }}"
+      state: directory
+      mode: '0755'
+    delegate_to: localhost
+
+  - name: Define report content
+    ansible.builtin.set_fact:
+      report_content: |
+        ================================================================================
+        ORACLE LOG SYNC REPORT
+        ================================================================================
+        Host: {{ inventory_hostname }}
+        OS: {{ os_type.stdout | default('Unknown') }}
+        Timestamp: {{ ansible_date_time.iso8601 }}
+        NFS Destination: {{ nfs_log_path }}
+        Sync Mode: {{ sync_mode }}
+        
+        ================================================================================
+        1. DISK SPACE STATUS
+        ================================================================================
+        {{ nfs_disk_check.stdout | default('Unable to check disk space') }}
+        
+        ================================================================================
+        2. DETECTED ORACLE CONFIGURATION
+        ================================================================================
+        Oracle User: {{ _oracle_user }}
+        Instances Found: {{ _all_instances | length }}
+        {% for sid in _all_instances %}
+          - {{ sid }}: ORACLE_HOME={{ oracle_home_map[sid] | default('NOT IN ORATAB') }}
+        {% endfor %}
+        
+        Listeners Found: {{ _all_listeners | length }}
+        {% for lsnr in _all_listeners %}
+          - {{ lsnr }}
+        {% endfor %}
+        
+        ================================================================================
+        3. INSTANCE LOG SYNC RESULTS
+        ================================================================================
+        {% for result in instance_sync_results | default([]) %}
+        Instance: {{ result.sid }}
+          Alert Log Dir: {{ result.alert_dir }}
+          Audit Log Dir: {{ result.audit_dir }}
+          Alert Sync Status:
+          {% if result.alert_files | length > 0 %}
+          New Files:
+          {% for text in result.alert_files %}
+            - {{ text }}
+          {% endfor %}
+          {% else %}
+          No new files transferred.
+          {% endif %}
+  
+          Audit Sync Status:
+          {% if result.audit_files | length > 0 %}
+          New Files:
+          {% for text in result.audit_files %}
+            - {{ text }}
+          {% endfor %}
+          {% else %}
+          No new files transferred.
+          {% endif %}
+        
+        {% endfor %}
+        {% if instance_sync_results | default([]) | length == 0 %}
+        No instances processed.
+        {% endif %}
+        
+        ================================================================================
+        4. LISTENER LOG SYNC RESULTS
+        ================================================================================
+        {% for result in listener_sync_results | default([]) %}
+        Listener: {{ result.listener }}
+          Log Dir: {{ result.log_dir }}
+          
+          Sync Status:
+          {% if result.synced_files | length > 0 %}
+          New Files:
+          {% for text in result.synced_files %}
+            - {{ text }}
+          {% endfor %}
+          {% else %}
+          No new files transferred.
+          {% endif %}
+        
+        {% endfor %}
+        {% if listener_sync_results | default([]) | length == 0 %}
+        No listeners processed.
+        {% endif %}
+        
+        ================================================================================
+        5. NFS DIRECTORY STRUCTURE
+        ================================================================================
+        {{ nfs_log_path }}/{{ inventory_hostname }}/
+        {% for sid in _all_instances %}
+        |-- {{ sid }}/
+        |   |-- alert/      (alert_*.log, *.xml)
+        |   |-- audit/      (*.aud, *.xml)
+        |   `-- trace/      (*.trc - recent files)
+        {% endfor %}
+        {% for lsnr in _all_listeners %}
+        `-- listener/
+            `-- {{ lsnr }}/  (listener logs)
+        {% endfor %}
+        
+        ================================================================================
+        6. CRON STATUS
+        ================================================================================
+        {% if setup_cron %}
+        Cron job ENABLED:
+          User: {{ _oracle_user }}
+          Script: {{ oracle_script_path }}/oracle_log_sync.sh
+          Log File: {{ oracle_sync_log }}
+          Interval: Every {{ cron_interval }} minutes
+          Log retention: {{ log_retention_days }} days
+          Compression: {{ compress_logs | ternary('Enabled', 'Disabled') }}
+        {% else %}
+        Cron job NOT configured (run with -e "setup_cron=true" to enable)
+        {% endif %}
+        
+        ================================================================================
+        END OF REPORT
+        ================================================================================
+
+  - name: Create local report data directory
+    ansible.builtin.file:
+      path: "{{ local_report_dir }}/data"
+      state: directory
+      mode: '0755'
+    delegate_to: localhost
+
+  # ============================================
+  # Per-Instance History Reports
+  # ============================================
+  - name: Ensure per-instance history files exist
+    ansible.builtin.file:
+      path: "{{ local_report_dir }}/data/{{ item.sid }}_history.log"
+      state: touch
+      mode: '0644'
+    delegate_to: localhost
+    loop: "{{ instance_sync_results | default([]) }}"
+
+  - name: Append to per-instance history
+    ansible.builtin.shell:
+      cmd: |
+        cat >> {{ local_report_dir }}/data/{{ item.sid }}_history.log <<EOF
+        ================================================================================
+        LOG SYNC REPORT: {{ item.sid }}
+        Timestamp: {{ ansible_date_time.iso8601 }}
+        Alert Dir: {{ item.alert_dir }}
+        Audit Dir: {{ item.audit_dir }}
+        ================================================================================
+        Alert Sync:
+        {% if item.alert_files | length > 0 %}
+        {% for f in item.alert_files %}
+        - {{ item.alert_dir }}/{{ f }}
+        {% endfor %}
+        {% else %}
+        No new files.
+        {% endif %}
+
+        Audit Sync:
+        {% if item.audit_files | length > 0 %}
+        {% for f in item.audit_files %}
+        - {{ item.audit_dir }}/{{ f }}
+        {% endfor %}
+        {% else %}
+        No new files.
+        {% endif %}
+
+        EOF
+    delegate_to: localhost
+    loop: "{{ instance_sync_results | default([]) }}"
+
+  # ============================================
+  # Per-Listener History Reports
+  # ============================================
+  - name: Ensure per-listener history files exist
+    ansible.builtin.file:
+      path: "{{ local_report_dir }}/data/{{ item.listener }}_history.log"
+      state: touch
+      mode: '0644'
+    delegate_to: localhost
+    loop: "{{ listener_sync_results | default([]) }}"
+
+  - name: Append to per-listener history
+    ansible.builtin.shell:
+      cmd: |
+        cat >> {{ local_report_dir }}/data/{{ item.listener }}_history.log <<EOF
+        ================================================================================
+        LOG SYNC REPORT: {{ item.listener }}
+        Timestamp: {{ ansible_date_time.iso8601 }}
+        Log Dir: {{ item.log_dir }}
+        ================================================================================
+        Sync Status:
+        {% if item.synced_files | length > 0 %}
+        {% for f in item.synced_files %}
+        - {{ item.log_dir }}/{{ f }}
+        {% endfor %}
+        {% else %}
+        No new files.
+        {% endif %}
+
+        EOF
+    delegate_to: localhost
+    loop: "{{ listener_sync_results | default([]) }}"
+
+  # ============================================
+  # Per-Job Reports (Dashboard Linking)
+  # ============================================
+  - name: Create job logs directory
+    ansible.builtin.file:
+      path: "{{ local_report_dir }}/{{ report_timestamp }}/log_sync_jobs"
+      state: directory
+      mode: '0755'
+    delegate_to: localhost
+
+  - name: Generate per-job instance logs (TXT)
+    ansible.builtin.copy:
+      dest: "{{ local_report_dir }}/{{ report_timestamp }}/log_sync_jobs/{{ item.sid }}_job.log"
+      content: |
+        ================================================================================
+        JOB LOG: {{ item.sid }}
+        Timestamp: {{ ansible_date_time.iso8601 }}
+        Alert Log Size: {{ (item.check_alert_size | int / 1024 / 1024) | round(2) }} MB
+        Alert Log Lag: {{ (ansible_date_time.epoch | int) - (item.check_alert_mtime | int) }} seconds
+        Audit File Count: {{ item.check_audit_count }}
+        ================================================================================
+        Alert Sync:
+        {% if item.alert_files | length > 0 %}
+        {% for f in item.alert_files %}
+        - {{ item.alert_dir }}/{{ f }}
+        {% endfor %}
+        {% else %}
+        No new files.
+        {% endif %}
+
+        Audit Sync:
+        {% if item.audit_files | length > 0 %}
+        {% for f in item.audit_files %}
+        - {{ item.audit_dir }}/{{ f }}
+        {% endfor %}
+        {% else %}
+        No new files.
+        {% endif %}
+    delegate_to: localhost
+    loop: "{{ instance_sync_results | default([]) }}"
+
+  - name: Generate per-job instance report (HTML)
+    ansible.builtin.template:
+      src: job_detail.html.j2
+      dest: "{{ local_report_dir }}/{{ report_timestamp }}/log_sync_jobs/{{ item.sid }}_job.html"
+      mode: '0644'
+    vars:
+      job_name: "{{ item.sid }}"
+      job_type: "Instance"
+      timestamp: "{{ ansible_date_time.iso8601 }}"
+      lag: "{{ (ansible_date_time.epoch | int) - (item.check_alert_mtime | int) }}"
+      dest_lag: "{{ (ansible_date_time.epoch | int) - (item.nfs_alert_mtime | int) }}"
+      size: "{{ item.check_alert_size | int }}"
+      dest_size: "{{ item.nfs_alert_size | int }}"
+      audit_count: "{{ item.check_audit_count | int }}"
+      src_path: "{{ item.alert_dir }}/alert_{{ item.sid }}.log"
+      dest_path: "{{ nfs_log_path }}/{{ inventory_hostname }}/{{ item.sid }}/alert/alert_{{ item.sid }}.log"
+      files: "{{ (item.alert_files + item.audit_files) }}"
+    delegate_to: localhost
+    loop: "{{ instance_sync_results | default([]) }}"
+
+  - name: Generate per-job listener logs (TXT)
+    ansible.builtin.copy:
+      dest: "{{ local_report_dir }}/{{ report_timestamp }}/log_sync_jobs/{{ item.listener }}_job.log"
+      content: |
+        ================================================================================
+        JOB LOG: {{ item.listener }}
+        Timestamp: {{ ansible_date_time.iso8601 }}
+        Log Size: {{ (item.check_lsnr_size | int / 1024 / 1024) | round(2) }} MB
+        Log Lag: {{ (ansible_date_time.epoch | int) - (item.check_lsnr_mtime | int) }} seconds
+        ================================================================================
+        Sync Status:
+        {% if item.synced_files | length > 0 %}
+        {% for f in item.synced_files %}
+        - {{ item.log_dir }}/{{ f }}
+        {% endfor %}
+        {% else %}
+        No new files.
+        {% endif %}
+    delegate_to: localhost
+    loop: "{{ listener_sync_results | default([]) }}"
+
+  - name: Generate per-job listener report (HTML)
+    ansible.builtin.template:
+      src: job_detail.html.j2
+      dest: "{{ local_report_dir }}/{{ report_timestamp }}/log_sync_jobs/{{ item.listener }}_job.html"
+      mode: '0644'
+    vars:
+      job_name: "{{ item.listener }}"
+      job_type: "Listener"
+      timestamp: "{{ ansible_date_time.iso8601 }}"
+      lag: "{{ (ansible_date_time.epoch | int) - (item.check_lsnr_mtime | int) }}"
+      dest_lag: "{{ (ansible_date_time.epoch | int) - (item.nfs_lsnr_mtime | int) }}"
+      size: "{{ item.check_lsnr_size | int }}"
+      dest_size: "{{ item.nfs_lsnr_size | int }}"
+      src_path: "{{ item.log_dir }}/trace/listener.log"
+      dest_path: "{{ item.nfs_log_file }}"
+      files: "{{ item.synced_files }}"
+    delegate_to: localhost
+    loop: "{{ listener_sync_results | default([]) }}"
+
+  # ============================================
+  # Main Host Summary (Preserved)
+  # ============================================
+  - name: Save timestamped main report
+    ansible.builtin.copy:
+      dest: "{{ local_report_dir }}/{{ report_timestamp }}/{{ inventory_hostname }}/log_sync_summary.txt"
+      content: "{{ report_content }}"
+    delegate_to: localhost
+
+  # ============================================
+  # Consolidated Execution Summary (Metrics Enhanced)
+  # ============================================
+  # Format: INST: SID#Lag#Size#Audit, ... | LSNR: LISTENER#Lag#Size, ...
+  - name: Ensure consolidated summary file exists
+    ansible.builtin.file:
+      path: "{{ local_report_dir }}/{{ report_timestamp }}/log_sync_jobs/Daily_Execution_Summary.txt"
+      state: touch
+      mode: '0664'
+    delegate_to: localhost
+    run_once: true
+
+  - name: Build Instance Metric String
+    ansible.builtin.set_fact:
+      _inst_metrics: |
+        {% set res = [] %}
+        {% for i in instance_sync_results | default([]) %}
+        {# Use Sync Lag (Source mtime - Dest mtime) to reflect sync freshness #}
+        {# If source and dest timestamps match (rsync -a), lag is 0 #}
+        {% set lag = (i.check_alert_mtime | int) - (i.nfs_alert_mtime | int) %}
+        {% set size = i.nfs_alert_size | default(0) %}
+        {% set audit = i.check_audit_count | default(0) %}
+        {% set _ = res.append(i.sid ~ '#' ~ lag ~ '#' ~ size ~ '#' ~ audit) %}
+        {% endfor %}
+        {{ res | join(',') }}
+
+  - name: Build Listener Metric String
+    ansible.builtin.set_fact:
+      _lsnr_metrics: |
+        {% set res = [] %}
+        {% for l in listener_sync_results | default([]) %}
+        {# Use Sync Lag (Source mtime - Dest mtime) #}
+        {% set lag = (l.check_lsnr_mtime | int) - (l.nfs_lsnr_mtime | int) %}
+        {% set size = l.nfs_lsnr_size | default(0) %}
+        {% set _ = res.append(l.listener ~ '#' ~ lag ~ '#' ~ size) %}
+        {% endfor %}
+        {{ res | join(',') }}
+
+  - name: Append to consolidated summary
+    ansible.builtin.lineinfile:
+      path: "{{ local_report_dir }}/{{ report_timestamp }}/log_sync_jobs/Daily_Execution_Summary.txt"
+      line: "{{ ansible_date_time.iso8601 }} | HOST: {{ inventory_hostname }} | INST: {{ _inst_metrics | trim }} | LSNR: {{ _lsnr_metrics | trim }}"
+      insertafter: EOF
+    delegate_to: localhost
+    throttle: 1
+
+  # ============================================
+  # HTML Dashboard Generation
+  # ============================================
+  - name: Generate HTML Status Dashboard
+    ansible.builtin.template:
+      src: dashboard.html.j2
+      dest: "{{ local_report_dir }}/{{ report_timestamp }}/log_sync_jobs/index.html"
+      mode: '0644'
+    delegate_to: localhost
+    run_once: true
+
+  # ============================================
+  # Console Banner
+  # ============================================
+  - name: Display Execution Banner
+    ansible.builtin.debug:
+      msg:
+        - "********************************************************************************"
+        - "*                            ORACLE LOG SYNC BANNER                            *"
+        - "********************************************************************************"
+        - "* Host:       {{ inventory_hostname }}"
+        - "* Timestamp:  {{ ansible_date_time.iso8601 }}"
+        - "* Instances:  {{ _all_instances | length }}"
+        - "* Listeners:  {{ _all_listeners | length }}"
+        - "* Report:     {{ local_report_dir }}/{{ report_timestamp }}/{{ inventory_hostname }}/log_sync_summary.txt"
+        - "********************************************************************************"
+
+  - name: Display Synced Files (Summary)
+    ansible.builtin.debug:
+      msg: 
+        - "Instance {{ item.sid }}: {{ item.alert_files | length }} alert logs, {{ item.audit_files | length }} audit logs."
+    loop: "{{ instance_sync_results | default([]) }}"
+    loop_control:
+      label: "{{ item.sid }}"
+
+  - name: Display Synced Files (Detail - Low Volume)
+    ansible.builtin.debug:
+      msg: "  - {{ item.1 }}"
+    loop: "{{ instance_sync_results | default([]) | subelements('alert_files') }}"
+    when: (item.0.alert_files | length) < 10 and (item.0.alert_files | length) > 0
+    loop_control:
+      label: "{{ item.1 }}"
+  
+  - name: Display Synced Audit Files (Detail - Low Volume)
+    ansible.builtin.debug:
+      msg: "  - {{ item.1 }}"
+    loop: "{{ instance_sync_results | default([]) | subelements('audit_files') }}"
+    when: (item.0.audit_files | length) < 10 and (item.0.audit_files | length) > 0
+    loop_control:
+      label: "{{ item.1 }}"
+
+  - name: Display report location
+    ansible.builtin.debug:
+      msg: "Reports saved to: {{ local_report_dir }}"

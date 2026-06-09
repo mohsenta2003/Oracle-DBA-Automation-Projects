@@ -1,0 +1,164 @@
+---
+# playbooks/refresh_java_reference_from_mirror.yml
+#
+# OFFLINE-FRIENDLY refresher.
+#
+# Strategy: query an INTERNAL artifact mirror (yum repo, Artifactory, file share)
+# for the highest available JDK package per (vendor, major), then rewrite
+# vars/java_reference.yml. No public internet required.
+#
+# Configure mirror_sources below to match your environment, then:
+#   ansible-playbook playbooks/refresh_java_reference_from_mirror.yml \
+#     -i "localhost," -c local
+#
+# Followed by:
+#   ansible-playbook playbooks/update_java_reference.yml \
+#     -i "localhost," -c local -e repo_password=<pwd>
+
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    reference_file: "{{ playbook_dir }}/../vars/java_reference.yml"
+
+    # ── Edit these to match your internal mirrors ────────────────────────────
+    mirror_sources:
+
+      # 1. yum/dnf repo discovery (works on RHEL/OL with reposync mirrors).
+      #    Lists installed-or-available packages whose name matches a pattern.
+      - kind: yum
+        track_key: "OPENJDK-8"
+        vendor: "OpenJDK"
+        major: 8
+        # Returns lines like: java-1.8.0-openjdk.x86_64  1:1.8.0.492.b08-1.el8  baseos
+        query_cmd: "repoquery --qf '%{version}-%{release}' java-1.8.0-openjdk 2>/dev/null | sort -V | tail -1"
+        version_regex: '([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)'
+
+      - kind: yum
+        track_key: "OPENJDK-11"
+        vendor: "OpenJDK"
+        major: 11
+        query_cmd: "repoquery --qf '%{version}-%{release}' java-11-openjdk 2>/dev/null | sort -V | tail -1"
+        version_regex: '([0-9]+\.[0-9]+\.[0-9]+)'
+
+      - kind: yum
+        track_key: "OPENJDK-17"
+        vendor: "OpenJDK"
+        major: 17
+        query_cmd: "repoquery --qf '%{version}-%{release}' java-17-openjdk 2>/dev/null | sort -V | tail -1"
+        version_regex: '([0-9]+\.[0-9]+\.[0-9]+)'
+
+      # 2. Artifactory REST API (replace URL/token).
+      #    Example folder lists distinct JDK builds you've uploaded.
+      # - kind: artifactory
+      #   track_key: "ORACLE-8"
+      #   vendor: "Oracle JDK"
+      #   major: 8
+      #   query_cmd: >-
+      #     curl -s -H "X-JFrog-Art-Api: {{ lookup('env','ARTIFACTORY_TOKEN') }}"
+      #     'https://artifactory.intra/api/storage/jdk-local/oracle/8/?list&deep=0'
+      #     | python -c "import json,sys;d=json.load(sys.stdin);
+      #     print(sorted([f['uri'].strip('/') for f in d['files']])[-1])"
+      #   version_regex: '([0-9]+\.[0-9]+\.[0-9]+_[0-9]+)'
+
+      # 3. Plain file share (NFS / SMB mounted on controller).
+      # - kind: filesystem
+      #   track_key: "ORACLE-11"
+      #   vendor: "Oracle JDK"
+      #   major: 11
+      #   query_cmd: "ls -1 /mnt/nfs/jdk/oracle/11/ 2>/dev/null | grep -E '^jdk-' | sort -V | tail -1"
+      #   version_regex: '([0-9]+\.[0-9]+\.[0-9]+)'
+
+  tasks:
+
+    - name: Load existing reference (preserve fields we cannot detect)
+      ansible.builtin.include_vars:
+        file: "{{ reference_file }}"
+        name: _existing
+      ignore_errors: true
+
+    - name: Initialize merged map from existing entries
+      ansible.builtin.set_fact:
+        _ref_map: >-
+          {{ dict(
+              ((_existing.java_reference) | default([]))
+              | map(attribute='track_key')
+              | zip((_existing.java_reference) | default([]))
+            ) }}
+
+    - name: Query each mirror source
+      ansible.builtin.shell:
+        cmd: "{{ item.query_cmd }}"
+      loop: "{{ mirror_sources }}"
+      loop_control:
+        label: "{{ item.track_key }}"
+      register: _mirror_q
+      changed_when: false
+      failed_when: false
+
+    - name: Update map with discovered latest versions
+      ansible.builtin.set_fact:
+        _ref_map: >-
+          {%- set m = _ref_map -%}
+          {%- for r in _mirror_q.results -%}
+            {%- set src = r.item -%}
+            {%- set raw = (r.stdout | default('') | trim) -%}
+            {%- set found = (raw | regex_search(src.version_regex, '\\1') | default('', true)) -%}
+            {%- if found | length > 0 -%}
+              {%- set existing = m.get(src.track_key, {
+                'track_key': src.track_key,
+                'vendor': src.vendor,
+                'major': src.major,
+                'release_date': '',
+                'eol_date': '',
+                'notes': ''
+              }) -%}
+              {%- set _ = existing.update({
+                'track_key': src.track_key,
+                'vendor': src.vendor,
+                'major': src.major,
+                'latest_version': found,
+                'release_date': (lookup('pipe','date +%Y-%m-%d')),
+              }) -%}
+              {%- set _ = m.update({src.track_key: existing}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ m }}
+
+    - name: Show queries and detected versions
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item.track_key }}: raw='{{ (item.stdout | default('') | trim) }}'
+          rc={{ item.rc | default('?') }}
+      loop: "{{ _mirror_q.results }}"
+      loop_control:
+        label: "{{ item.item.track_key }}"
+
+    - name: Rewrite vars/java_reference.yml
+      ansible.builtin.copy:
+        dest: "{{ reference_file }}"
+        mode: '0644'
+        content: |
+          ---
+          # Auto-refreshed by playbooks/refresh_java_reference_from_mirror.yml
+          # Last refresh: {{ lookup('pipe','date +%Y-%m-%dT%H:%M:%S') }}
+          # Edit mirror_sources in that playbook to add vendors/majors.
+          java_reference:
+          {% for k in (_ref_map.keys() | list | sort) %}
+          {%   set r = _ref_map[k] %}
+            - track_key: "{{ r.track_key }}"
+              vendor: "{{ r.vendor }}"
+              major: {{ r.major | int }}
+              latest_version: "{{ r.latest_version | default('') }}"
+              release_date: "{{ r.release_date | default('') }}"
+              eol_date: "{{ r.eol_date | default('') }}"
+              notes: "{{ (r.notes | default('')) | replace('"','\\"') }}"
+          {% endfor %}
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          Wrote {{ _ref_map | length }} tracks to {{ reference_file }}.
+          Now run: ansible-playbook playbooks/update_java_reference.yml -i "localhost," -c local -e repo_password=<pwd>

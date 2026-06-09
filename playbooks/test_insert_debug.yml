@@ -1,0 +1,94 @@
+---
+# Test INSERT into ORACLE_OPT_RUNS to debug RUN_ID=0 issue
+- name: Test repository INSERT
+  hosts: localhost
+  gather_facts: no
+  become: no
+  
+  vars:
+    repo_tns_alias: ""
+    repo_host:      "crlnxd1046"
+    repo_port:      "1535"
+    repo_sid:       "d1hub"
+    repo_user:      "DBAORALIC_SCH"
+    repo_schema:    "DBAORALIC_SCH"
+    repo_password:  "PP1_mQo84M8G"
+    repo_dsn: "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={{ repo_host }})(PORT={{ repo_port }}))(CONNECT_DATA=(SID={{ repo_sid }})))"
+  
+  tasks:
+    - name: Build connection string
+      ansible.builtin.set_fact:
+        _repo_conn_string: "{{ repo_tns_alias if (repo_tns_alias | default('')) else '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=' ~ repo_host ~ ')(PORT=' ~ repo_port ~ '))(CONNECT_DATA=(SID=' ~ repo_sid ~ ')))' }}"
+    
+    - name: Test 1 - Check table exists
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          SELECT 'Table exists' FROM user_tables WHERE table_name = 'ORACLE_OPT_RUNS';
+          EXIT;
+          EOSQL
+      register: _test1
+      
+    - name: Show test 1
+      ansible.builtin.debug:
+        msg: "Test 1 result: {{ _test1.stdout }}"
+    
+    - name: Test 2 - Count existing rows
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          SELECT TO_CHAR(COUNT(*)) FROM {{ repo_schema }}.ORACLE_OPT_RUNS;
+          EXIT;
+          EOSQL
+      register: _test2
+      
+    - name: Show test 2
+      ansible.builtin.debug:
+        msg: "Test 2 - Row count: {{ _test2.stdout }}"
+    
+    - name: Test 3 - Try INSERT with FEEDBACK ON
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF
+          SET FEEDBACK ON
+          SET PAGESIZE 0
+          INSERT INTO {{ repo_schema }}.ORACLE_OPT_RUNS
+              (RUN_DATE, DATA_AS_OF, RUN_LABEL, TRIGGERED_BY, CONTROLLER_HOST, PLAYBOOK,
+               TOTAL_HOSTS, TOTAL_INSTANCES)
+          VALUES
+              (SYSDATE, SYSDATE, 'DEBUG-TEST', 'ansible', 'test-host', 'test.yml', 1, 1);
+          SELECT TO_CHAR(MAX(RUN_ID)) FROM {{ repo_schema }}.ORACLE_OPT_RUNS;
+          COMMIT;
+          EXIT;
+          EOSQL
+      register: _test3
+      
+    - name: Show test 3
+      ansible.builtin.debug:
+        msg:
+          - "=== INSERT TEST OUTPUT ==="
+          - "stdout: {{ _test3.stdout }}"
+          - "stdout_lines: {{ _test3.stdout_lines }}"
+          - "stderr: {{ _test3.stderr }}"
+          - "rc: {{ _test3.rc }}"
+    
+    - name: Test 4 - Check row was inserted
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          SELECT TO_CHAR(COUNT(*)) FROM {{ repo_schema }}.ORACLE_OPT_RUNS WHERE RUN_LABEL = 'DEBUG-TEST';
+          EXIT;
+          EOSQL
+      register: _test4
+      
+    - name: Show test 4
+      ansible.builtin.debug:
+        msg: "Test 4 - DEBUG-TEST rows: {{ _test4.stdout }}"

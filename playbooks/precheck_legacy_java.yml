@@ -1,0 +1,247 @@
+---
+# ────────────────────────────────────────────────────────────────────────────
+# precheck_legacy_java.yml
+# ────────────────────────────────────────────────────────────────────────────
+# Discovery-only playbook. Gathers evidence to decide whether legacy Java
+# (1.6 / 1.7) RPMs can be safely removed from a host. NEVER modifies state.
+#
+# For each host, writes a precheck report to:
+#   reports/precheck_legacy_java/<hostname>__<timestamp>.txt
+#
+# Sections per host:
+#   1. RPM presence              rpm -q  on each legacy package
+#   2. RPM dependents            rpm -q --whatrequires
+#   3. Install timestamps        when the RPM was installed
+#   4. Java alternatives state   alternatives --display java
+#   5. JAVA_HOME / PATH evidence env grep across login shells, /etc/profile.d
+#   6. Running processes         pgrep -af 'java' (catches services using it)
+#   7. systemd unit references   systemctl + grep across /etc/systemd
+#   8. Tomcat / JBoss / WildFly hints (common app-server pinning)
+#   9. Verdict                   SAFE / RISKY / NOT_PRESENT
+#
+# Usage:
+#   ansible-playbook playbooks/precheck_legacy_java.yml \
+#     -i ansibleInventory/inv_var.yml --limit <hostlist>
+#
+# Optional knobs:
+#   -e legacy_java_packages='["java-1.6.0-openjdk","java-1.7.0-openjdk"]'
+#   -e precheck_out_dir=reports/precheck_legacy_java
+#
+# Exit code: always 0 unless connection fails. Verdict is data, not failure.
+# ────────────────────────────────────────────────────────────────────────────
+
+- name: Legacy Java removal precheck (read-only discovery)
+  hosts: all
+  gather_facts: true
+  become: true
+  any_errors_fatal: false
+
+  vars:
+    legacy_java_packages:
+      - java-1.6.0-openjdk
+      - java-1.7.0-openjdk
+      - java-1.6.0-openjdk-devel
+      - java-1.7.0-openjdk-devel
+      - java-1.6.0-openjdk-headless
+      - java-1.7.0-openjdk-headless
+    precheck_out_dir: "reports/precheck_legacy_java"
+    _ts: "{{ ansible_date_time.iso8601_basic_short | default(lookup('pipe','date +%Y%m%dT%H%M%S')) }}"
+
+  tasks:
+
+    # ── 1. RPM presence ────────────────────────────────────────────────────
+    - name: "[1] Check if each legacy Java pkg is installed"
+      ansible.builtin.shell: "rpm -q {{ item }} 2>/dev/null || true"
+      register: _rpm_present
+      changed_when: false
+      loop: "{{ legacy_java_packages }}"
+
+    # ── 2. Dependents (rpm --whatrequires) ─────────────────────────────────
+    - name: "[2] rpm --whatrequires per legacy pkg"
+      ansible.builtin.shell: "rpm -q --whatrequires {{ item }} 2>&1 || true"
+      register: _rpm_deps
+      changed_when: false
+      loop: "{{ legacy_java_packages }}"
+
+    # ── 3. Install timestamps ──────────────────────────────────────────────
+    - name: "[3] Install timestamp of each legacy pkg"
+      ansible.builtin.shell: "rpm -q --queryformat '%{NAME}-%{VERSION}-%{RELEASE}\\t%{INSTALLTIME:date}\\n' {{ item }} 2>/dev/null || true"
+      register: _rpm_when
+      changed_when: false
+      loop: "{{ legacy_java_packages }}"
+
+    # ── 4. Java alternatives configuration ─────────────────────────────────
+    - name: "[4] alternatives --display java"
+      ansible.builtin.shell: "alternatives --display java 2>&1 || true"
+      register: _alt_java
+      changed_when: false
+
+    # ── 5. JAVA_HOME / PATH evidence in shell rc files & profile.d ─────────
+    - name: "[5] grep JAVA_HOME / java in shell rc + profile.d"
+      ansible.builtin.shell: |
+        {
+          grep -RHniE '(JAVA_HOME|/usr/lib/jvm/java-1\.[67])' \
+               /etc/profile /etc/profile.d /etc/bashrc /etc/environment \
+               /root/.bashrc /root/.bash_profile 2>/dev/null
+          # Per-user shells (best effort, skip homes without read perms)
+          for d in /home/*; do
+            [ -d "$d" ] || continue
+            grep -HniE '(JAVA_HOME|/usr/lib/jvm/java-1\.[67])' \
+                 "$d/.bashrc" "$d/.bash_profile" "$d/.profile" 2>/dev/null
+          done
+        } || true
+      register: _java_env
+      changed_when: false
+
+    # ── 6. Running Java processes ──────────────────────────────────────────
+    - name: "[6] Running java processes (pgrep -af java)"
+      ansible.builtin.shell: "pgrep -af 'java' 2>/dev/null || true"
+      register: _java_procs
+      changed_when: false
+
+    # ── 7. systemd units referencing java / jvm ────────────────────────────
+    - name: "[7] systemd units referencing java/jvm"
+      ansible.builtin.shell: |
+        {
+          grep -RHniE '(java|jvm)' /etc/systemd/system /usr/lib/systemd/system 2>/dev/null \
+            | grep -vE '^/usr/lib/systemd/system/java-1\.8' || true
+        } || true
+      register: _systemd_java
+      changed_when: false
+
+    # ── 8. App-server hints (Tomcat / JBoss / WildFly) ─────────────────────
+    - name: "[8] App-server install hints"
+      ansible.builtin.shell: |
+        {
+          rpm -qa 2>/dev/null | grep -iE '(tomcat|jboss|wildfly|websphere|weblogic)' || true
+          ls -d /opt/tomcat* /opt/jboss* /opt/wildfly* /opt/IBM/WebSphere* /opt/oracle/Middleware* 2>/dev/null || true
+        } || true
+      register: _app_hints
+      changed_when: false
+
+    # ── 9. Render per-host report and write to controller ──────────────────
+    - name: "[9] Compute per-pkg verdict"
+      ansible.builtin.set_fact:
+        _verdicts: >-
+          {{ _verdicts | default([]) + [{
+              'pkg': item.0,
+              'present': (item.1.stdout | default('') | trim) | length > 0
+                         and 'is not installed' not in (item.1.stdout | default('')),
+              'present_text': (item.1.stdout | default('') | trim),
+              'deps_text': (item.2.stdout | default('') | trim),
+              'has_deps': (item.2.stdout | default('') | trim) | length > 0
+                          and 'no package requires' not in (item.2.stdout | default('')),
+              'when_text': (item.3.stdout | default('') | trim)
+          }] }}
+      loop: "{{ legacy_java_packages | zip(_rpm_present.results, _rpm_deps.results, _rpm_when.results) | list }}"
+      loop_control:
+        label: "{{ item.0 }}"
+
+    - name: "[9] Render report content"
+      ansible.builtin.set_fact:
+        _report: |
+          ================================================================
+          Legacy Java Precheck — {{ inventory_hostname }}
+          Generated: {{ ansible_date_time.iso8601 | default(_ts) }}
+          OS: {{ ansible_distribution | default('?') }} {{ ansible_distribution_version | default('') }}
+          Kernel: {{ ansible_kernel | default('?') }}
+          ================================================================
+
+          [1] RPM PRESENCE & VERDICT
+          ----------------------------------------------------------------
+          {% for v in _verdicts %}
+          - {{ '%-40s' | format(v.pkg) }} : {%
+              if not v.present %}NOT_PRESENT{%
+              elif v.has_deps %}RISKY (has dependents){%
+              else %}SAFE_TO_REMOVE (no dependents){%
+              endif %}
+              {% if v.present %}
+                installed: {{ v.present_text }}
+                installed_at: {{ v.when_text }}
+                {% if v.has_deps %}
+                dependents:
+                  {{ v.deps_text | replace('\n','\n    ') }}
+                {% else %}
+                dependents: (none)
+                {% endif %}
+              {% endif %}
+          {% endfor %}
+
+          [2] alternatives --display java
+          ----------------------------------------------------------------
+          {{ _alt_java.stdout | default('(no output)') }}
+
+          [3] JAVA_HOME / java-1.[67] references in shell config
+          ----------------------------------------------------------------
+          {{ _java_env.stdout | default('(none found)') if (_java_env.stdout | default('') | trim) | length > 0 else '(none found)' }}
+
+          [4] Running Java processes
+          ----------------------------------------------------------------
+          {{ _java_procs.stdout | default('(no running java processes)') if (_java_procs.stdout | default('') | trim) | length > 0 else '(no running java processes)' }}
+
+          [5] systemd units referencing java/jvm
+          ----------------------------------------------------------------
+          {{ _systemd_java.stdout | default('(none)') if (_systemd_java.stdout | default('') | trim) | length > 0 else '(none)' }}
+
+          [6] App-server install hints (tomcat / jboss / wildfly / websphere / weblogic)
+          ----------------------------------------------------------------
+          {{ _app_hints.stdout | default('(none found)') if (_app_hints.stdout | default('') | trim) | length > 0 else '(none found)' }}
+
+          ================================================================
+          OVERALL VERDICT
+          ----------------------------------------------------------------
+          {% set safe_count = (_verdicts | selectattr('present') | rejectattr('has_deps') | list) | length %}
+          {% set risky_count = (_verdicts | selectattr('present') | selectattr('has_deps') | list) | length %}
+          {% set absent_count = (_verdicts | rejectattr('present') | list) | length %}
+          {% set procs = (_java_procs.stdout | default('') | trim) %}
+          {% set env_refs = (_java_env.stdout | default('') | trim) %}
+          {% set app_hints = (_app_hints.stdout | default('') | trim) %}
+          Packages safe to remove   : {{ safe_count }}
+          Packages with dependents  : {{ risky_count }}
+          Packages not present      : {{ absent_count }}
+          Java processes running?   : {{ 'YES' if procs | length > 0 else 'no' }}
+          JAVA_HOME refs in shell?  : {{ 'YES' if env_refs | length > 0 else 'no' }}
+          App server hints?         : {{ 'YES' if app_hints | length > 0 else 'no' }}
+
+          RECOMMENDATION:
+          {% if risky_count > 0 %}
+            HOLD — at least one legacy Java package has RPM dependents. Investigate the dependent packages before any removal.
+          {% elif procs | length > 0 %}
+            HOLD — no RPM dependents, but a Java process is currently running. Confirm the running JVM is not 1.6 / 1.7 (check $JAVA_HOME of the process owner) before removing.
+          {% elif (env_refs | length > 0) or (app_hints | length > 0) %}
+            INVESTIGATE — no RPM dependents, but JAVA_HOME shell references or app-server installs are present. Confirm those are pointed at a supported JDK (1.8+) before removing the legacy RPMs.
+          {% elif safe_count > 0 %}
+            PROCEED — no RPM dependents, no running Java, no shell references, no app-server hints. Remediation via remediate_java_safe.yml is safe (still defaults to dry-run).
+          {% else %}
+            NOTHING TO DO — no legacy Java packages installed.
+          {% endif %}
+          ================================================================
+
+    - name: "[9] Ensure controller output dir exists"
+      ansible.builtin.file:
+        path: "{{ precheck_out_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: "[9] Write per-host precheck report on controller"
+      ansible.builtin.copy:
+        dest: "{{ precheck_out_dir }}/{{ inventory_hostname }}__{{ _ts }}.txt"
+        content: "{{ _report }}"
+        mode: '0644'
+      delegate_to: localhost
+      become: false
+
+    - name: "[9] Print verdict line"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} :
+          safe={{ (_verdicts | selectattr('present') | rejectattr('has_deps') | list) | length }}
+          risky={{ (_verdicts | selectattr('present') | selectattr('has_deps') | list) | length }}
+          absent={{ (_verdicts | rejectattr('present') | list) | length }}
+          procs={{ 'Y' if (_java_procs.stdout | default('') | trim) | length > 0 else 'n' }}
+          env={{ 'Y' if (_java_env.stdout | default('') | trim) | length > 0 else 'n' }}
+          app={{ 'Y' if (_app_hints.stdout | default('') | trim) | length > 0 else 'n' }}
+          report={{ precheck_out_dir }}/{{ inventory_hostname }}__{{ _ts }}.txt

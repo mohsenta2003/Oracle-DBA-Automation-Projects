@@ -1,0 +1,192 @@
+---
+# playbooks/report_timeline.yml
+#
+# Generate Historical Timeline Report for Oracle Options
+# Shows WHAT objects had features configured WHEN across ALL collection runs
+#
+# Usage:
+#   ansible-playbook playbooks/report_timeline.yml -i "localhost," -c local -e "repo_tns_alias=d1hub"
+#   ansible-playbook playbooks/report_timeline.yml -i "localhost," -c local -e "repo_tns_alias=d1hub option=inmemory"
+#   ansible-playbook playbooks/report_timeline.yml -i "localhost," -c local -e "repo_tns_alias=d1hub option=all"
+#   ansible-playbook playbooks/report_timeline.yml -i "localhost," -c local -e "repo_tns_alias=d1hub hosts='crlnxm145,crlnxt222'"
+
+- name: Oracle Options Timeline Report
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  become: no
+  
+  vars_files:
+    - ../vars/repo_config.yml
+  
+  vars:
+    option: "all"                    # all, inmemory, partitioning, compression, security
+    hosts: ""                        # Filter by specific hosts (comma-separated)
+    output_format: "both"            # html, text, both
+    output_dir: "../reports/timeline"
+    report_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    
+    _conn: "{{ repo_tns_alias if (repo_tns_alias | default('')) else '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=' ~ repo_host ~ ')(PORT=' ~ repo_port ~ '))(CONNECT_DATA=(SID=' ~ repo_sid ~ ')))' }}"
+
+  tasks:
+
+    - name: Ensure output directory exists
+      ansible.builtin.file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Show report parameters
+      ansible.builtin.debug:
+        msg:
+          - "Timeline Report Configuration:"
+          - "  Option: {{ option }}"
+          - "  Hosts filter: {{ hosts if hosts != '' else 'ALL' }}"
+          - "  Output format: {{ output_format }}"
+          - "  Output directory: {{ output_dir }}"
+
+    # ── Get run count and date range ────────────────────────────────────────
+    - name: Get run statistics
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200
+          SELECT 
+              COUNT(*) || '|' ||
+              TO_CHAR(MIN(run_date), 'YYYY-MM-DD') || '|' ||
+              TO_CHAR(MAX(run_date), 'YYYY-MM-DD') || '|' ||
+              ROUND(MAX(run_date) - MIN(run_date)) || '|' ||
+              MAX(run_id)
+          FROM {{ repo_schema | upper }}.ORACLE_OPT_RUNS;
+          EXIT;
+          EOSQL
+      register: _run_stats_raw
+      changed_when: false
+
+    - name: Parse run statistics
+      ansible.builtin.set_fact:
+        _total_runs: "{{ (_run_stats_raw.stdout | trim).split('|')[0] }}"
+        _first_run_date: "{{ (_run_stats_raw.stdout | trim).split('|')[1] }}"
+        _last_run_date: "{{ (_run_stats_raw.stdout | trim).split('|')[2] }}"
+        _days_span: "{{ (_run_stats_raw.stdout | trim).split('|')[3] }}"
+        _latest_run_id: "{{ (_run_stats_raw.stdout | trim).split('|')[4] }}"
+
+    - name: Display timeline scope
+      ansible.builtin.debug:
+        msg:
+          - "Timeline Scope:"
+          - "  Total collection runs: {{ _total_runs }}"
+          - "  Date range: {{ _first_run_date }} to {{ _last_run_date }}"
+          - "  Days span: {{ _days_span }}"
+          - "  Latest RUN_ID: {{ _latest_run_id }}"
+
+    # ── Generate SQL report based on option ─────────────────────────────────
+    - name: Set SQL script path
+      ansible.builtin.set_fact:
+        _sql_script: "{{ '../roles/oracle_options_audit/files/show_' ~ (option if option in ['inmemory','partitioning','compression','security'] else 'all_options') ~ '_timeline.sql' }}"
+
+    - name: Debug SQL script path
+      ansible.builtin.debug:
+        msg:
+          - "Selected option: {{ option }}"
+          - "SQL script path: {{ _sql_script }}"
+          - "Playbook directory: {{ playbook_dir }}"
+
+    - name: Verify SQL script exists
+      ansible.builtin.stat:
+        path: "{{ _sql_script }}"
+      register: _sql_file
+
+    - name: Debug stat result
+      ansible.builtin.debug:
+        msg:
+          - "File exists: {{ _sql_file.stat.exists }}"
+          - "Full path checked: {{ _sql_file.stat.path | default('N/A') }}"
+
+    - name: Fail if SQL script not found
+      ansible.builtin.fail:
+        msg: "SQL script not found: {{ _sql_script }}"
+      when: not _sql_file.stat.exists
+
+    # ── Generate TEXT report ────────────────────────────────────────────────
+    - name: Generate text report
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET PAGESIZE 9999
+          SET LINESIZE 250
+          SPOOL {{ output_dir }}/timeline_{{ option }}_{{ report_timestamp }}.txt
+          @{{ _sql_script }}
+          SPOOL OFF
+          EXIT;
+          EOSQL
+      register: _text_report
+      changed_when: true
+      when: output_format in ['text', 'both']
+
+    # ── Generate HTML report ────────────────────────────────────────────────
+    - name: Query timeline data for HTML
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400
+          SET MARKUP HTML ON SPOOL ON PREFORMAT OFF ENTMAP ON
+          SPOOL {{ output_dir }}/timeline_{{ option }}_{{ report_timestamp }}.html
+          SELECT '<html><head><title>Oracle Options Timeline Report</title>' FROM DUAL;
+          SELECT '<style>' FROM DUAL;
+          SELECT 'body { font-family: Arial, sans-serif; margin: 20px; }' FROM DUAL;
+          SELECT 'table { border-collapse: collapse; width: 100%; margin: 20px 0; }' FROM DUAL;
+          SELECT 'th { background-color: #4CAF50; color: white; padding: 12px; text-align: left; }' FROM DUAL;
+          SELECT 'td { border: 1px solid #ddd; padding: 8px; }' FROM DUAL;
+          SELECT 'tr:nth-child(even) { background-color: #f2f2f2; }' FROM DUAL;
+          SELECT 'h1 { color: #333; }' FROM DUAL;
+          SELECT 'h2 { color: #666; border-bottom: 2px solid #4CAF50; padding-bottom: 5px; }' FROM DUAL;
+          SELECT '.info { background-color: #e7f3ff; padding: 15px; border-left: 4px solid #2196F3; margin: 20px 0; }' FROM DUAL;
+          SELECT '.status-active { color: green; font-weight: bold; }' FROM DUAL;
+          SELECT '.status-historical { color: orange; font-weight: bold; }' FROM DUAL;
+          SELECT '</style></head><body>' FROM DUAL;
+          
+          SELECT '<h1>Oracle Options Historical Timeline Report</h1>' FROM DUAL;
+          SELECT '<div class="info">' FROM DUAL;
+          SELECT '<p><strong>Report Type:</strong> {{ option | upper }}</p>' FROM DUAL;
+          SELECT '<p><strong>Generated:</strong> ' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') || '</p>' FROM DUAL;
+          SELECT '<p><strong>Timeline Scope:</strong> {{ _total_runs }} collection runs from {{ _first_run_date }} to {{ _last_run_date }} ({{ _days_span }} days)</p>' FROM DUAL;
+          SELECT '<p><strong>Repository:</strong> {{ repo_schema | upper }}@{{ repo_tns_alias }}</p>' FROM DUAL;
+          SELECT '</div>' FROM DUAL;
+          
+          @{{ _sql_script }}
+          
+          SELECT '</body></html>' FROM DUAL;
+          SPOOL OFF
+          EXIT;
+          EOSQL
+      register: _html_report
+      changed_when: true
+      when: output_format in ['html', 'both']
+
+    # ── Summary ─────────────────────────────────────────────────────────────
+    - name: Report generation summary
+      ansible.builtin.debug:
+        msg:
+          - "✅ Timeline Report Generated:"
+          - "  Option: {{ option | upper }}"
+          - "  Timeline: {{ _first_run_date }} to {{ _last_run_date }} ({{ _total_runs }} runs)"
+          - "  Text report: {{ output_dir }}/timeline_{{ option }}_{{ report_timestamp }}.txt"
+          - "  HTML report: {{ output_dir }}/timeline_{{ option }}_{{ report_timestamp }}.html"
+
+    - name: Show where to find reports
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "📊 View reports:"
+          - "  Text: cat {{ output_dir }}/timeline_{{ option }}_{{ report_timestamp }}.txt"
+          - "  HTML: Open {{ output_dir }}/timeline_{{ option }}_{{ report_timestamp }}.html in browser"
+          - ""
+          - "💡 Generate other timeline reports:"
+          - "  ansible-playbook playbooks/report_timeline.yml -i 'localhost,' -c local -e 'option=inmemory'"
+          - "  ansible-playbook playbooks/report_timeline.yml -i 'localhost,' -c local -e 'option=partitioning'"
+          - "  ansible-playbook playbooks/report_timeline.yml -i 'localhost,' -c local -e 'option=compression'"
+          - "  ansible-playbook playbooks/report_timeline.yml -i 'localhost,' -c local -e 'option=security'"

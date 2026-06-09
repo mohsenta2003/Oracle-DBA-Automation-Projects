@@ -1,0 +1,6 @@
+---
+# defaults file for oracle_wait_events
+# All values auto-detected - override with -e if needed
+oracle_user: ""
+oracle_home: ""
+db_sid: ""

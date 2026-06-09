@@ -1,0 +1,350 @@
+---
+# roles/oracle_options_audit/defaults/main.yml
+#
+# ============================================================================
+# REPOSITORY CONFIGURATION - SINGLE SOURCE OF TRUTH
+# ============================================================================
+# When moving DEV → TEST → PROD, change repo_* settings below!
+# Standalone playbooks will load from vars/repo_config.yml (keep in sync)
+# ============================================================================
+#
+# Oracle OS user — auto-detected from PMON process.
+# Override: -e 'oracle_user=oracle'
+# oracle_user: ""
+
+# Limit to a single SID on multi-instance hosts.
+# Override: -e 'db_sid=MYDB'
+# db_sid: ""
+
+# Repository database connection
+repo_tns_alias: ""              # TNS alias: "d1hub" or leave empty to use host/port/sid
+repo_host:     "crlnxd1046"     # Repository host
+repo_port:     "1535"           # Repository port
+repo_sid:      "d1hub"          # Repository SID
+repo_user:     "DBAORALIC_SCH"  # Repository user (schema owner)
+repo_schema:   "{{ repo_user }}"   # Schema owning ORACLE_OPT_* tables
+repo_password: "PP1_mQo84M8G"   # Repository password (TODO: use ansible-vault!)
+
+# Run label for this execution — override to tag runs e.g. 'Weekly-2026-W19'
+run_label: "ansible-{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%SZ') }}"
+
+# ── Feature collection flags ───────────────────────────────────────────────────
+#
+# Set any flag to false to skip that detail query entirely (faster runs).
+# v$option + dba_feature_usage_statistics are ALWAYS collected regardless.
+#
+# Override on command line:
+#   -e "collect_partitioning=false collect_security=false"
+#   -e "collect_only_security=true"   � shorthand: sets all others false (see below)
+#
+# Shorthand group flags (override individual flags below):
+#   collect_all=true     → enable everything (default)
+#   collect_all=false    → disable all detail queries; only v$option+features collected
+#
+collect_partitioning: true    # ORACLE_OPT_D_PART    — dba_part_tables
+collect_compression:  true    # ORACLE_OPT_D_COMPRESS — dba_tables compression
+collect_security:     true    # ORACLE_OPT_D_SECURITY — TDE encrypted TS + columns
+collect_inmemory:     true    # ORACLE_OPT_D_INMEM    — dba_tables INMEMORY=ENABLED
+collect_pdbs:         true    # ORACLE_OPT_D_PDB      — v$pdbs (12c+ only)
+collect_adg:          true    # ORACLE_OPT_D_ADG      — Standby DBs open READ ONLY (Active Data Guard)
+collect_rac:          true    # ORACLE_OPT_D_RAC      — gv$instance
+
+# Email / report: skip sections with zero rows (keeps email compact)
+email_skip_empty_sections: false
+
+# ── Oracle option / pack catalog ───────────────────────────────────────────────
+#
+# license_type values:
+#   EE_BASE      — Oracle Database Enterprise Edition itself
+#   EE_EXTRA     — requires a SEPARATE license purchase on top of EE
+#
+# option_name — exact string that appears in v$option PARAMETER column.
+#
+# detail_table — DB table this role creates/populates with evidence rows
+#   (object counts, names, sizes).  "" = no detail table for this option.
+#
+# NOTE: OEM Repository Database and OEM Management Agent are INFRASTRUCTURE
+#   products — they do NOT appear in v$option or dba_feature_usage_statistics.
+#   Track them via OEM: Setup → My Oracle Support → License Management Services.
+
+oracle_option_catalog:
+
+  # ����������������������������������������������������������������������������
+  # GROUP: Oracle Database Enterprise Edition (base)
+  #   License type: purchased separately; options below are INCLUDED in that base.
+  # ����������������������������������������������������������������������������
+  - option_name:        "Oracle Database Enterprise Edition"
+    license_group:      "Database Engine"
+    license_type:       "EE_BASE"
+    detail_table:       ""
+    notes: "Base EE license. All EE_EXTRA options below require this to be licensed first."
+
+  # ����������������������������������������������������������������������������
+  # GROUP: High Availability & Scalability
+  # ����������������������������������������������������������������������������
+  - option_name:        "Real Application Clusters"
+    license_group:      "High Availability & Scalability"
+    license_type:       "EE_EXTRA"
+    detail_table:       "ORACLE_OPT_D_RAC"
+    notes: "RAC: requires license for every node/CPU in the cluster."
+
+  - option_name:        "RAC"
+    license_group:      "High Availability & Scalability"
+    license_type:       "EE_EXTRA"
+    detail_table:       "ORACLE_OPT_D_RAC"
+    notes: "Alias entry — same product as Real Application Clusters."
+
+  - option_name:        "Active Data Guard"
+    license_group:      "High Availability & Scalability"
+    license_type:       "EE_EXTRA"
+    detail_table:       "ORACLE_OPT_D_ADG"
+    notes: "Standby open for read / fast-start failover. Data Guard itself (no reads) is EE_INCLUDED."
+
+  - option_name:        "GoldenGate"
+    license_group:      "High Availability & Scalability"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "Separate GoldenGate license, not part of DB install."
+
+  # ����������������������������������������������������������������������������
+  # GROUP: Multitenant
+  # ����������������������������������������������������������������������������
+  - option_name:        "Multitenant"
+    license_group:      "Multitenant"
+    license_type:       "EE_EXTRA"
+    detail_table:       "ORACLE_OPT_D_PDB"
+    notes: "Required when running >3 PDBs per CDB (19c+). Up to 3 PDBs included in EE."
+
+  # ����������������������������������������������������������������������������
+  # GROUP: Partitioning
+  # ����������������������������������������������������������������������������
+  - option_name:        "Partitioning"
+    license_group:      "Partitioning"
+    license_type:       "EE_EXTRA"
+    detail_table:       "ORACLE_OPT_D_PART"
+    notes: "Any partitioned table / index triggers this option."
+
+  # ����������������������������������������������������������������������������
+  # GROUP: Compression
+  # ����������������������������������������������������������������������������
+  - option_name:        "Advanced Compression"
+    license_group:      "Compression"
+    license_type:       "EE_EXTRA"
+    detail_table:       "ORACLE_OPT_D_COMPRESS"
+    notes: "OLTP/Advanced/Hybrid Columnar Compression. Basic table compression is included in EE."
+
+  # ����������������������������������������������������������������������������
+  # GROUP: Security
+  # ����������������������������������������������������������������������������
+  - option_name:        "Advanced Security Option"
+    license_group:      "Security"
+    license_type:       "EE_EXTRA"
+    detail_table:       "ORACLE_OPT_D_SECURITY"
+    notes: "Transparent Data Encryption (TDE) + Native Network Encryption."
+
+  - option_name:        "Label Security"
+    license_group:      "Security"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "Row-level security labels (OLS)."
+
+  - option_name:        "Database Vault"
+    license_group:      "Security"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "Privileged user access control and separation of duty."
+
+  # ����������������������������������������������������������������������������
+  # GROUP: In-Memory & Analytics
+  # ����������������������������������������������������������������������������
+  - option_name:        "In-Memory Column Store"
+    license_group:      "In-Memory & Analytics"
+    license_type:       "EE_EXTRA"
+    detail_table:       "ORACLE_OPT_D_INMEM"
+    notes: "Any object with INMEMORY clause triggers this option."
+
+  - option_name:        "OLAP"
+    license_group:      "In-Memory & Analytics"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "Analytic workspaces / OLAP DML."
+
+  - option_name:        "Oracle Data Mining"
+    license_group:      "In-Memory & Analytics"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "In-DB machine learning algorithms (DBMS_DATA_MINING)."
+
+  - option_name:        "Oracle Advanced Analytics"
+    license_group:      "In-Memory & Analytics"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "Bundles Data Mining + R integration."
+
+  - option_name:        "Spatial"
+    license_group:      "In-Memory & Analytics"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "SDO_GEOMETRY types, spatial operators and indexing."
+
+  - option_name:        "Spatial and Graph"
+    license_group:      "In-Memory & Analytics"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "Spatial plus RDF/property graph."
+
+  # ����������������������������������������������������������������������������
+  # GROUP: Testing & Quality
+  # ����������������������������������������������������������������������������
+  - option_name:        "Real Application Testing"
+    license_group:      "Testing & Quality"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "Database Replay and SQL Performance Analyzer (SPA)."
+
+  # ����������������������������������������������������������������������������
+  # GROUP: Management Packs (OEM)
+  #   IMPORTANT: OEM auto-triggers Diagnostics & Tuning Pack usage even if you
+  #   never explicitly open those screens.  AWR snapshots and nightly SQL Tuning
+  #   auto-tasks run by default and register usage in dba_feature_usage_statistics.
+  # ����������������������������������������������������������������������������
+  - option_name:        "Diagnostics Pack"
+    license_group:      "Management Packs"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "AWR, ADDM, ASH, Baselines. OEM auto-enables. Included in many OEM deployments."
+
+  - option_name:        "Tuning Pack"
+    license_group:      "Management Packs"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "SQL Tuning/Access Advisor, Real-Time SQL Monitoring. Requires Diagnostics Pack."
+
+  - option_name:        "Database Lifecycle Management Pack"
+    license_group:      "Management Packs"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "Schema change management, patch automation via OEM."
+
+  - option_name:        "Data Masking and Subsetting Pack"
+    license_group:      "Management Packs"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "Test data management via OEM."
+
+  - option_name:        "Cloud Management Pack for Oracle Database"
+    license_group:      "Management Packs"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "Cloud operations management via OEM."
+
+  - option_name:        "Change Management Pack"
+    license_group:      "Management Packs"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "Change/configuration tracking via OEM."
+
+  - option_name:        "Configuration Management Pack"
+    license_group:      "Management Packs"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "Inventory and configuration compliance via OEM."
+
+  - option_name:        "Provisioning and Patch Automation Pack"
+    license_group:      "Management Packs"
+    license_type:       "EE_EXTRA"
+    detail_table:       ""
+    notes: "Automated provisioning and patching via OEM."
+
+# ── Backward-compat flat list (derived from catalog above, used in Jinja loops) ─
+# Tasks that do  'opt_name in ee_extra_options'  still work without changes.
+ee_extra_options: >-
+  {{ oracle_option_catalog | selectattr('license_type','in',['EE_EXTRA','EE_BASE'])
+     | map(attribute='option_name') | list }}
+
+# Keywords used to filter DBA_FEATURE_USAGE_STATISTICS to EE extra-cost features only.
+# Each entry generates a  NAME LIKE '%keyword%'  clause in the SQL WHERE list.
+# These are Oracle's internal feature names (often different from v$option names).
+#
+# OEM / auto-maintenance features are included because they register usage
+# automatically and still require the corresponding pack license:
+#   AWR, ADDM, ASH, Baseline, Real-time ADDM  → Diagnostics Pack
+#   SQL Tuning/Access Advisor, SQL Monitoring  → Tuning Pack
+#   Automatic SQL Tuning (nightly auto task)   → Tuning Pack
+ee_feature_keywords:
+  # ── Diagnostics Pack ─────────────────────────────────────────────────────────
+  - "Automatic Workload Repository"
+  - "AWR"
+  - "ADDM"
+  - "Active Session History"
+  - "Baseline"
+  - "Diagnostics Pack"
+  - "Real-time ADDM"
+  - "Database Performance Hub"
+  - "DB Performance Hub"
+  # ── Tuning Pack ──────────────────────────────────────────────────────────────
+  - "SQL Tuning Advisor"
+  - "SQL Access Advisor"
+  - "Automatic SQL Tuning"
+  - "Tuning Pack"
+  - "SQL Monitoring"
+  - "Real-Time SQL Monitoring"
+  # ── Database Lifecycle Management Pack ───────────────────────────────────────
+  - "Database Lifecycle Management"
+  - "Lifecycle Management Pack"
+  - "Patch Automation"
+  # ── Data Masking and Subsetting Pack ─────────────────────────────────────────
+  - "Data Masking"
+  - "Data Subsetting"
+  # ── Cloud Management Pack for Oracle Database ─────────────────────────────────
+  - "Cloud Management Pack"
+  # ── Change / Configuration / Provisioning Packs ──────────────────────────────
+  - "Change Management Pack"
+  - "Configuration Management Pack"
+  - "Provisioning and Patch"
+  # ── Partitioning ─────────────────────────────────────────────────────────────
+  - "Partitioning"
+  # ── Compression ──────────────────────────────────────────────────────────────
+  - "Advanced Compression"
+  - "Hybrid Columnar Compression"
+  # ── Security ─────────────────────────────────────────────────────────────────
+  - "Advanced Security"
+  - "Label Security"
+  - "Database Vault"
+  - "Audit Vault"
+  - "Data Masking"
+  - "Transparent Data Encryption"
+  - "Native Network Encryption"
+  # ── Analytics / In-Memory ────────────────────────────────────────────────────
+  - "Data Mining"
+  - "Advanced Analytics"
+  - "OLAP"
+  - "In-Memory"
+  # ── Spatial / Graph ──────────────────────────────────────────────────────────
+  - "Spatial"
+  # ── HA / RAC / Replication ───────────────────────────────────────────────────
+  - "Active Data Guard"
+  - "Real Application Clusters"
+  - "GoldenGate"
+  # ── Multitenant / PDB ────────────────────────────────────────────────────────
+  - "Multitenant"
+  # ── Testing ──────────────────────────────────────────────────────────────────
+  - "Real Application Testing"
+
+# Log/temp folder on the controller — role-specific, under project root.
+# A dated subfolder is created automatically per run (YYYY-MM-DD).
+# Override: -e "log_dir=/your/path"
+log_dir: "{{ playbook_dir }}/../logs/oracle_options_audit/{{ lookup('pipe', 'date +%Y-%m-%d') }}"
+
+# ── Email summary ──────────────────────────────────────────────────────────────
+# Set send_summary_email: true to email a run report after each execution.
+# Override on command line: -e "send_summary_email=true"
+send_summary_email: false
+
+# Comma-separated list of recipients
+email_to:   "Mohsen.Taheri@transamerica.com"
+email_from: "crlnxp1086@transamerica.com"
+
+# SMTP relay
+smtp_host: "mail1.us.aegon.com"
+smtp_port: 25

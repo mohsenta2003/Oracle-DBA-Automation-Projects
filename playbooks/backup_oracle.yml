@@ -1,0 +1,37 @@
+---
+# ================================================================================
+# Oracle RMAN Backup Playbook - MULTI-INSTANCE SUPPORT
+# ================================================================================
+#
+# This playbook automatically detects and processes ALL database instances
+# running on each target host.
+#
+# BASIC USAGE:
+#   ansible-playbook playbooks/backup_oracle.yml --limit us_lnx_test
+#   ansible-playbook playbooks/backup_oracle.yml --limit crlnxd2201
+#
+# SPECIFIC INSTANCE:
+#   ansible-playbook playbooks/backup_oracle.yml --limit crlnxd2201 -e "db_sid=ORCL1"
+#
+# BACKUP OPTIONS:
+#   -e "backup_type=full"           # Full backup (default)
+#   -e "backup_type=incremental"    # Incremental level 1
+#   -e "backup_type=archivelog"     # Archivelog only
+#   -e "backup_dest=/u01/backup"    # Custom backup location
+#   -e "execute_backup=true"        # Actually run (default is dry-run)
+#
+# AUTO-DETECTION:
+#   - Oracle user detected from PMON process owner
+#   - ORACLE_HOME resolved from /etc/oratab for each instance
+#   - All running instances processed automatically
+#
+# REPORTS:
+#   Saved to: reports/YYYY-MM-DD/hostname/backup_<SID>.txt
+# ================================================================================
+
+- name: Configure RMAN Backup for Oracle Databases
+  hosts: all
+  become: no
+  gather_facts: no
+  roles:
+    - oracle_backup

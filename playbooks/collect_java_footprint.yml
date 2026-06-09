@@ -1,0 +1,74 @@
+---
+# playbooks/collect_java_footprint.yml
+#
+# Scans all target hosts for Java installations (JDK/JRE) and stores the
+# results in the central repository on dbai under the mtaheri schema.
+#
+# Central tables populated:
+#   MTAHERI.JAVA_SCAN_RUNS      — one row per execution
+#   MTAHERI.JAVA_SCAN_SERVERS   — one row per host
+#   MTAHERI.JAVA_SCAN_INSTALLS  — one row per Java installation found
+#
+# Reporting views (query after each run):
+#   MTAHERI.JAVA_SCAN_LATEST_VW    — all installs from most recent run
+#   MTAHERI.JAVA_SCAN_SUMMARY_VW   — count per host/type/version
+#   MTAHERI.JAVA_SCAN_ORACLE_VW    — Oracle-context Java only
+#   MTAHERI.JAVA_SCAN_OUTDATED_VW  — Java < 11 with patch risk flag
+#
+# Prerequisites:
+#   Run _setup_java_scan_tables.yml once to create the repository tables.
+#
+# Usage:
+#   # All hosts
+#   ansible-playbook playbooks/collect_java_footprint.yml -i inv_key.yml \
+#     -e "repo_password=<pwd>"
+#
+#   # Specific host group
+#   ansible-playbook playbooks/collect_java_footprint.yml -i inv_key.yml \
+#     -l all_eu_linux -e "repo_password=<pwd>"
+#
+#   # Single host
+#   ansible-playbook playbooks/collect_java_footprint.yml -i inv_key.yml \
+#     -l crlnxp1086 -e "repo_password=<pwd>"
+#
+#   # Run as root for full path access (recommended for Oracle homes)
+#   ansible-playbook playbooks/collect_java_footprint.yml -i inv_key.yml \
+#     -e "java_scan_become_root=true repo_password=<pwd>"
+#
+#   # Tag the run
+#   ansible-playbook playbooks/collect_java_footprint.yml -i inv_key.yml \
+#     -e "run_label=Monthly-Java-Scan-2026-06 repo_password=<pwd>"
+#
+#   # Override repository (different DB/schema)
+#   ansible-playbook playbooks/collect_java_footprint.yml -i inv_key.yml \
+#     -e "repo_host=crlnxd1046 repo_port=1535 repo_sid=dbai repo_user=mtaheri repo_password=<pwd>"
+#
+#   # After scan — check results:
+#   SELECT * FROM MTAHERI.JAVA_SCAN_LATEST_VW   ORDER BY HOSTNAME, JAVA_TYPE;
+#   SELECT * FROM MTAHERI.JAVA_SCAN_OUTDATED_VW  ORDER BY JAVA_MAJOR, HOSTNAME;
+#   SELECT * FROM MTAHERI.JAVA_SCAN_ORACLE_VW    ORDER BY HOSTNAME;
+#   SELECT * FROM MTAHERI.JAVA_SCAN_SUMMARY_VW;
+
+- name: Collect Java Footprint — All Servers
+  hosts: all
+  gather_facts: false
+  become: false
+  serial: 0                    # run all hosts in parallel
+
+  vars_files:
+    - ../vars/java_scanner_config.yml
+
+  pre_tasks:
+    - name: Validate required runtime variables
+      ansible.builtin.assert:
+        that:
+          - repo_user | default('') | trim | length > 0
+          - repo_schema | default('') | trim | length > 0
+          - repo_password | default('') | trim | length > 0
+        fail_msg: >-
+          Missing required repository variables. Provide at runtime, e.g.
+          -e "repo_password=<pwd>".
+      run_once: true
+
+  roles:
+    - java_scanner

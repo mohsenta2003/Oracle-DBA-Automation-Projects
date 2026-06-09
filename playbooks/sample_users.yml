@@ -1,0 +1,70 @@
+---
+# ================================================================================
+# Sample Users Definition File for provision_users.yml Playbook
+# ================================================================================
+# Usage:
+#   ansible-playbook playbooks/provision_users.yml -e "action=create" -e "@playbooks/sample_users.yml"
+#
+# Copy this file and modify for your environment
+# ================================================================================
+
+users:
+  # Application user with standard access
+  - username: APP_USER1
+    password: "AppSecure#2024!"
+    default_tablespace: USERS
+    temp_tablespace: TEMP
+    quota_mb: 500
+    profile: DEFAULT
+    account_status: UNLOCK
+    roles:
+      - CONNECT
+      - RESOURCE
+
+  # Developer user with more privileges
+  - username: DEV_USER1
+    password: "DevSecure#2024!"
+    default_tablespace: USERS
+    temp_tablespace: TEMP
+    quota_mb: 1024
+    profile: DEFAULT
+    account_status: UNLOCK
+    roles:
+      - CONNECT
+      - RESOURCE
+      - CREATE VIEW
+      - CREATE SYNONYM
+
+  # Read-only reporting user
+  - username: RPT_USER1
+    password: "RptSecure#2024!"
+    default_tablespace: USERS
+    temp_tablespace: TEMP
+    quota_mb: 100
+    profile: DEFAULT
+    account_status: UNLOCK
+    roles:
+      - CONNECT
+
+  # Service account with unlimited quota
+  - username: SVC_BATCH
+    password: "SvcBatch#2024!"
+    default_tablespace: USERS
+    temp_tablespace: TEMP
+    quota_mb: -1  # Unlimited
+    profile: DEFAULT
+    account_status: UNLOCK
+    roles:
+      - CONNECT
+      - RESOURCE
+
+  # Locked account (created but disabled)
+  - username: APP_DISABLED
+    password: "Disabled#2024!"
+    default_tablespace: USERS
+    temp_tablespace: TEMP
+    quota_mb: 0
+    profile: DEFAULT
+    account_status: LOCK
+    roles:
+      - CONNECT

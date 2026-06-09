@@ -1,0 +1,29 @@
+---
+# Oracle User Management Playbook
+#
+# Supports MULTIPLE instances on same host!
+#
+# Usage Examples:
+#   # List users in ALL instances on a host
+#   ansible-playbook playbooks/manage_users.yml --limit crlnxd2201
+#
+#   # List users in specific instance only
+#   ansible-playbook playbooks/manage_users.yml --limit crlnxd2201 -e "db_sid=awdmld"
+#
+#   # Check if user exists (in all instances)
+#   ansible-playbook playbooks/manage_users.yml --limit crlnxd2201 -e "check_user=ESMITH"
+#
+#   # Change password (specify db_sid for safety)
+#   ansible-playbook playbooks/manage_users.yml --limit crlnxd2201 -e "db_sid=awdmld change_password_user=MYUSER change_password_new=NewP@ss123"
+#
+#   # Unlock user account (specify db_sid for safety)
+#   ansible-playbook playbooks/manage_users.yml --limit crlnxd2201 -e "db_sid=awdmld unlock_user=BNEWTON"
+#
+# Reports saved to: reports/YYYY-MM-DD/hostname/users_SID.csv
+
+- name: Manage Oracle Database Users
+  hosts: all
+  become: no
+  gather_facts: no
+  roles:
+    - oracle_user

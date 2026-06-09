@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Master Health Dashboard: {{ current_sid }}</title>
+    <style>
+        :root {
+            --primary: #0f172a; --primary-light: #2563eb; --bg: #f1f5f9; --card-bg: #ffffff;
+            --text-main: #1e293b; --text-muted: #475569; --border: #cbd5e1;
+            --success: #059669; --warning: #d97706; --danger: #dc2626; --info: #2563eb;
+        }
+        body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); margin: 0; padding: 25px; color: var(--text-main); font-size: 13px; }
+        .container { max-width: 1300px; margin: auto; }
+        .header { background: var(--primary); color: white; padding: 25px 35px; border-radius: 12px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+        .header h1 { margin: 0; font-size: 2rem; letter-spacing: -0.025em; }
+        
+        .section-title { font-size: 1rem; font-weight: 800; color: var(--primary); margin: 25px 0 12px; display: flex; align-items: center; gap: 8px; text-transform: uppercase; border-left: 4px solid var(--primary-light); padding-left: 12px; }
+        
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .card { background: var(--card-bg); padding: 18px; border-radius: 10px; border: 1px solid var(--border); box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .card-label { font-size: 0.7rem; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; }
+        
+        .metric-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #f1f5f9; }
+        .metric-row:last-child { border-bottom: none; }
+        .metric-val { font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+        
+        .status-badge { padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 800; text-transform: uppercase; }
+        .bg-success { background: #d1fae5; color: #065f46; }
+        .bg-warning { background: #fef3c7; color: #92400e; }
+        .bg-danger { background: #fee2e2; color: #991b1b; }
+        
+        table { width: 100%; border-collapse: collapse; margin-top: 5px; background: white; border-radius: 8px; overflow: hidden; }
+        th { text-align: left; background: #f8fafc; padding: 12px; font-size: 0.7rem; color: var(--text-muted); border-bottom: 2px solid var(--border); }
+        td { padding: 10px 12px; border-bottom: 1px solid #f1f5f9; font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; }
+        
+        pre { background: #1e293b; color: #f8fafc; padding: 15px; border-radius: 8px; font-size: 0.75rem; overflow-x: auto; line-height: 1.4; border: 1px solid #334155; }
+        .log-box { max-height: 250px; overflow-y: auto; }
+        
+        .advisor-box { background: #eff6ff; border: 1px solid #bfdbfe; padding: 15px; border-radius: 8px; color: #1e3a8a; }
+        .advisor-title { font-weight: 800; margin-bottom: 8px; color: #1d4ed8; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div>
+                <h1>{{ current_sid }} <span style="font-size: 1rem; opacity: 0.7;">| MASTER HEALTH</span></h1>
+                <div style="margin-top: 5px; opacity: 0.9;">{{ inventory_hostname }} | {{ _current_mon_result.version }}</div>
+            </div>
+            <div style="text-align: right;">
+                <div style="font-size: 1.2rem; font-weight: 700;">{{ _current_mon_result.status }}</div>
+                <div style="font-size: 0.8rem; opacity: 0.7;">Uptime: {{ _current_mon_result.startup_time }}</div>
+            </div>
+        </div>
+
+        <!-- 1. FULL-STACK INFRASTRUCTURE (OS + DB) -->
+        <div class="section-title">🖥️ Full-Stack Infrastructure</div>
+        <div class="grid">
+            <div class="card">
+                <div class="card-label">OS Disk Usage (Mount Points)</div>
+                <pre style="margin: 0; padding: 10px; background: #f8fafc; color: #334155; font-size: 0.7rem; border-color: #e2e8f0;">{{ _disk_usage | default('No OS disk data captured') }}</pre>
+            </div>
+            <div class="card">
+                <div class="card-label">OS Memory Health</div>
+                <pre style="margin: 0; padding: 10px; background: #f8fafc; color: #334155; font-size: 0.7rem; border-color: #e2e8f0;">{{ _os_mem | default('No OS memory data captured') }}</pre>
+            </div>
+            <div class="card">
+                <div class="card-label">Log & Recoverability</div>
+                <div class="metric-row"><span>Log Switch (24h)</span> <span class="metric-val">{{ _redo_log_health | regex_search('Value: (\\d+)', '\\1') | default('0') }}</span></div>
+                <div class="metric-row"><span>FRA Usage</span> <span class="metric-val">{{ _fra_health | regex_search('Used: (.*?) \\|', '\\1') | default('N/A') }}</span></div>
+                <div class="metric-row"><span>Archivelog Mode</span> <span class="metric-val">{{ _db_extra | regex_search('Archivelog Mode: (.*)', '\\1') | default('N/A') }}</span></div>
+            </div>
+        </div>
+
+        <!-- 2. PERFORMANCE & SGA/PGA EFFICIENCY -->
+        <div class="section-title">⚡ Performance & Memory Efficiency</div>
+        <div class="grid">
+            <div class="card">
+                <div class="card-label">Cache Hit Ratios</div>
+                {% set buf_hit = _perf_ratios | regex_search('Buffer Cache Hit Ratio \\| Value: (\\d+\\.\\d+)%', '\\1') | default('0') | float %}
+                {% set lib_hit = _perf_ratios | regex_search('Library Cache Hit Ratio \\| Value: (\\d+\\.\\d+)%', '\\1') | default('0') | float %}
+                {% set dic_hit = _shared_pool_diag | regex_search('Dictionary Cache Hit Ratio \\| Value: (\\d+\\.\\d+)%', '\\1') | default('0') | float %}
+                <div class="metric-row"><span>Buffer Cache Hit</span> <span class="status-badge {{ 'bg-danger' if buf_hit < 90 else 'bg-success' }}">{{ buf_hit }}%</span></div>
+                <div class="metric-row"><span>Library Cache Hit</span> <span class="status-badge {{ 'bg-danger' if lib_hit < 95 else 'bg-success' }}">{{ lib_hit }}%</span></div>
+                <div class="metric-row"><span>Dictionary Cache</span> <span class="status-badge {{ 'bg-danger' if dic_hit < 85 else 'bg-success' }}">{{ dic_hit }}%</span></div>
+            </div>
+            <div class="card">
+                <div class="card-label">Wait Profile (Last 24h)</div>
+                <div class="metric-group" style="font-size: 0.8rem;">
+                    {{ _wait_history | replace('Wait Class: ', '') | replace(' | Percent: ', ': ') | replace('\n', '<br>') }}
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-label">Resource Pressures</div>
+                <div class="metric-row"><span>Redo Retries</span> <span class="metric-val">{{ _redo_log_health | regex_search('Redo Allocation Retries \\| Value: (\\d+)', '\\1') | default('0') }}</span></div>
+                <div class="metric-row"><span>Sort Segments</span> <span class="metric-val">{{ _sort_segments | truncate(40) if _sort_segments != '' else 'None' }}</span></div>
+                <div class="metric-row"><span>Shared Pool Reloads</span> <span class="metric-val">{{ _shared_pool_diag | regex_search('Library Cache Reloads \\| Value: (\\d+)', '\\1') | default('0') }}</span></div>
+            </div>
+        </div>
+
+        <!-- 3. STORAGE & OBJECT QUALITY -->
+        <div class="section-title">📂 Storage & Object Quality</div>
+        <div class="grid">
+            <div class="card" style="grid-column: span 2;">
+                <div class="card-label">Tablespace Detail (Usage & Availability)</div>
+                <pre style="margin: 0; padding: 10px; background: white; color: var(--text-main); border-color: #e2e8f0; font-size: 0.75rem;">{{ tablespace_usage.stdout | default('No tablespace data') }}</pre>
+            </div>
+            <div class="card">
+                <div class="card-label">Statistics Status</div>
+                <div class="metric-row"><span>Last Global Gather</span> <span class="metric-val">{{ _db_extra | regex_search('Global Stats Gather: (.*)', '\\1') | default('Unknown') }}</span></div>
+                <div class="metric-row"><span>Stale Table Count</span> <span class="metric-val">{{ _adv_stats.split('\n')|reject('eq','')|list|length if _adv_stats != '' else '0' }}</span></div>
+                <div style="font-size: 0.7rem; color: var(--text-muted); margin-top: 10px;">
+                    <strong>Oldest Analyzed:</strong> {{ _stats_dates.split('\n')|first if _stats_dates != '' else 'N/A' }}
+                </div>
+            </div>
+        </div>
+
+        <div class="grid">
+            <div class="card">
+                <div class="card-label">Index Rebuild Candidates (High B-Level/Clustering)</div>
+                <div style="font-size: 0.75rem; white-space: pre-wrap;">{{ _index_rebuilds | default('✅ No critical rebuild candidates identified') }}</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Maintenance Summary</div>
+                <div class="metric-row"><span>Last Backup</span> <span class="metric-val" style="font-size: 0.7rem;">{{ _backup_history.split('\n')|first | default('None') }}</span></div>
+                <div class="metric-row"><span>Last Patch</span> <span class="metric-val" style="font-size: 0.7rem;">{{ _patch_history.split('\n')|first | default('None') }}</span></div>
+            </div>
+        </div>
+
+        <!-- 4. CRITICAL LOGS & ALERTING -->
+        <div class="section-title">📑 Critical Logs & Connection Security</div>
+        <div class="grid">
+            <div class="card" style="grid-column: span 2;">
+                <div class="card-label">Alert Log (ORA- Errors with Context)</div>
+                <div class="log-box">
+                    {% if alert_log_errors.stdout | default('') | trim == '' %}
+                    <div class="bg-success" style="padding: 10px; border-radius: 6px; font-weight: 700;">✅ Clean (Last 24h)</div>
+                    {% else %}
+                    <pre>{{ alert_log_errors.stdout }}</pre>
+                    {% endif %}
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-label">Security Audit (Grantee: PUBLIC)</div>
+                <div style="font-size: 0.7rem;">
+                    {{ _security_audit | default('✅ No high-risk PUBLIC grants detected') | replace('\n', '<br>') }}
+                </div>
+            </div>
+        </div>
+
+        <!-- 5. EXPERT RECOMMENDATIONS -->
+        <div class="section-title">🧠 Master DBA Advisor</div>
+        {% if _advisor_tips | trim == '' %}
+        <div class="card bg-success" style="text-align: center; font-weight: 700;">✅ Instance is compliant with all Master Health Checks</div>
+        {% else %}
+        <div class="advisor-box">
+            <div class="advisor-title">Critical & Stability Recommendations</div>
+            <div style="white-space: pre-wrap; font-size: 0.85rem;">{{ _advisor_tips }}</div>
+        </div>
+        {% endif %}
+
+        <div style="text-align: center; margin-top: 40px; color: var(--text-muted); font-size: 0.7rem; padding-bottom: 25px;">
+            Antigravity Enterprise Monitoring | Advanced Health Deep-Dive | Created: {{ _report_iso }}
+        </div>
+    </div>
+</body>
+</html>

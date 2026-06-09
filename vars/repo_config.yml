@@ -1,0 +1,33 @@
+---
+# ============================================================================
+# Oracle Options Audit - Repository Configuration
+# ============================================================================
+# SINGLE SOURCE OF TRUTH for repository connection settings.
+# 
+# Used by:
+#   - roles/oracle_options_audit/defaults/main.yml (included by reference)
+#   - All standalone playbooks via vars_files
+#
+# To change environment (DEV → TEST → PROD), edit ONLY this file!
+# ============================================================================
+
+# Repository database connection
+repo_tns_alias: ""              # TNS alias (if configured): "d1hub" or leave empty
+repo_host:      "crlnxd1046"    # Database host
+repo_port:      "1535"          # Listener port
+repo_sid:       "d1hub"         # Database SID
+repo_user:      "DBAORALIC_SCH" # Schema owner/connection user
+repo_schema:    "{{ repo_user }}"  # Schema owning ORACLE_OPT_* tables (usually same as repo_user)
+repo_password:  "PP1_mQo84M8G"  # Connection password (TODO: use ansible-vault in production!)
+
+# Auto-built connection string (do not modify)
+repo_dsn: "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={{ repo_host }})(PORT={{ repo_port }}))(CONNECT_DATA=(SID={{ repo_sid }})))"
+_repo_conn_string: "{{ repo_tns_alias if (repo_tns_alias | default('')) else repo_dsn }}"
+
+# ============================================================================
+# Reporting & Email Configuration
+# ============================================================================
+report_output_dir: "/tmp"
+email_to:   "AGTORACLEDBA@transamerica.com"
+email_from: "crlnxp1086@transamerica.com"
+smtp_host:  "mail1.us.aegon.com"

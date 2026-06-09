@@ -1,0 +1,94 @@
+---
+- name: Test actual voption query output format
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: no
+  vars_files:
+    - ../vars/repo_config.yml
+  vars:
+    _test_run_ids: "81,101,121"
+  
+  tasks:
+    - name: "Run voption query with exact SET commands from report"
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500 WRAP OFF TRIMSPOOL ON
+          WITH host_latest_run AS (
+            SELECT i.hostname, MAX(i.run_id) AS run_id
+            FROM {{ repo_schema }}.ORACLE_OPT_INSTANCES i
+            WHERE i.run_id IN ({{ _test_run_ids }})
+            GROUP BY i.hostname
+          ),
+          historical_usage AS (
+            SELECT 
+              vh.hostname,
+              vh.sid,
+              vh.option_name,
+              MAX(CASE WHEN vh.is_inuse = 'Y' THEN 1 ELSE 0 END) AS ever_used,
+              MAX(CASE WHEN vh.is_inuse = 'Y' THEN vh.run_id END) AS last_used_run
+            FROM {{ repo_schema }}.ORACLE_OPT_VOPTION vh
+            WHERE vh.is_ee_extra = 'Y'
+            GROUP BY vh.hostname, vh.sid, vh.option_name
+          ),
+          voption_with_instance AS (
+            SELECT 
+              v.option_name,
+              v.hostname,
+              v.sid,
+              v.option_enabled,
+              v.is_inuse,
+              v.run_id,
+              i.os_type,
+              i.region
+            FROM {{ repo_schema }}.ORACLE_OPT_VOPTION v
+            JOIN host_latest_run hlr ON hlr.hostname = v.hostname AND hlr.run_id = v.run_id
+            JOIN {{ repo_schema }}.ORACLE_OPT_INSTANCES i ON i.hostname = hlr.hostname AND i.run_id = hlr.run_id AND i.sid = v.sid
+            WHERE v.is_ee_extra = 'Y'
+          )
+          SELECT 
+            vi.option_name || '|' ||
+            vi.hostname || '|' ||
+            vi.sid || '|' ||
+            vi.option_enabled || '|' ||
+            vi.is_inuse || '|' ||
+            CASE
+              WHEN UPPER(vi.os_type) = 'AIX' THEN 'AIX'
+              WHEN UPPER(vi.os_type) LIKE '%LINUX%' AND UPPER(vi.region) LIKE '%EU%' THEN 'EU-Linux'
+              WHEN UPPER(vi.os_type) LIKE '%LINUX%' THEN 'US-Linux'
+              ELSE 'Other'
+            END || '|' ||
+            CASE
+              WHEN UPPER(vi.hostname) LIKE 'CRLNXP%' OR UPPER(vi.hostname) LIKE 'UKLNXP%' 
+                   OR UPPER(vi.hostname) LIKE 'UKAIXP%' OR UPPER(vi.hostname) LIKE 'DCUP%' 
+                   OR UPPER(vi.hostname) LIKE 'CRANXP%' OR UPPER(vi.hostname) LIKE 'IP-%' THEN 'Production'
+              WHEN UPPER(vi.hostname) LIKE 'CRLNXM%' THEN 'Model'
+              WHEN UPPER(vi.hostname) LIKE 'CRLNXT%' OR UPPER(vi.hostname) LIKE 'CRLNXD%' 
+                   OR UPPER(vi.hostname) LIKE 'UKLNXT%' OR UPPER(vi.hostname) LIKE 'UKAIXT%' 
+                   OR UPPER(vi.hostname) LIKE 'DCUNX%' THEN 'Test-Dev'
+              ELSE 'Other'
+            END || '|' ||
+            NVL(TO_CHAR(h.ever_used), '0') || '|' ||
+            NVL(TO_CHAR(h.last_used_run), 'NEVER') AS result
+          FROM voption_with_instance vi
+          LEFT JOIN historical_usage h ON h.hostname = vi.hostname AND h.sid = vi.sid AND h.option_name = vi.option_name
+          ORDER BY vi.option_name, vi.is_inuse DESC, h.ever_used DESC, vi.hostname, vi.sid;
+          EXIT;
+          EOSQL
+      register: voption_test
+      changed_when: false
+      become: false
+
+    - name: "Show output stats"
+      debug:
+        msg:
+          - "Output defined: {{ voption_test.stdout is defined }}"
+          - "Output length: {{ (voption_test.stdout | default('') | length) }} characters"
+          - "Line count: {{ (voption_test.stdout | default('') | trim).split('\n') | length }}"
+          - "First 10 lines:"
+
+    - name: "Show first 10 lines"
+      debug:
+        msg: "{{ voption_test.stdout_lines[:10] }}"

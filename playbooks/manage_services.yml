@@ -1,0 +1,115 @@
+---
+# ================================================================================
+# Service Management - Manage Oracle Services
+# ================================================================================
+#
+# MULTI-INSTANCE SUPPORT:
+#   Automatically detects ALL running instances on each host
+#
+# USAGE:
+#   # List all services (all instances)
+#   ansible-playbook playbooks/manage_services.yml --limit crlnxd2201 \
+#     -e "action=list"
+#
+#   # Create a new service
+#   ansible-playbook playbooks/manage_services.yml --limit crlnxd2201 \
+#     -e "action=create" \
+#     -e "service_name=APP_SERVICE"
+#
+#   # Start/Stop service
+#   ansible-playbook playbooks/manage_services.yml --limit crlnxd2201 \
+#     -e "db_sid=ORCL1" \
+#     -e "action=start" \
+#     -e "service_name=APP_SERVICE"
+#
+# REPORTS:
+#   Saved to: reports/YYYY-MM-DD/hostname/services_<SID>.txt
+# ================================================================================
+
+- name: Oracle Services Management
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  vars:
+    action: "list"  # list, create, start, stop, delete
+    service_name: ""
+    network_name: ""
+    report_base_dir: "{{ playbook_dir }}/../reports"
+    report_date: "{{ ansible_date_time.date }}"
+
+  tasks:
+    # ============================================
+    # Auto-detect Oracle Environment
+    # ============================================
+    - name: Detect Oracle service accounts
+      ansible.builtin.shell: |
+        grep -E '^svcorat|^svcorap|^oracle' /etc/passwd | head -1 | cut -d: -f1
+      register: detected_oracle_user
+      changed_when: false
+      failed_when: false
+
+    - name: Set Oracle user
+      ansible.builtin.set_fact:
+        oracle_user: "{{ oracle_user | default(detected_oracle_user.stdout | default('oracle')) }}"
+
+    - name: Detect all running database instances from PMON
+      ansible.builtin.shell: |
+        ps -ef | grep ora_pmon | grep -v grep | awk -F'_' '{print $NF}' | sort -u
+      register: detected_instances
+      changed_when: false
+      become_user: "{{ oracle_user }}"
+
+    - name: Read oratab entries for ORACLE_HOME mapping
+      ansible.builtin.shell: |
+        grep -v '^#' /etc/oratab 2>/dev/null | grep ':' || echo ""
+      register: oratab_content
+      changed_when: false
+
+    - name: Build ORACLE_HOME map from oratab
+      ansible.builtin.set_fact:
+        oracle_home_map: >-
+          {%- set home_map = {} -%}
+          {%- for line in oratab_content.stdout_lines -%}
+            {%- set parts = line.split(':') -%}
+            {%- if parts | length >= 2 -%}
+              {%- set _ = home_map.update({parts[0]: parts[1]}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ home_map }}
+
+    - name: Determine instances to process
+      ansible.builtin.set_fact:
+        instances_to_process: >-
+          {%- if db_sid is defined and db_sid != '' -%}
+            {{ [db_sid] }}
+          {%- else -%}
+            {{ detected_instances.stdout_lines | default([]) }}
+          {%- endif -%}
+
+    - name: Display detected instances
+      ansible.builtin.debug:
+        msg: |
+          Host: {{ inventory_hostname }}
+          Oracle User: {{ oracle_user }}
+          Instances: {{ instances_to_process | join(', ') }}
+          Action: {{ action }}
+
+    - name: Fail if no instances found
+      ansible.builtin.fail:
+        msg: "No Oracle instances detected on {{ inventory_hostname }}"
+      when: instances_to_process | length == 0
+
+    - name: Create local report directory
+      ansible.builtin.file:
+        path: "{{ report_base_dir }}/{{ report_date }}/{{ inventory_hostname }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: no
+
+    - name: Manage services on each instance
+      ansible.builtin.include_tasks: manage_services_instance.yml
+      loop: "{{ instances_to_process }}"
+      loop_control:
+        loop_var: current_sid

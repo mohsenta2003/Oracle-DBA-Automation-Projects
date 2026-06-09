@@ -1,0 +1,183 @@
+---
+# ================================================================================
+# Provision Users Playbook - Bulk user provisioning from YAML definition
+# ================================================================================
+# Creates multiple Oracle users with roles and quotas from a predefined list
+#
+# Usage:
+#   ansible-playbook playbooks/provision_users.yml --limit oracle_servers \
+#     -e "action=create" -e "@users_to_provision.yml"
+#
+# Actions:
+#   - create:   Create users from users list
+#   - remove:   Remove/drop users from users list  
+#   - report:   Generate report of user status without changes
+#   - validate: Validate users definition without creating
+#
+# Users Definition File (users_to_provision.yml):
+#   users:
+#     - username: APP_USER1
+#       password: "SecurePass123!"
+#       default_tablespace: USERS
+#       temp_tablespace: TEMP
+#       quota_mb: 500        # quota in MB, use -1 for unlimited
+#       roles:
+#         - CONNECT
+#         - RESOURCE
+#       profile: DEFAULT
+#       account_status: UNLOCK  # UNLOCK or LOCK
+#
+# Required Variables:
+#   - users: List of users to provision (from external file)
+#
+# Example Commands:
+#   Create users:
+#     ansible-playbook playbooks/provision_users.yml -e "action=create" -e "@users.yml"
+#   
+#   Report only:
+#     ansible-playbook playbooks/provision_users.yml -e "action=report" -e "@users.yml"
+#
+#   Remove users:
+#     ansible-playbook playbooks/provision_users.yml -e "action=remove" -e "@users.yml"
+# ================================================================================
+
+- name: Bulk Provision Oracle Users
+  hosts: all
+  gather_facts: yes
+  become: yes
+  
+  vars:
+    # Action to perform
+    action: report
+    
+    # Users list - should be provided via external file
+    users: []
+    
+    # Default values for users (if not specified per user)
+    default_tablespace: USERS
+    default_temp_tablespace: TEMP
+    default_quota_mb: 100
+    default_profile: DEFAULT
+    default_roles:
+      - CONNECT
+    
+    # Drop options
+    cascade_on_drop: true
+    
+    # Report directory
+    report_base_dir: "{{ playbook_dir }}/../reports"
+    report_date: "{{ ansible_date_time.date }}"
+    
+    # Target specific SID (optional)
+    db_sid: ""
+
+  pre_tasks:
+    - name: Validate users list is provided
+      ansible.builtin.fail:
+        msg: "No users defined. Please provide users list via -e '@users_file.yml'"
+      when: users | length == 0 and action != 'report'
+
+  tasks:
+    # ==========================================
+    # Detect Oracle user from OS
+    # ==========================================
+    - name: Detect Oracle service accounts from OS
+      ansible.builtin.shell: |
+        grep -E '^svcorat|^svcorap|^oracle' /etc/passwd | head -1 | cut -d: -f1
+      register: detected_oracle_user
+      changed_when: false
+      failed_when: detected_oracle_user.stdout == ""
+
+    - name: Set Oracle user
+      ansible.builtin.set_fact:
+        oracle_user: "{{ detected_oracle_user.stdout }}"
+
+    # ==========================================
+    # Detect all running database instances
+    # ==========================================
+    - name: Detect all running database instances from PMON
+      ansible.builtin.shell: |
+        ps -ef | grep ora_pmon | grep -v grep | awk -F'_' '{print $NF}' | sort -u
+      register: running_instances
+      changed_when: false
+
+    - name: Fail if no instances found
+      ansible.builtin.fail:
+        msg: "No running Oracle instances found on this host"
+      when: running_instances.stdout_lines | length == 0
+
+    - name: Display detected instances
+      ansible.builtin.debug:
+        msg: "Detected instances: {{ running_instances.stdout_lines | join(', ') }}"
+
+    # ==========================================
+    # Get ORACLE_HOME for each instance
+    # ==========================================
+    - name: Read oratab entries
+      ansible.builtin.shell: |
+        grep -v '^#' /etc/oratab 2>/dev/null | grep ':' || echo ""
+      register: oratab_content
+      changed_when: false
+
+    - name: Build ORACLE_HOME map from oratab
+      ansible.builtin.set_fact:
+        oracle_home_map: >-
+          {{
+            oracle_home_map | default({}) | combine({
+              item.split(':')[0]: item.split(':')[1]
+            })
+          }}
+      loop: "{{ oratab_content.stdout_lines }}"
+      when: item != '' and ':' in item
+
+    - name: Display ORACLE_HOME mappings
+      ansible.builtin.debug:
+        msg: "ORACLE_HOME map: {{ oracle_home_map | default({}) }}"
+
+    # ==========================================
+    # Create report directory
+    # ==========================================
+    - name: Create report directory on control machine
+      ansible.builtin.file:
+        path: "{{ report_base_dir }}/{{ report_date }}/{{ inventory_hostname }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: no
+      run_once: false
+
+    # ==========================================
+    # Determine which instances to process
+    # ==========================================
+    - name: Set instances to process
+      ansible.builtin.set_fact:
+        instances_to_process: "{{ [db_sid] if db_sid != '' and db_sid in running_instances.stdout_lines else running_instances.stdout_lines }}"
+
+    - name: Display instances to be processed
+      ansible.builtin.debug:
+        msg: "Will process instances: {{ instances_to_process | join(', ') }}"
+
+    # ==========================================
+    # Process each instance
+    # ==========================================
+    - name: Process each Oracle instance for user provisioning
+      ansible.builtin.include_tasks: provision_users_instance.yml
+      loop: "{{ instances_to_process }}"
+      loop_control:
+        loop_var: current_sid
+
+    # ==========================================
+    # Summary
+    # ==========================================
+    - name: User Provisioning Summary
+      ansible.builtin.debug:
+        msg: |
+          ═══════════════════════════════════════════════════
+          USER PROVISIONING COMPLETE
+          ═══════════════════════════════════════════════════
+          Host:         {{ inventory_hostname }}
+          Action:       {{ action }}
+          Users Count:  {{ users | length }}
+          Instances:    {{ instances_to_process | join(', ') }}
+          Reports:      {{ report_base_dir }}/{{ report_date }}/{{ inventory_hostname }}/
+          ═══════════════════════════════════════════════════

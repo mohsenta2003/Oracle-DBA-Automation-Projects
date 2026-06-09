@@ -1,0 +1,382 @@
+﻿---
+# roles/java_scanner/tasks/main.yml
+#
+# Scans every target host for Java installations (JDK/JRE) and stores the
+# complete footprint in the central repository on dbai / mtaheri.
+#
+# No script file is copied to target hosts — all discovery is done with
+# inline shell tasks in scan_host.yml (same approach as oracle_options_audit).
+#
+# Tables populated:
+#   {{ repo_schema | upper }}.JAVA_SCAN_RUNS      — one row per ansible execution
+#   {{ repo_schema | upper }}.JAVA_SCAN_SERVERS   — one row per host scanned
+#   {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS  — one row per Java installation found
+#
+# Config:  vars/java_scanner_config.yml  (SINGLE SOURCE OF TRUTH — edit there only)
+# Scanner: roles/java_scanner/tasks/scan_host.yml  (inline bash — no file copy)
+
+# ============================================
+# Build repository connection string
+# ============================================
+- name: Set repository connection string
+  ansible.builtin.set_fact:
+    _repo_conn_string: "{{ repo_tns_alias if (repo_tns_alias | default('')) else '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=' ~ repo_host ~ ')(PORT=' ~ repo_port ~ '))(CONNECT_DATA=(' ~ ('SERVICE_NAME=' ~ repo_service if (repo_service | default('')) else 'SID=' ~ repo_sid) ~ ')))' }}"
+  run_once: true
+  delegate_to: localhost
+  become: false
+
+- name: Test repository database connection
+  ansible.builtin.shell:
+    cmd: |
+      sqlplus -s /nolog << 'EOSQL'
+      CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+      SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+      SELECT 'REPO_CONNECTION_OK' FROM DUAL;
+      EXIT;
+      EOSQL
+  register: _repo_test
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  failed_when: "'REPO_CONNECTION_OK' not in _repo_test.stdout"
+
+- name: Display repository connection status
+  ansible.builtin.debug:
+    msg: "Repository connection SUCCESSFUL: {{ repo_user }}@{{ repo_tns_alias if (repo_tns_alias | default('')) else (repo_host ~ ':' ~ repo_port ~ '/' ~ repo_sid) }}"
+  run_once: true
+
+# ============================================
+# Gather facts needed for OS/region detection
+# ============================================
+- name: Gather facts (OS, timezone, CPU, network)
+  ansible.builtin.setup:
+    gather_subset:
+      - '!all'
+      - date_time
+      - hardware
+      - distribution
+      - network
+  become: false
+
+- name: Set run timestamp
+  ansible.builtin.set_fact:
+    _scan_timestamp: "{{ ansible_date_time.date }}_{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}{{ ansible_date_time.second }}"
+    _scan_date:      "{{ ansible_date_time.date }}"
+  run_once: true
+
+- name: Ensure role log directory exists on controller
+  ansible.builtin.file:
+    path: "{{ log_dir }}"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+# ============================================
+# Derive host OS metadata (region from timezone)
+# ============================================
+- name: Detect IANA timezone from OS
+  ansible.builtin.shell:
+    cmd: >-
+      timedatectl show --property=Timezone --value 2>/dev/null ||
+      readlink /etc/localtime 2>/dev/null | sed 's|.*zoneinfo/||' ||
+      cat /etc/timezone 2>/dev/null ||
+      echo ""
+  register: _detected_tz
+  changed_when: false
+  failed_when: false
+  become: false
+
+- name: Detect total RAM MB
+  ansible.builtin.shell:
+    cmd: >-
+      if [ -r /proc/meminfo ]; then
+        awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo;
+      elif command -v bootinfo >/dev/null 2>&1; then
+        bootinfo -r 2>/dev/null | awk '{printf "%d", $1/1024}';
+      else
+        echo 0;
+      fi
+  register: _detected_ram
+  changed_when: false
+  failed_when: false
+  become: false
+
+- name: Set host metadata facts
+  ansible.builtin.set_fact:
+    _host_os_type:    "{{ 'AIX' if ansible_system == 'AIX' else 'Linux' }}"
+    _host_os_version: "{{ ansible_distribution | default('Unknown') }} {{ ansible_distribution_version | default('') }}"
+    _host_os_kernel:  "{{ ansible_kernel | default('') }}"
+    _host_cpu_count:  "{{ ansible_processor_vcpus | default(ansible_processor_count | default(0)) }}"
+    _host_ip:         "{{ ansible_default_ipv4.address | default('') }}"
+    _host_ram_mb:     "{{ _detected_ram.stdout | default('0') | trim }}"
+    _host_timezone:   "{{ (_detected_tz.stdout | default('') | trim) or (ansible_date_time.tz | default('')) }}"
+    _host_region: >-
+      {%- set tz = (_detected_tz.stdout | default('') | trim) or (ansible_date_time.tz | default('')) -%}
+      {%- if 'Europe' in tz or 'London' in tz or 'Berlin' in tz or 'Prague' in tz or 'Paris' in tz or 'Amsterdam' in tz or 'CET' in tz or 'CEST' in tz or 'BST' in tz or 'GMT' in tz -%}EMEA
+      {%- elif 'America' in tz or 'CDT' in tz or 'CST' in tz or 'EDT' in tz or 'EST' in tz or 'MDT' in tz or 'MST' in tz or 'PDT' in tz or 'PST' in tz or 'CT' == tz or 'ET' == tz -%}USA
+      {%- elif 'Asia' in tz or 'Pacific' in tz or 'Australia' in tz or 'Tokyo' in tz or 'Singapore' in tz or 'JST' in tz or 'SGT' in tz or 'AEST' in tz -%}APAC
+      {%- else -%}UNKNOWN{%- endif -%}
+
+# ============================================
+# Initialize per-host results list
+# ============================================
+- name: Initialize Java installs list
+  ansible.builtin.set_fact:
+    _java_installs: []
+    _java_scan_rc:  0
+    _java_scan_err: ""
+
+# ============================================
+# Run inline Java scanner (no file copy)
+# ============================================
+- name: Scan this host for Java installations
+  ansible.builtin.include_tasks: scan_host.yml
+
+- name: Display scan result for this host
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: found {{ _java_installs | length }} Java installation(s) — rc={{ _java_scan_rc }}"
+
+# ============================================
+# INSERT run header into repository (run_once)
+# ============================================
+- name: Count totals for run header
+  ansible.builtin.set_fact:
+    _total_hosts:    "{{ ansible_play_hosts | length }}"
+    _total_installs: >-
+      {{ ansible_play_hosts
+         | map('extract', hostvars, '_java_installs')
+         | select('defined')
+         | map('length')
+         | map('int')
+         | sum }}
+  run_once: true
+
+- name: INSERT run header into JAVA_SCAN_RUNS and save RUN_ID
+  ansible.builtin.shell:
+    cmd: |
+      sqlplus -s /nolog << 'EOSQL'
+      CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+      SET HEADING OFF
+      SET FEEDBACK OFF
+      SET PAGESIZE 0
+      INSERT INTO {{ repo_schema | upper }}.JAVA_SCAN_RUNS
+          (RUN_DATE, DATA_AS_OF, RUN_LABEL, TRIGGERED_BY, CONTROLLER_HOST,
+           TOTAL_HOSTS, TOTAL_INSTALLS)
+      VALUES
+          (SYSDATE, SYSDATE,
+           '{{ run_label | replace("'", "''") }}',
+           '{{ lookup("pipe","whoami") }}',
+           '{{ lookup("pipe","hostname") }}',
+           {{ _total_hosts }},
+           {{ _total_installs }});
+      SELECT TO_CHAR(MAX(RUN_ID)) FROM {{ repo_schema | upper }}.JAVA_SCAN_RUNS;
+      COMMIT;
+      EXIT;
+      EOSQL
+  register: _run_insert
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: true
+
+- name: DEBUG — Show raw INSERT output
+  ansible.builtin.debug:
+    msg:
+      - "=== RAW SQLPLUS OUTPUT ==="
+      - "stdout: {{ _run_insert.stdout }}"
+      - "stdout_lines: {{ _run_insert.stdout_lines }}"
+      - "stderr: {{ _run_insert.stderr }}"
+      - "rc: {{ _run_insert.rc }}"
+  run_once: true
+  delegate_to: localhost
+  become: false
+
+- name: Parse RUN_ID from insert output
+  ansible.builtin.set_fact:
+    _scan_run_id: "{{ _run_insert.stdout_lines | select('match', '^[0-9]+$') | list | last | default('0') | trim }}"
+  run_once: true
+  delegate_to: localhost
+  become: false
+
+- name: DEBUG — Show parsed RUN_ID
+  ansible.builtin.debug:
+    msg:
+      - "=== RUN_ID PARSING ==="
+      - "Regex matches: {{ _run_insert.stdout_lines | select('match', '^[0-9]+$') | list }}"
+      - "Parsed RUN_ID: {{ _scan_run_id }}"
+  run_once: true
+  delegate_to: localhost
+  become: false
+
+- name: Display run ID
+  ansible.builtin.debug:
+    msg: "Java Scan RUN_ID={{ _scan_run_id }} — inserting results for {{ _total_installs }} install(s) across {{ _total_hosts }} host(s)"
+  run_once: true
+
+# ============================================
+# Write SQL insert file for all hosts then execute
+# (same pattern as oracle_options_audit detail SQL file)
+# ============================================
+- name: Write SQL insert file for all hosts
+  ansible.builtin.copy:
+    dest: "{{ log_dir }}/java_scan_{{ _scan_run_id }}_{{ _scan_timestamp }}.sql"
+    content: |
+      CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+      SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+      {% for target in ansible_play_hosts %}
+      {% set hv = hostvars[target] %}
+      -- ── Host: {{ target }} ───────────────────────────────────────────────────
+      INSERT INTO {{ repo_schema | upper }}.JAVA_SCAN_SERVERS
+          (RUN_ID, HOSTNAME, IP_ADDRESS, OS_TYPE, OS_VERSION, OS_KERNEL,
+           CPU_COUNT, RAM_MB, REGION, HOST_TIMEZONE, JAVA_COUNT,
+           SCAN_STATUS, SCAN_ERROR)
+      VALUES ({{ _scan_run_id }},
+              '{{ target | replace("'","''") }}',
+              '{{ hv._host_ip | default("") | replace("'","''") }}',
+              '{{ hv._host_os_type | default("") | replace("'","''") }}',
+              '{{ (hv._host_os_version | default("")) | trim | replace("'","''") }}',
+              '{{ hv._host_os_kernel | default("") | replace("'","''") }}',
+              {{ hv._host_cpu_count | default(0) }},
+              {{ hv._host_ram_mb | default(0) }},
+              '{{ (hv._host_region | default("UNKNOWN")) | trim | replace("'","''") }}',
+              '{{ hv._host_timezone | default("") | replace("'","''") }}',
+              {{ hv._java_installs | default([]) | length }},
+              '{{ "OK" if (hv._java_scan_rc | default(0) | int == 0) else "SCAN_ERROR" }}',
+              '{{ (hv._java_scan_err | default("")) | truncate(490, true, "...") | replace("'","''") }}');
+      {% for inst in hv._java_installs | default([]) %}
+      INSERT INTO {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS
+          (RUN_ID, SERVER_ID, HOSTNAME, REGION,
+           JAVA_TYPE, JAVA_VENDOR, JAVA_VERSION, JAVA_MAJOR,
+           JAVA_EDITION, BUILD_INFO,
+           JAVA_BIN_PATH, JAVA_HOME, SYMLINK_TARGET,
+           INSTALL_CONTEXT, INSTALL_SOURCE, IS_DEFAULT_PATH,
+           RELATED_ORACLE_HOME, RELATED_ORACLE_SID,
+           FILE_OWNER, FILE_GROUP, FILE_PERMISSIONS, FILE_LAST_MODIFIED,
+           ARCH_BITS,
+           IS_SYMLINK, RPM_OWNER, RPM_INSTALL_DATE,
+           RUNTIME_NAME, IS_HEADLESS, IS_ALTERNATIVES_DEFAULT, LIVE_PROCS)
+      VALUES ({{ _scan_run_id }},
+              (SELECT MAX(SERVER_ID) FROM {{ repo_schema | upper }}.JAVA_SCAN_SERVERS
+               WHERE RUN_ID={{ _scan_run_id }}
+                 AND HOSTNAME='{{ target | replace("'","''") }}'),
+              '{{ target | replace("'","''") }}',
+              '{{ (hv._host_region | default("UNKNOWN")) | trim | replace("'","''") }}',
+              '{{ inst.java_type | default("") | replace("'","''") }}',
+              '{{ inst.java_vendor | default("") | replace("'","''") }}',
+              '{{ inst.java_version | default("") | replace("'","''") }}',
+              {{ (inst.java_major if (inst.java_major is not none and (inst.java_major | string | trim) != '') else 'NULL') }},
+              '{{ inst.java_edition | default("") | replace("'","''") }}',
+              '{{ inst.build_info | default("") | truncate(490,true,"...") | replace("'","''") }}',
+              '{{ inst.java_bin | default("") | replace("'","''") }}',
+              '{{ inst.java_home | default("") | replace("'","''") }}',
+              '{{ inst.symlink_target | default("") | replace("'","''") }}',
+              '{{ inst.install_context | default("") | replace("'","''") }}',
+              '{{ inst.install_source | default("filesystem") | replace("'","''") }}',
+              '{{ inst.is_default_path | default("N") }}',
+              '{{ inst.related_oracle_home | default("") | replace("'","''") }}',
+              '{{ inst.related_oracle_sid | default("") | replace("'","''") }}',
+              '{{ inst.file_owner | default("") | replace("'","''") }}',
+              '{{ inst.file_group | default("") | replace("'","''") }}',
+              '{{ inst.file_perms | default("") | replace("'","''") }}',
+              '{{ inst.file_modified | default("") | replace("'","''") }}',
+              {{ (inst.arch_bits if (inst.arch_bits is not none and (inst.arch_bits | string | trim) != '') else 'NULL') }},
+              '{{ inst.is_symlink | default("N") }}',
+              '{{ inst.rpm_owner | default("") | truncate(240,true,"") | replace("'","''") }}',
+              '{{ inst.rpm_install_date | default("") | truncate(40,true,"") | replace("'","''") }}',
+              '{{ inst.runtime_name | default("") | truncate(240,true,"") | replace("'","''") }}',
+              '{{ inst.is_headless | default("") }}',
+              '{{ inst.is_alternatives_default | default("N") }}',
+              {{ inst.live_procs | default(0) | int }});
+      {% endfor %}
+      {% set ev = hv._java_host_evidence | default({}) %}
+      INSERT INTO {{ repo_schema | upper }}.JAVA_HOST_EVIDENCE
+          (RUN_ID, HOSTNAME, RUNNING_PROC_COUNT, RUNNING_PROC_USERS,
+           RUNNING_PROC_HOMES, LISTENING_PORTS, ENV_REFS_COUNT, ENV_REFS_FILES,
+           SYSTEMD_UNITS, CRON_REFS, LEGACY_RPMS_PRESENT, ALTERNATIVES_TARGET)
+      VALUES ({{ _scan_run_id }},
+              '{{ target | replace("'","''") }}',
+              {{ ev.RunningProcCount | default(0) | int }},
+              '{{ ev.RunningProcUsers | default("") | truncate(490,true,"") | replace("'","''") }}',
+              '{{ ev.RunningProcHomes | default("") | truncate(1990,true,"") | replace("'","''") }}',
+              '{{ ev.ListeningPorts | default("") | truncate(490,true,"") | replace("'","''") }}',
+              {{ ev.EnvRefsCount | default(0) | int }},
+              '{{ ev.EnvRefsFiles | default("") | truncate(1990,true,"") | replace("'","''") }}',
+              '{{ ev.SystemdUnits | default("") | truncate(1990,true,"") | replace("'","''") }}',
+              '{{ ev.CronRefs | default("") | truncate(1990,true,"") | replace("'","''") }}',
+              '{{ ev.LegacyRpmsPresent | default("") | truncate(490,true,"") | replace("'","''") }}',
+              '{{ ev.AlternativesTarget | default("") | truncate(490,true,"") | replace("'","''") }}');
+      {% endfor %}
+      COMMIT;
+      EXIT;
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Execute SQL insert file
+  ansible.builtin.shell:
+    cmd: "sqlplus -s /nolog @{{ log_dir }}/java_scan_{{ _scan_run_id }}_{{ _scan_timestamp }}.sql"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: true
+  register: _insert_result
+
+- name: DEBUG — Show insert output
+  ansible.builtin.debug:
+    msg:
+      - "=== INSERT OUTPUT ==="
+      - "{{ _insert_result.stdout_lines }}"
+  run_once: true
+  delegate_to: localhost
+  become: false
+
+- name: Check for SQL errors in insert
+  ansible.builtin.fail:
+    msg: "SQL insert errors detected — check {{ log_dir }}/java_scan_{{ _scan_run_id }}_{{ _scan_timestamp }}.sql"
+  when: _insert_result.stdout | regex_search('ORA-[0-9]+')
+  run_once: true
+
+- name: Read DB summary for this run
+  ansible.builtin.shell:
+    cmd: |
+      sqlplus -s /nolog << 'EOSQL'
+      CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _repo_conn_string }}
+      SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF ECHO OFF TRIMSPOOL ON LINESIZE 500
+      SELECT
+        r.run_id || '|' ||
+        NVL(r.total_hosts,0) || '|' ||
+        NVL(r.total_installs,0) || '|' ||
+        (SELECT COUNT(*) FROM {{ repo_schema | upper }}.JAVA_SCAN_SERVERS s WHERE s.run_id = r.run_id) || '|' ||
+        (SELECT COUNT(*) FROM {{ repo_schema | upper }}.JAVA_SCAN_SERVERS s WHERE s.run_id = r.run_id AND s.scan_status = 'OK') || '|' ||
+        (SELECT COUNT(*) FROM {{ repo_schema | upper }}.JAVA_SCAN_SERVERS s WHERE s.run_id = r.run_id AND s.scan_status <> 'OK') || '|' ||
+        (SELECT COUNT(*) FROM {{ repo_schema | upper }}.JAVA_SCAN_INSTALLS i WHERE i.run_id = r.run_id) || '|' ||
+        TO_CHAR(r.run_date, 'YYYY-MM-DD HH24:MI:SS')
+      FROM {{ repo_schema | upper }}.JAVA_SCAN_RUNS r
+      WHERE r.run_id = {{ _scan_run_id }};
+      EXIT;
+      EOSQL
+  register: _db_run_summary
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+
+- name: Parse DB run summary line
+  ansible.builtin.set_fact:
+    _db_summary_line: "{{ (_db_run_summary.stdout_lines | default([]) | map('trim') | reject('equalto', '') | select('match', '^[0-9]+\\|') | list | first | default('')) }}"
+  run_once: true
+  delegate_to: localhost
+  become: false
+
+- name: Final summary
+  ansible.builtin.debug:
+    msg:
+      - "Java scan complete — DB summary"
+      - "RUN_ID={{ (_db_summary_line.split('|')[0] if _db_summary_line else _scan_run_id) }} | RUN_DATE={{ (_db_summary_line.split('|')[7] if _db_summary_line else 'N/A') }}"
+      - "RUNS table hosts={{ (_db_summary_line.split('|')[1] if _db_summary_line else '0') }} | RUNS table installs={{ (_db_summary_line.split('|')[2] if _db_summary_line else '0') }}"
+      - "SERVERS rows={{ (_db_summary_line.split('|')[3] if _db_summary_line else '0') }} | OK={{ (_db_summary_line.split('|')[4] if _db_summary_line else '0') }} | ERR={{ (_db_summary_line.split('|')[5] if _db_summary_line else '0') }}"
+      - "INSTALLS rows={{ (_db_summary_line.split('|')[6] if _db_summary_line else '0') }}"
+  run_once: true

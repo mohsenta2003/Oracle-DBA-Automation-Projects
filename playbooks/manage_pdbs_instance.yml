@@ -1,0 +1,312 @@
+---
+# ================================================================================
+# Manage PDBs Instance Tasks - Called for each Oracle instance
+# ================================================================================
+
+- name: "{{ current_sid }} - Set instance ORACLE_HOME"
+  ansible.builtin.set_fact:
+    current_oracle_home: "{{ oracle_home_map[current_sid] | default(oracle_home_map.values() | list | first | default('/u01/app/oracle/product/19.0.0/dbhome_1')) }}"
+
+- name: "{{ current_sid }} - Set environment"
+  ansible.builtin.set_fact:
+    oracle_env:
+      ORACLE_HOME: "{{ current_oracle_home }}"
+      ORACLE_SID: "{{ current_sid }}"
+      LD_LIBRARY_PATH: "{{ current_oracle_home }}/lib"
+      PATH: "{{ current_oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+
+- name: "{{ current_sid }} - Set report timestamp"
+  ansible.builtin.set_fact:
+    report_timestamp: "{{ ansible_date_time.iso8601 }}"
+
+# ============================================
+# Check if CDB
+# ============================================
+- name: "{{ current_sid }} - Check if this is a CDB"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT CDB FROM v\$database;
+    EXIT;
+    EOF
+  register: is_cdb
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+
+# ============================================
+# LIST - List all PDBs
+# ============================================
+- name: "{{ current_sid }} - List all PDBs"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    SELECT RPAD(pdb_name, 25) || ' | ' || 
+           RPAD(status, 12) || ' | ' || 
+           RPAD(open_mode, 15) || ' | Size: ' ||
+           NVL(TO_CHAR(ROUND(
+             (SELECT SUM(bytes)/1024/1024/1024 
+              FROM cdb_data_files 
+              WHERE con_id = p.con_id), 2)), 'N/A') || ' GB'
+    FROM cdb_pdbs p
+    ORDER BY pdb_name;
+    EXIT;
+    EOF
+  register: pdbs_list
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'list' and is_cdb.stdout | trim == 'YES'
+
+- name: "{{ current_sid }} - Get PDB services"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 100 LINESIZE 200
+    SELECT RPAD(name, 30) || ' | PDB: ' || RPAD(NVL(pdb, 'CDB'), 20)
+    FROM cdb_services
+    WHERE pdb IS NOT NULL
+    ORDER BY pdb, name;
+    EXIT;
+    EOF
+  register: pdb_services
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'list' and is_cdb.stdout | trim == 'YES'
+
+# ============================================
+# CREATE - Create new PDB
+# ============================================
+- name: "{{ current_sid }} - Get default datafile path"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+    SELECT REGEXP_REPLACE(file_name, '/[^/]+$', '') 
+    FROM dba_data_files WHERE ROWNUM = 1;
+    EXIT;
+    EOF
+  register: datafile_path
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  changed_when: false
+  when: action == 'create' and is_cdb.stdout | trim == 'YES'
+
+- name: "{{ current_sid }} - Create PDB"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    CREATE PLUGGABLE DATABASE {{ pdb_name }}
+    ADMIN USER {{ pdb_admin_user }} IDENTIFIED BY "{{ pdb_admin_password }}"
+    FILE_NAME_CONVERT = ('pdbseed', '{{ pdb_name | lower }}');
+    EXIT;
+    EOF
+  register: create_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'create' and pdb_name != '' and pdb_admin_password != '' and is_cdb.stdout | trim == 'YES'
+  no_log: true
+  failed_when: false
+
+- name: "{{ current_sid }} - Open newly created PDB"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    ALTER PLUGGABLE DATABASE {{ pdb_name }} OPEN;
+    {% if save_state | bool %}
+    ALTER PLUGGABLE DATABASE {{ pdb_name }} SAVE STATE;
+    {% endif %}
+    EXIT;
+    EOF
+  register: open_new_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'create' and create_result is defined and create_result.rc == 0
+  failed_when: false
+
+# ============================================
+# CLONE - Clone existing PDB
+# ============================================
+- name: "{{ current_sid }} - Clone PDB"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    CREATE PLUGGABLE DATABASE {{ pdb_name }}
+    FROM {{ source_pdb }}
+    FILE_NAME_CONVERT = ('{{ source_pdb | lower }}', '{{ pdb_name | lower }}');
+    EXIT;
+    EOF
+  register: clone_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'clone' and pdb_name != '' and source_pdb != '' and is_cdb.stdout | trim == 'YES'
+  failed_when: false
+
+# ============================================
+# OPEN - Open PDB
+# ============================================
+- name: "{{ current_sid }} - Open PDB"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    ALTER PLUGGABLE DATABASE {{ pdb_name }} OPEN;
+    {% if save_state | bool %}
+    ALTER PLUGGABLE DATABASE {{ pdb_name }} SAVE STATE;
+    {% endif %}
+    EXIT;
+    EOF
+  register: open_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'open' and pdb_name != '' and is_cdb.stdout | trim == 'YES'
+  failed_when: false
+
+# ============================================
+# CLOSE - Close PDB
+# ============================================
+- name: "{{ current_sid }} - Close PDB"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    ALTER PLUGGABLE DATABASE {{ pdb_name }} CLOSE IMMEDIATE;
+    EXIT;
+    EOF
+  register: close_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'close' and pdb_name != '' and is_cdb.stdout | trim == 'YES'
+  failed_when: false
+
+# ============================================
+# DROP - Drop PDB
+# ============================================
+- name: "{{ current_sid }} - Close PDB before drop"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    ALTER PLUGGABLE DATABASE {{ pdb_name }} CLOSE IMMEDIATE;
+    EXIT;
+    EOF
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'drop' and pdb_name != '' and is_cdb.stdout | trim == 'YES'
+  failed_when: false
+
+- name: "{{ current_sid }} - Drop PDB"
+  ansible.builtin.shell: |
+    export ORACLE_HOME="{{ current_oracle_home }}"
+    export ORACLE_SID="{{ current_sid }}"
+    {{ current_oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    DROP PLUGGABLE DATABASE {{ pdb_name }} INCLUDING DATAFILES;
+    EXIT;
+    EOF
+  register: drop_result
+  become_user: "{{ oracle_user }}"
+  environment: "{{ oracle_env }}"
+  when: action == 'drop' and pdb_name != '' and is_cdb.stdout | trim == 'YES'
+  failed_when: false
+
+# ============================================
+# Build PDB Report
+# ============================================
+- name: "{{ current_sid }} - Build PDB report"
+  ansible.builtin.set_fact:
+    pdb_report: |
+      ╔═══════════════════════════════════════════════════════════════════════════════════╗
+      ║                           PDB MANAGEMENT REPORT                                   ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ Report Time: {{ report_timestamp }}
+      ║ Host:        {{ inventory_hostname }}
+      ║ Instance:    {{ current_sid }}
+      ║ ORACLE_HOME: {{ current_oracle_home }}
+      ║ CDB:         {{ is_cdb.stdout | trim }}
+      ║ Action:      {{ action | upper }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if is_cdb.stdout | trim != 'YES' %}
+      ║ ⚠️  This is NOT a Container Database (CDB) - PDB operations not applicable        ║
+      {% elif action == 'list' %}
+      ║ PLUGGABLE DATABASES:                                                              ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ pdbs_list.stdout | default('No PDBs found') }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      ║ PDB SERVICES:                                                                     ║
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {{ pdb_services.stdout | default('No PDB services') }}
+      {% elif action == 'create' %}
+      ║ CREATE PDB: {{ pdb_name }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if create_result is defined and create_result.rc == 0 %}
+      ║ ✅ PDB {{ pdb_name }} created successfully
+      ║ Admin User: {{ pdb_admin_user }}
+      ║ Opened:     {{ 'Yes' if open_new_result is defined and open_new_result.rc == 0 else 'No' }}
+      ║ State Saved:{{ save_state }}
+      ║
+      ║ Connection: {{ inventory_hostname }}:1521/{{ pdb_name }}
+      {% else %}
+      ║ ❌ Failed to create PDB
+      ║ {{ create_result.stdout | default('Unknown error') }}
+      {% endif %}
+      {% elif action == 'clone' %}
+      ║ CLONE PDB: {{ pdb_name }} FROM {{ source_pdb }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if clone_result is defined and clone_result.rc == 0 %}
+      ║ ✅ PDB {{ pdb_name }} cloned successfully from {{ source_pdb }}
+      {% else %}
+      ║ ❌ Failed to clone PDB
+      ║ {{ clone_result.stdout | default('Unknown error') }}
+      {% endif %}
+      {% elif action == 'open' %}
+      ║ OPEN PDB: {{ pdb_name }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if open_result is defined and open_result.rc == 0 %}
+      ║ ✅ PDB {{ pdb_name }} opened successfully
+      ║ State Saved: {{ save_state }}
+      {% else %}
+      ║ ❌ Failed to open PDB
+      ║ {{ open_result.stdout | default('Unknown error') }}
+      {% endif %}
+      {% elif action == 'close' %}
+      ║ CLOSE PDB: {{ pdb_name }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if close_result is defined and close_result.rc == 0 %}
+      ║ ✅ PDB {{ pdb_name }} closed successfully
+      {% else %}
+      ║ ❌ Failed to close PDB
+      ║ {{ close_result.stdout | default('Unknown error') }}
+      {% endif %}
+      {% elif action == 'drop' %}
+      ║ DROP PDB: {{ pdb_name }}
+      ╠═══════════════════════════════════════════════════════════════════════════════════╣
+      {% if drop_result is defined and drop_result.rc == 0 %}
+      ║ ✅ PDB {{ pdb_name }} dropped successfully (including datafiles)
+      {% else %}
+      ║ ❌ Failed to drop PDB
+      ║ {{ drop_result.stdout | default('Unknown error') }}
+      {% endif %}
+      {% endif %}
+      ╚═══════════════════════════════════════════════════════════════════════════════════╝
+
+- name: "{{ current_sid }} - Display PDB report"
+  ansible.builtin.debug:
+    msg: "{{ pdb_report }}"
+
+- name: "{{ current_sid }} - Save PDB report"
+  ansible.builtin.copy:
+    content: "{{ pdb_report }}"
+    dest: "{{ report_base_dir }}/{{ report_date }}/{{ inventory_hostname }}/pdbs_{{ current_sid }}.txt"
+    mode: '0644'
+  delegate_to: localhost
+  become: no

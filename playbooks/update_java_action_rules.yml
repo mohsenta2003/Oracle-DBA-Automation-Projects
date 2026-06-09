@@ -1,0 +1,146 @@
+---
+# playbooks/update_java_action_rules.yml
+#
+# Idempotent MERGE of vars/java_action_rules.yml into
+# {{ repo_schema }}.JAVA_ACTION_RULES.
+#
+# Creates the table if missing. Edit vars/java_action_rules.yml and re-run.
+#
+# Usage (US):
+#   ansible-playbook playbooks/update_java_action_rules.yml -i "localhost," -c local \
+#     -e "repo_password=<pwd>"
+#
+# Usage (EU):
+#   ansible-playbook playbooks/update_java_action_rules.yml -i "localhost," -c local \
+#     -e "@vars/java_scanner_config_eu.yml" -e "repo_password=<pwd>"
+
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  environment:
+    NLS_LANG: AMERICAN_AMERICA.AL32UTF8
+
+  vars_files:
+    - ../vars/java_scanner_config.yml
+    - ../vars/java_action_rules.yml
+
+  vars:
+    _conn: "{{ repo_tns_alias if (repo_tns_alias | default('')) else '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=' ~ repo_host ~ ')(PORT=' ~ repo_port ~ '))(CONNECT_DATA=(' ~ ('SERVICE_NAME=' ~ repo_service if (repo_service | default('')) else 'SID=' ~ repo_sid) ~ ')))' }}"
+
+  tasks:
+
+    - name: Validate inputs
+      ansible.builtin.assert:
+        that:
+          - repo_user | default('') | length > 0
+          - repo_schema | default('') | length > 0
+          - repo_password | default('') | length > 0
+          - java_action_rules | default([]) | length > 0
+        fail_msg: "Missing repo creds or empty java_action_rules list."
+
+    - name: Ensure JAVA_ACTION_RULES table exists
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          BEGIN
+            EXECUTE IMMEDIATE '
+              CREATE TABLE {{ repo_schema | upper }}.JAVA_ACTION_RULES (
+                RULE_ID         VARCHAR2(64)  PRIMARY KEY,
+                PATH_PATTERN    VARCHAR2(400) NOT NULL,
+                JAVA_MAJOR_MIN  NUMBER,
+                JAVA_MAJOR_MAX  NUMBER,
+                PRIORITY        NUMBER        NOT NULL,
+                RISK_TIER       VARCHAR2(10)  NOT NULL,
+                ACTION_METHOD   VARCHAR2(200) NOT NULL,
+                OWNER           VARCHAR2(64),
+                PRECHECK_NOTES  VARCHAR2(500),
+                UPDATED_AT      TIMESTAMP DEFAULT SYSTIMESTAMP
+              )';
+          EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+          END;
+          /
+          BEGIN
+            EXECUTE IMMEDIATE 'CREATE INDEX JACT_RULES_IDX1 ON {{ repo_schema | upper }}.JAVA_ACTION_RULES(PRIORITY)';
+          EXCEPTION WHEN OTHERS THEN IF SQLCODE=-955 THEN NULL; ELSE RAISE; END IF;
+          END;
+          /
+          EXIT;
+          EOSQL
+      register: _rules_create
+      changed_when: false
+
+    - name: Build MERGE SQL file
+      ansible.builtin.copy:
+        dest: "/tmp/java_action_rules_merge_{{ lookup('pipe','date +%s') }}.sql"
+        mode: "0600"
+        content: |
+          SET DEFINE OFF
+          SET FEEDBACK OFF
+          {% for r in java_action_rules %}
+          MERGE INTO {{ repo_schema | upper }}.JAVA_ACTION_RULES t
+          USING (SELECT
+                   '{{ r.rule_id | replace("'", "''") }}'                AS RULE_ID,
+                   '{{ r.path_pattern | replace("'", "''") }}'           AS PATH_PATTERN,
+                   {% if r.java_major_min is defined %}{{ r.java_major_min | int }}{% else %}NULL{% endif %} AS JAVA_MAJOR_MIN,
+                   {% if r.java_major_max is defined %}{{ r.java_major_max | int }}{% else %}NULL{% endif %} AS JAVA_MAJOR_MAX,
+                   {{ r.priority | int }}                                 AS PRIORITY,
+                   '{{ r.risk_tier | replace("'", "''") }}'              AS RISK_TIER,
+                   '{{ r.action_method | replace("'", "''") }}'          AS ACTION_METHOD,
+                   '{{ (r.owner | default('')) | replace("'", "''") }}'  AS OWNER,
+                   '{{ (r.precheck_notes | default('')) | replace("'", "''") }}' AS PRECHECK_NOTES
+                 FROM DUAL) s
+          ON (t.RULE_ID = s.RULE_ID)
+          WHEN MATCHED THEN UPDATE SET
+              PATH_PATTERN   = s.PATH_PATTERN,
+              JAVA_MAJOR_MIN = s.JAVA_MAJOR_MIN,
+              JAVA_MAJOR_MAX = s.JAVA_MAJOR_MAX,
+              PRIORITY       = s.PRIORITY,
+              RISK_TIER      = s.RISK_TIER,
+              ACTION_METHOD  = s.ACTION_METHOD,
+              OWNER          = s.OWNER,
+              PRECHECK_NOTES = s.PRECHECK_NOTES,
+              UPDATED_AT     = SYSTIMESTAMP
+          WHEN NOT MATCHED THEN INSERT
+              (RULE_ID, PATH_PATTERN, JAVA_MAJOR_MIN, JAVA_MAJOR_MAX, PRIORITY,
+               RISK_TIER, ACTION_METHOD, OWNER, PRECHECK_NOTES, UPDATED_AT)
+              VALUES (s.RULE_ID, s.PATH_PATTERN, s.JAVA_MAJOR_MIN, s.JAVA_MAJOR_MAX, s.PRIORITY,
+                      s.RISK_TIER, s.ACTION_METHOD, s.OWNER, s.PRECHECK_NOTES, SYSTIMESTAMP);
+          {% endfor %}
+          COMMIT;
+          EXIT;
+      register: _rules_sql
+
+    - name: Execute MERGE
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << EOSQL
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          @{{ _rules_sql.dest }}
+          EOSQL
+      register: _rules_run
+      changed_when: true
+
+    - name: Show row count
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          SELECT 'JAVA_ACTION_RULES rows=' || COUNT(*) FROM {{ repo_schema | upper }}.JAVA_ACTION_RULES;
+          EXIT;
+          EOSQL
+      register: _rules_count
+      changed_when: false
+
+    - name: Result
+      ansible.builtin.debug:
+        msg: "{{ _rules_count.stdout_lines }}"
+
+    - name: Cleanup temp SQL
+      ansible.builtin.file:
+        path: "{{ _rules_sql.dest }}"
+        state: absent
