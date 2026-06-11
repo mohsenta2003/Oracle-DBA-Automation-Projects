@@ -1,0 +1,276 @@
+-- ============================================================================
+-- Java ownership views + validation checks
+-- Purpose: ensure every discovered JDK has a responsible team before emailing.
+-- Run in repo schema (US/EU), e.g.:
+--   sqlplus mtaheri/<pwd>@dbai @scripts/java_owner_views.sql
+-- ============================================================================
+
+SET SERVEROUTPUT ON SIZE UNLIMITED
+SET PAGESIZE 200 LINESIZE 240 FEEDBACK ON VERIFY OFF
+
+PROMPT
+PROMPT [1/6] Create latest-install view (latest RUN_ID per host)
+
+CREATE OR REPLACE VIEW V_JAVA_INSTALLS_LATEST AS
+SELECT i.*
+FROM   JAVA_SCAN_INSTALLS i
+WHERE  (i.HOSTNAME, i.RUN_ID) IN (
+  SELECT HOSTNAME, MAX(RUN_ID)
+  FROM   JAVA_SCAN_INSTALLS
+  GROUP  BY HOSTNAME
+);
+/
+
+PROMPT
+PROMPT [2/6] Create classified ownership view (best matching rule per install)
+
+CREATE OR REPLACE VIEW V_JAVA_INSTALLS_CLASSIFIED AS
+WITH matched AS (
+  SELECT
+    i.INSTALL_ID,
+    i.RUN_ID,
+    i.HOSTNAME,
+    i.JAVA_TYPE,
+    i.JAVA_VERSION,
+    i.JAVA_MAJOR,
+    i.INSTALL_CONTEXT,
+    i.RELATED_ORACLE_HOME,
+    i.JAVA_BIN_PATH,
+    s.OS_TYPE,
+    s.OS_VERSION,
+    r.RULE_ID,
+    r.RISK_TIER,
+    r.ACTION_METHOD,
+    r.OWNER AS RULE_OWNER,
+    r.PRECHECK_NOTES,
+    ROW_NUMBER() OVER (
+      PARTITION BY i.INSTALL_ID
+      ORDER BY NVL(r.PRIORITY, 99999)
+    ) AS RN
+  FROM V_JAVA_INSTALLS_LATEST i
+  LEFT JOIN JAVA_SCAN_SERVERS s
+    ON s.HOSTNAME = i.HOSTNAME
+   AND s.RUN_ID   = i.RUN_ID
+  LEFT JOIN JAVA_ACTION_RULES r
+    ON i.JAVA_BIN_PATH LIKE r.PATH_PATTERN
+   AND (r.JAVA_MAJOR_MIN IS NULL OR NVL(i.JAVA_MAJOR,0) >= r.JAVA_MAJOR_MIN)
+   AND (r.JAVA_MAJOR_MAX IS NULL OR NVL(i.JAVA_MAJOR,0) <= r.JAVA_MAJOR_MAX)
+)
+SELECT
+  HOSTNAME,
+  JAVA_TYPE,
+  JAVA_VERSION,
+  CASE
+    -- OEM/OMS: use OEM-specific target if present in JAVA_VERSION_REFERENCE,
+    -- otherwise fall back to April 2026 baseline 8u491.
+    WHEN UPPER(INSTALL_CONTEXT) = 'OEM OMS'
+      OR LOWER(JAVA_BIN_PATH) LIKE '%/oms/%'
+      OR LOWER(JAVA_BIN_PATH) LIKE '%/oms_%'
+      THEN NVL(
+        (SELECT MAX(LATEST_VERSION)
+         FROM JAVA_VERSION_REFERENCE
+         WHERE TRACK_KEY IN ('OEM-OMS-135','OEM-OMS-13.5')
+           AND MAJOR = 8),
+        '1.8.0_491'
+      )
+    -- OEM Agent: use OEM-specific target if present, fallback 8u491.
+    WHEN UPPER(INSTALL_CONTEXT) = 'OEM AGENT'
+      OR LOWER(JAVA_BIN_PATH) LIKE '%/agent/%'
+      OR LOWER(JAVA_BIN_PATH) LIKE '%/agent_%'
+      OR LOWER(JAVA_BIN_PATH) LIKE '%/em_grid_agent/%'
+      OR LOWER(JAVA_BIN_PATH) LIKE '%/oracle_common/jdk/%'
+      THEN NVL(
+        (SELECT MAX(LATEST_VERSION)
+         FROM JAVA_VERSION_REFERENCE
+         WHERE TRACK_KEY IN ('OEM-AGENT-135','OEM-AGENT-13.5')
+           AND MAJOR = 8),
+        '1.8.0_491'
+      )
+    -- Generic target by vendor + major from reference table.
+    ELSE (
+      SELECT MAX(LATEST_VERSION)
+      FROM JAVA_VERSION_REFERENCE v
+      WHERE UPPER(v.VENDOR) = UPPER(JAVA_TYPE)
+        AND v.MAJOR = JAVA_MAJOR
+    )
+  END AS TARGET_JAVA_VERSION,
+  CASE
+    WHEN JAVA_VERSION IS NULL THEN 'UNKNOWN_VERSION'
+    WHEN (
+      CASE
+        WHEN UPPER(INSTALL_CONTEXT) = 'OEM OMS'
+          OR LOWER(JAVA_BIN_PATH) LIKE '%/oms/%'
+          OR LOWER(JAVA_BIN_PATH) LIKE '%/oms_%'
+          THEN NVL(
+            (SELECT MAX(LATEST_VERSION) FROM JAVA_VERSION_REFERENCE
+             WHERE TRACK_KEY IN ('OEM-OMS-135','OEM-OMS-13.5') AND MAJOR = 8),
+            '1.8.0_491'
+          )
+        WHEN UPPER(INSTALL_CONTEXT) = 'OEM AGENT'
+          OR LOWER(JAVA_BIN_PATH) LIKE '%/agent/%'
+          OR LOWER(JAVA_BIN_PATH) LIKE '%/agent_%'
+          OR LOWER(JAVA_BIN_PATH) LIKE '%/em_grid_agent/%'
+          OR LOWER(JAVA_BIN_PATH) LIKE '%/oracle_common/jdk/%'
+          THEN NVL(
+            (SELECT MAX(LATEST_VERSION) FROM JAVA_VERSION_REFERENCE
+             WHERE TRACK_KEY IN ('OEM-AGENT-135','OEM-AGENT-13.5') AND MAJOR = 8),
+            '1.8.0_491'
+          )
+        ELSE (
+          SELECT MAX(LATEST_VERSION)
+          FROM JAVA_VERSION_REFERENCE v
+          WHERE UPPER(v.VENDOR) = UPPER(JAVA_TYPE)
+            AND v.MAJOR = JAVA_MAJOR
+        )
+      END
+    ) IS NULL THEN 'NO_TARGET'
+    WHEN JAVA_VERSION = (
+      CASE
+        WHEN UPPER(INSTALL_CONTEXT) = 'OEM OMS'
+          OR LOWER(JAVA_BIN_PATH) LIKE '%/oms/%'
+          OR LOWER(JAVA_BIN_PATH) LIKE '%/oms_%'
+          THEN NVL(
+            (SELECT MAX(LATEST_VERSION) FROM JAVA_VERSION_REFERENCE
+             WHERE TRACK_KEY IN ('OEM-OMS-135','OEM-OMS-13.5') AND MAJOR = 8),
+            '1.8.0_491'
+          )
+        WHEN UPPER(INSTALL_CONTEXT) = 'OEM AGENT'
+          OR LOWER(JAVA_BIN_PATH) LIKE '%/agent/%'
+          OR LOWER(JAVA_BIN_PATH) LIKE '%/agent_%'
+          OR LOWER(JAVA_BIN_PATH) LIKE '%/em_grid_agent/%'
+          OR LOWER(JAVA_BIN_PATH) LIKE '%/oracle_common/jdk/%'
+          THEN NVL(
+            (SELECT MAX(LATEST_VERSION) FROM JAVA_VERSION_REFERENCE
+             WHERE TRACK_KEY IN ('OEM-AGENT-135','OEM-AGENT-13.5') AND MAJOR = 8),
+            '1.8.0_491'
+          )
+        ELSE (
+          SELECT MAX(LATEST_VERSION)
+          FROM JAVA_VERSION_REFERENCE v
+          WHERE UPPER(v.VENDOR) = UPPER(JAVA_TYPE)
+            AND v.MAJOR = JAVA_MAJOR
+        )
+      END
+    ) THEN 'AT_TARGET'
+    ELSE 'BELOW_TARGET'
+  END AS TARGET_STATUS,
+  INSTALL_CONTEXT,
+  RELATED_ORACLE_HOME,
+  JAVA_BIN_PATH,
+  NVL(OS_TYPE, 'UNKNOWN') AS OS_TYPE,
+  NVL(OS_VERSION, 'UNKNOWN') AS OS_VERSION,
+  NVL(RISK_TIER, 'UNCLASSIFIED') AS RISK_TIER,
+  NVL(ACTION_METHOD, '(no rule matched)') AS ACTION_METHOD,
+  NVL(RULE_OWNER, '-') AS RULE_OWNER,
+  NVL(PRECHECK_NOTES, '') AS PRECHECK_NOTES,
+  CASE
+    WHEN UPPER(INSTALL_CONTEXT) IN ('OEM OMS','OEM AGENT')
+      OR LOWER(JAVA_BIN_PATH) LIKE '%/oms/%'
+      OR LOWER(JAVA_BIN_PATH) LIKE '%/oms_%'
+      OR LOWER(JAVA_BIN_PATH) LIKE '%/agent/%'
+      OR LOWER(JAVA_BIN_PATH) LIKE '%/agent_%'
+      OR LOWER(JAVA_BIN_PATH) LIKE '%/em_grid_agent/%'
+      OR LOWER(JAVA_BIN_PATH) LIKE '%/oracle_common/jdk/%'
+      THEN 'OEM/OMS/AGENT TEAM'
+    WHEN UPPER(INSTALL_CONTEXT) IN ('OS OPENJDK','OS DEFAULT','PUPPETLABS')
+      THEN 'OS TEAM'
+    WHEN UPPER(NVL(RULE_OWNER,' ')) LIKE '%OEM%' THEN 'OEM/OMS/AGENT TEAM'
+    WHEN UPPER(NVL(RULE_OWNER,' ')) LIKE '%LINUX%' THEN 'OS TEAM'
+    WHEN UPPER(NVL(RULE_OWNER,' ')) LIKE '%DBA%' THEN 'DBA PATCH TEAM'
+    ELSE 'UNASSIGNED'
+  END AS RESPONSIBLE_TEAM
+FROM matched
+WHERE RN = 1 OR RN IS NULL;
+/
+
+PROMPT
+PROMPT [3/6] Create team-specific views for distribution
+
+CREATE OR REPLACE VIEW V_JAVA_TEAM_DBA_PATCH AS
+SELECT * FROM V_JAVA_INSTALLS_CLASSIFIED
+WHERE RESPONSIBLE_TEAM = 'DBA PATCH TEAM';
+/
+
+CREATE OR REPLACE VIEW V_JAVA_TEAM_OEM AS
+SELECT * FROM V_JAVA_INSTALLS_CLASSIFIED
+WHERE RESPONSIBLE_TEAM = 'OEM/OMS/AGENT TEAM';
+/
+
+CREATE OR REPLACE VIEW V_JAVA_TEAM_OS AS
+SELECT * FROM V_JAVA_INSTALLS_CLASSIFIED
+WHERE RESPONSIBLE_TEAM = 'OS TEAM';
+/
+
+PROMPT
+PROMPT [4/6] Ownership coverage check (must be 0 unassigned)
+
+COLUMN team FORMAT A22
+SELECT RESPONSIBLE_TEAM AS team,
+       COUNT(*) AS installs,
+       COUNT(DISTINCT HOSTNAME) AS hosts
+FROM   V_JAVA_INSTALLS_CLASSIFIED
+GROUP  BY RESPONSIBLE_TEAM
+ORDER  BY CASE RESPONSIBLE_TEAM
+            WHEN 'DBA PATCH TEAM' THEN 1
+            WHEN 'OEM/OMS/AGENT TEAM' THEN 2
+            WHEN 'OS TEAM' THEN 3
+            ELSE 4
+          END;
+
+PROMPT
+PROMPT Unassigned rows (review these before emailing):
+
+COLUMN hostname FORMAT A28
+COLUMN install_context FORMAT A18
+COLUMN java_type FORMAT A12
+COLUMN java_version FORMAT A16
+COLUMN java_bin_path FORMAT A120
+
+SELECT HOSTNAME, INSTALL_CONTEXT, JAVA_TYPE, JAVA_VERSION, JAVA_BIN_PATH
+FROM   V_JAVA_INSTALLS_CLASSIFIED
+WHERE  RESPONSIBLE_TEAM = 'UNASSIGNED'
+ORDER  BY HOSTNAME, INSTALL_CONTEXT;
+
+PROMPT
+PROMPT [5/6] Team email payload summary (subject/body seed)
+
+COLUMN team FORMAT A22
+COLUMN risk_tier FORMAT A13
+COLUMN sample_actions FORMAT A80
+
+SELECT RESPONSIBLE_TEAM AS team,
+       RISK_TIER,
+       COUNT(*) installs,
+       COUNT(DISTINCT HOSTNAME) hosts,
+       SUBSTR(LISTAGG(DISTINCT ACTION_METHOD, '; ') WITHIN GROUP (ORDER BY ACTION_METHOD),1,80) AS sample_actions
+FROM   V_JAVA_INSTALLS_CLASSIFIED
+GROUP  BY RESPONSIBLE_TEAM, RISK_TIER
+ORDER  BY team, CASE RISK_TIER
+                  WHEN 'RED' THEN 1
+                  WHEN 'YELLOW' THEN 2
+                  WHEN 'GREEN' THEN 3
+                  WHEN 'INFO' THEN 4
+                  ELSE 5
+                END;
+
+PROMPT
+PROMPT [6/6] Detailed extract per team (for attachments)
+PROMPT Tip: add WHERE RISK_TIER IN ('RED','YELLOW') if you only want actionable items.
+
+SELECT RESPONSIBLE_TEAM,
+       HOSTNAME,
+       OS_TYPE,
+       OS_VERSION,
+       INSTALL_CONTEXT,
+       JAVA_TYPE,
+       JAVA_VERSION,
+  TARGET_JAVA_VERSION,
+  TARGET_STATUS,
+       RISK_TIER,
+       ACTION_METHOD,
+       RULE_OWNER,
+       JAVA_BIN_PATH
+FROM   V_JAVA_INSTALLS_CLASSIFIED
+ORDER  BY RESPONSIBLE_TEAM, HOSTNAME, INSTALL_CONTEXT, JAVA_TYPE, JAVA_VERSION;
+
+EXIT;

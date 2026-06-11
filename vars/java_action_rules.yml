@@ -28,18 +28,18 @@ java_action_rules:
   - rule_id: "OPATCH-BUNDLED-JRE"
     path_pattern: "%/OPatch/jre/%"
     priority: 10
-    risk_tier: "INFO"
-    action_method: "Bundled with OPatch - no direct action"
+    risk_tier: "YELLOW"
+    action_method: "Update OPatch to latest supported version (bundled JRE refreshes with OPatch)"
     owner: "DBA"
-    precheck_notes: "Refreshed when OPatch itself is updated (MOS 274526.1). Do not patch in-place."
+    precheck_notes: "Check current opatch version first; bundled JRE is refreshed when OPatch is updated. Do not patch in-place."
 
   - rule_id: "OPATCH-STALE-BACKUP"
     path_pattern: "%OPatch_b4_update_%/%"
     priority: 15
-    risk_tier: "GREEN"
-    action_method: "Cleanup - rm -rf stale OPatch_b4_update_* dir"
+    risk_tier: "YELLOW"
+    action_method: "Cleanup - rm -rf stale OPatch_b4_update_* dir (DBA change window)"
     owner: "DBA"
-    precheck_notes: "Confirm parent OPatch already upgraded successfully; backup dir is safe to remove."
+    precheck_notes: "Confirm parent OPatch upgraded successfully before removing. On EOL hosts (11g/12cR1) skip if decommission is planned - cleanup will happen with host retirement."
 
   # ── 2. OEM OMS / Agent JDK ──────────────────────────────────────────────
   - rule_id: "OEM-OMS-JDK"
@@ -166,6 +166,23 @@ java_action_rules:
     action_method: "Oracle Home JDK Bundle Patch (review version)"
     owner: "DBA"
     precheck_notes: "Identify exact ORACLE_HOME version, apply MOS-noted JDK BP via OPatch."
+
+  # ── 8a. Legacy system Java under /usr/java* (OS-owned cleanup) ─────────
+  - rule_id: "OS-USR-JAVA-LEGACY"
+    path_pattern: "%/usr/java%/%"
+    priority: 180
+    risk_tier: "YELLOW"
+    action_method: "OS cleanup: validate usage, then remove/upgrade legacy /usr/java* runtime"
+    owner: "Linux / DBA"
+    precheck_notes: "Treat as OS-managed legacy Java path. Check process/service dependencies before remove or upgrade."
+
+  - rule_id: "OS-USR-BIN-JAVA"
+    path_pattern: "%/usr/bin/java"
+    priority: 181
+    risk_tier: "YELLOW"
+    action_method: "OS-managed java launcher: validate alternatives target, then patch/remove legacy runtime"
+    owner: "Linux / DBA"
+    precheck_notes: "Usually symlink/alternatives path. Resolve real target and apply OS package remediation."
 
   # ── 8. OS-level OpenJDK - GREEN, dnf/yum ────────────────────────────────
   - rule_id: "OS-OPENJDK-LEGACY"

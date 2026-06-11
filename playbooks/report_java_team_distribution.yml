@@ -1,0 +1,506 @@
+---
+# Team-distribution Java report (DBA patch / OEM-OMS-Agent / OS)
+#
+# Prerequisite:
+#   sqlplus mtaheri/<pwd>@dbai @scripts/java_owner_views.sql
+#
+# Usage:
+#   ansible-playbook playbooks/report_java_team_distribution.yml \
+#     -e "repo_password=<pwd>" \
+#     -e "dba_team_to=dba-team@company.com" \
+#     -e "oem_team_to=oem-team@company.com" \
+#     -e "os_team_to=os-team@company.com" \
+#     -e "my_group_to=my-group@company.com"
+
+- name: Java Team Distribution Report
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  environment:
+    NLS_LANG: AMERICAN_AMERICA.AL32UTF8
+
+  vars_files:
+    - ../vars/java_scanner_config.yml
+
+  vars:
+    _send_team_email: "{{ send_team_email | default(true) }}"
+    _my_group_to: "{{ my_group_to | default(email_to, true) }}"
+    _dba_team_to: "{{ dba_team_to | default(email_to, true) }}"
+    _oem_team_to: "{{ oem_team_to | default(email_to, true) }}"
+    _os_team_to: "{{ os_team_to | default(email_to, true) }}"
+    _conn: "{{ repo_tns_alias if (repo_tns_alias | default('')) else '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=' ~ repo_host ~ ')(PORT=' ~ repo_port ~ '))(CONNECT_DATA=(' ~ ('SERVICE_NAME=' ~ repo_service if (repo_service | default('')) else 'SID=' ~ repo_sid) ~ ')))' }}"
+
+  tasks:
+    - name: Validate required runtime variables
+      ansible.builtin.assert:
+        that:
+          - repo_user | default('') | trim | length > 0
+          - repo_schema | default('') | trim | length > 0
+          - repo_password | default('') | trim | length > 0
+          - _my_group_to | trim | length > 0
+        fail_msg: "Missing required variables (repo credentials or recipient lists)."
+
+    - name: Set team report output directory
+      ansible.builtin.set_fact:
+        _team_report_dir: "{{ playbook_dir }}/../reports"
+
+    - name: Ensure report output directory exists
+      ansible.builtin.file:
+        path: "{{ _team_report_dir }}"
+        state: directory
+
+    - name: Verify required reporting views exist
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+          SELECT COUNT(*)
+          FROM USER_VIEWS
+          WHERE VIEW_NAME IN ('V_JAVA_TEAM_DBA_PATCH','V_JAVA_TEAM_OEM','V_JAVA_TEAM_OS');
+          EXIT;
+          EOSQL
+      register: _view_count
+      changed_when: false
+
+    - name: Fail when team views are missing
+      ansible.builtin.fail:
+        msg: >-
+          Required views are missing. Run:
+          sqlplus {{ repo_user }}/<pwd>@{{ repo_tns_alias | default(repo_sid) }} @scripts/java_owner_views.sql
+      when: (_view_count.stdout | trim | int) < 3
+
+    - name: Fetch DBA team detail rows
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 32767
+          SELECT HOSTNAME || '|' ||
+                 OS_TYPE || '|' ||
+                 OS_VERSION || '|' ||
+                 INSTALL_CONTEXT || '|' ||
+                 JAVA_TYPE || '|' ||
+                 JAVA_VERSION || '|' ||
+                 NVL(TARGET_JAVA_VERSION,'') || '|' ||
+                 NVL(TARGET_STATUS,'') || '|' ||
+                 RISK_TIER || '|' ||
+                 ACTION_METHOD || '|' ||
+                 RULE_OWNER || '|' ||
+                 NVL(RELATED_ORACLE_HOME,'') || '|' ||
+                 JAVA_BIN_PATH || '|' ||
+                 NVL(
+                   CASE
+                     WHEN REGEXP_LIKE(JAVA_BIN_PATH, '/product/[^/]+/', 'i')
+                     THEN REGEXP_SUBSTR(JAVA_BIN_PATH, '/product/([^/]+)/', 1, 1, 'i', 1)
+                     WHEN NVL(RELATED_ORACLE_HOME,'') <> ''
+                     THEN REGEXP_SUBSTR(RELATED_ORACLE_HOME, '[^/]+$')
+                   END,
+                   '(java-only source)'
+                 ) || '|' ||
+                 '(java-only source)'
+          FROM V_JAVA_TEAM_DBA_PATCH
+          ORDER BY CASE
+                     WHEN JAVA_BIN_PATH LIKE '%/OPatch/%' THEN 1
+                     WHEN TARGET_STATUS = 'BELOW_TARGET' THEN 2
+                     WHEN JAVA_BIN_PATH LIKE '%/usr/%'
+                       OR JAVA_VERSION LIKE '1.5.%'
+                       OR JAVA_VERSION LIKE '1.6.%' THEN 3
+                     WHEN JAVA_BIN_PATH LIKE '%/product/%' THEN 4
+                     ELSE 5
+                   END,
+                   CASE RISK_TIER WHEN 'RED' THEN 1 WHEN 'YELLOW' THEN 2 WHEN 'GREEN' THEN 3 WHEN 'INFO' THEN 4 ELSE 5 END,
+                   HOSTNAME, INSTALL_CONTEXT, JAVA_TYPE, JAVA_VERSION;
+          EXIT;
+          EOSQL
+      register: _dba_rows
+      changed_when: false
+
+    - name: Fetch OEM team detail rows
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 32767
+          SELECT HOSTNAME || '|' ||
+                 OS_TYPE || '|' ||
+                 OS_VERSION || '|' ||
+                 INSTALL_CONTEXT || '|' ||
+                 JAVA_TYPE || '|' ||
+                 JAVA_VERSION || '|' ||
+                 NVL(TARGET_JAVA_VERSION,'') || '|' ||
+                 NVL(TARGET_STATUS,'') || '|' ||
+                 RISK_TIER || '|' ||
+                 ACTION_METHOD || '|' ||
+                 RULE_OWNER || '|' ||
+                 NVL(RELATED_ORACLE_HOME,'') || '|' ||
+                 JAVA_BIN_PATH
+          FROM V_JAVA_TEAM_OEM
+          ORDER BY CASE RISK_TIER WHEN 'RED' THEN 1 WHEN 'YELLOW' THEN 2 WHEN 'GREEN' THEN 3 WHEN 'INFO' THEN 4 ELSE 5 END,
+                   HOSTNAME, INSTALL_CONTEXT, JAVA_TYPE, JAVA_VERSION;
+          EXIT;
+          EOSQL
+      register: _oem_rows
+      changed_when: false
+
+    - name: Fetch OS team detail rows
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 32767
+          SELECT HOSTNAME || '|' ||
+                 OS_TYPE || '|' ||
+                 OS_VERSION || '|' ||
+                 INSTALL_CONTEXT || '|' ||
+                 JAVA_TYPE || '|' ||
+                 JAVA_VERSION || '|' ||
+                 NVL(TARGET_JAVA_VERSION,'') || '|' ||
+                 NVL(TARGET_STATUS,'') || '|' ||
+                 RISK_TIER || '|' ||
+                 ACTION_METHOD || '|' ||
+                 RULE_OWNER || '|' ||
+                 NVL(RELATED_ORACLE_HOME,'') || '|' ||
+                 JAVA_BIN_PATH
+          FROM V_JAVA_TEAM_OS
+          ORDER BY CASE
+                     WHEN ACTION_METHOD LIKE 'dnf remove %' THEN 1
+                     WHEN TARGET_STATUS = 'BELOW_TARGET' THEN 2
+                     WHEN TARGET_STATUS = 'NO_TARGET' THEN 3
+                     WHEN TARGET_STATUS = 'AT_TARGET' THEN 4
+                     ELSE 5
+                   END,
+                   CASE RISK_TIER WHEN 'RED' THEN 1 WHEN 'YELLOW' THEN 2 WHEN 'GREEN' THEN 3 WHEN 'INFO' THEN 4 ELSE 5 END,
+                   HOSTNAME, INSTALL_CONTEXT, JAVA_TYPE, JAVA_VERSION;
+          EXIT;
+          EOSQL
+      register: _os_rows
+      changed_when: false
+
+    - name: Fetch risk summary by team
+      ansible.builtin.shell:
+        cmd: |
+          sqlplus -s /nolog << 'EOSQL'
+          CONNECT {{ repo_user }}/"{{ repo_password }}"@{{ _conn }}
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500
+          SELECT RESPONSIBLE_TEAM || '|' || RISK_TIER || '|' || TO_CHAR(COUNT(*)) || '|' || TO_CHAR(COUNT(DISTINCT HOSTNAME))
+          FROM V_JAVA_INSTALLS_CLASSIFIED
+          GROUP BY RESPONSIBLE_TEAM, RISK_TIER
+          ORDER BY RESPONSIBLE_TEAM,
+                   CASE RISK_TIER WHEN 'RED' THEN 1 WHEN 'YELLOW' THEN 2 WHEN 'GREEN' THEN 3 WHEN 'INFO' THEN 4 ELSE 5 END;
+          EXIT;
+          EOSQL
+      register: _risk_summary
+      changed_when: false
+
+    - name: Set report timestamp
+      ansible.builtin.set_fact:
+        _ts: "{{ lookup('pipe','date +%Y%m%d_%H%M%S') }}"
+
+    - name: Set report output paths
+      ansible.builtin.set_fact:
+        _dba_html: "{{ _team_report_dir }}/java_team_dba_{{ _ts }}.html"
+        _oem_html: "{{ _team_report_dir }}/java_team_oem_{{ _ts }}.html"
+        _os_html: "{{ _team_report_dir }}/java_team_os_{{ _ts }}.html"
+
+    - name: Build DBA HTML
+      ansible.builtin.set_fact:
+        _dba_html_text: |
+          <!DOCTYPE html>
+          <html><head><meta charset="UTF-8"><title>Java Team Report - DBA Patch Team</title>
+          <style>
+          body{font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222;margin:0;padding:0 16px}
+          .h{background:#0d47a1;color:#fff;padding:18px 20px;border-radius:6px 6px 0 0}
+          .c{padding:18px 20px;border:1px solid #d9e2ec;border-top:0}
+          .s{background:#f5f7fa;border:1px solid #d9e2ec;padding:10px 12px;border-radius:6px;margin:10px 0 14px 0;font-size:12px}
+          .tw{overflow-x:auto;margin-top:8px;width:100%}
+          .tbl{width:100%;table-layout:auto;border-collapse:collapse;white-space:nowrap}
+          .tbl th{background:#37474f;color:#fff;padding:7px 10px;text-align:left;white-space:nowrap}
+          .tbl td{padding:6px 10px;border-bottom:1px solid #eceff1;vertical-align:top;white-space:nowrap}
+          .tbl td.wrap{white-space:normal;min-width:200px;max-width:340px;word-break:break-all}
+          .tbl td.path{font-family:Consolas,monospace;font-size:11px;white-space:nowrap;min-width:280px}
+          .b{display:inline-block;padding:2px 8px;border-radius:3px;color:#fff;font-size:11px;font-weight:700}
+          .red{background:#c62828}.yel{background:#f57c00}.grn{background:#2e7d32}.inf{background:#607d8b}
+          .mk{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;color:#fff;letter-spacing:.3px}
+          .mk-op{background:#1565c0}.mk-home{background:#455a64}.mk-leg{background:#ad1457}.mk-cyc{background:#ef6c00}.mk-rev{background:#6d4c41}
+          code{background:#f5f5f5;padding:1px 4px;border-radius:3px}
+          </style></head><body>
+          <div class="h"><h2 style="margin:0">Java Distribution Report - DBA Patch Team</h2>
+          <div style="margin-top:6px;font-size:12px">Generated: {{ _ts }} | Recipients: {{ _dba_team_to }}, {{ _my_group_to }}</div></div>
+          <div class="c">
+          {%- set rows = (_dba_rows.stdout | default('') | trim).split('\n') | select('search','\|') | list -%}
+          {%- set red_n = rows | select('search','\|RED\|') | list | length -%}
+          {%- set yel_n = rows | select('search','\|YELLOW\|') | list | length -%}
+          {%- set grn_n = rows | select('search','\|GREEN\|') | list | length -%}
+          {%- set info_n = rows | select('search','\|INFO\|') | list | length -%}
+          {%- set nt_n = rows | select('search','\|NO_TARGET\|') | list | length -%}
+          {%- set rpm_n = rows | select('search','\|dnf remove ') | list | length -%}
+          <div class="s"><b>Action Summary:</b> {{ rows | length }} install rows for DBA action. <span class="b red">RED {{ red_n }}</span> <span class="b yel">YELLOW {{ yel_n }}</span> <span class="b grn">GREEN {{ grn_n }}</span> <span class="b inf">INFO {{ info_n }}</span> &nbsp;|&nbsp; <b>Reference gaps:</b> {{ nt_n }} row(s) with <code>NO_TARGET</code>. Most DBA no-target rows are migration items, such as Oracle JDK 1.5.0_51 on RHEL 6/7/8, where the action is to move to 19c and there is no JDK patch path. This report is generated from Java views only; DB Version is path-derived from Java scan data and OPatch Version is not available in Java-only source. Grouped by DBA work queue, then risk, then hostname.</div>
+          <p style="font-size:12px; color:#444; margin:8px 0 0 0;">DBA scope: cleanup only inside Oracle Home (for example old OPatch backup paths). Any RPM action (<code>dnf remove</code>) is OS-team owned.</p>
+          <p style="font-size:12px; color:#444; margin:6px 0 0 0;">Cleanup note: old <code>OPatch_b4_update_*</code> folders and old JDK folders that are not in use should be removed after validation in the approved patch window.</p>
+          {% if rpm_n > 0 %}<p style="font-size:12px; color:#b71c1c; margin:6px 0 0 0;"><b>Ownership warning:</b> {{ rpm_n }} row(s) contain RPM remove commands and must be executed by OS team, not DBA.</p>{% endif %}
+          {%- set opatch_path_n = rows | select('search','/OPatch/') | list | length -%}
+          {%- set oracle_home_n = rows | select('search','/product/') | list | length -%}
+          {%- set old_jdk_n = rows | select('search','\|1\\.5\\.|\|1\\.6\\.') | list | length -%}
+          {%- set patch_cycle_n = rows | select('search','\|BELOW_TARGET\|') | list | length -%}
+          {%- set ns = namespace(dedupe_keys=[], dup_n=0) -%}
+          {%- for line in rows -%}
+          {%- set p = line.split('|') -%}
+          {%- set k = (p[0] | trim) ~ '|' ~ ((p[12] | trim) | regex_replace('/jre/bin/java$','') | regex_replace('/bin/java$','')) -%}
+          {%- if k in ns.dedupe_keys -%}
+          {%- set ns.dup_n = ns.dup_n + 1 -%}
+          {%- else -%}
+          {%- set _ = ns.dedupe_keys.append(k) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          <div class="s"><b>DBA Work Queues:</b> OPatch queue: <b>{{ opatch_path_n }}</b> | Patch-cycle queue (<code>BELOW_TARGET</code>): <b>{{ patch_cycle_n }}</b> | Legacy queue (1.5/1.6): <b>{{ old_jdk_n }}</b> | Oracle-home queue: <b>{{ oracle_home_n }}</b> | Duplicate row pairs (same host + base java path): <b>{{ ns.dup_n }}</b>.</div>
+          <div class="tw"><table class="tbl">
+            <tr>
+              <th>Hostname</th><th>OS Type</th><th>OS Version</th><th>Context</th><th>JDK Type</th><th>Current Version</th><th>Target Version</th><th>Target Status</th><th>Risk</th><th>Marker</th><th style="min-width:260px;">Required Action</th><th style="min-width:300px;">JDK Path</th><th>DB Version</th><th>OPatch Version</th>
+            </tr>
+            {%- for line in rows -%}
+            {%- set p = line.split('|') -%}
+            {%- set rt = p[8] | trim -%}
+            {%- set act = p[9] | trim -%}
+            {%- set path = p[12] | trim -%}
+            {%- set ts = p[7] | trim -%}
+            {%- if '/OPatch/' in path -%}
+            {%- set mk = 'OPATCH' -%}{%- set mkc = 'mk-op' -%}
+            {%- elif '/usr/' in path or '1.5.' in (p[5] | trim) or '1.6.' in (p[5] | trim) -%}
+            {%- set mk = 'LEGACY' -%}{%- set mkc = 'mk-leg' -%}
+            {%- elif ts == 'BELOW_TARGET' -%}
+            {%- set mk = 'PATCH_CYCLE' -%}{%- set mkc = 'mk-cyc' -%}
+            {%- elif '/product/' in path -%}
+            {%- set mk = 'DBHOME' -%}{%- set mkc = 'mk-home' -%}
+            {%- else -%}
+            {%- set mk = 'REVIEW' -%}{%- set mkc = 'mk-rev' -%}
+            {%- endif -%}
+            <tr>
+              <td><b>{{ p[0] | trim }}</b></td>
+              <td>{{ p[1] | trim }}</td>
+              <td>{{ p[2] | trim }}</td>
+              <td>{{ p[3] | trim }}</td>
+              <td>{{ p[4] | trim }}</td>
+              <td>{{ p[5] | trim }}</td>
+              <td>{{ p[6] | trim }}</td>
+              <td>{{ p[7] | trim }}</td>
+              <td>{% if rt=='RED' %}<span class="b red">RED</span>{% elif rt=='YELLOW' %}<span class="b yel">YELLOW</span>{% elif rt=='GREEN' %}<span class="b grn">GREEN</span>{% else %}<span class="b inf">{{ rt }}</span>{% endif %}</td>
+              <td><span class="mk {{ mkc }}">{{ mk }}</span></td>
+              <td class="wrap">{% if 'dnf remove ' in act %}[OS TEAM] {{ act }}{% else %}{{ act }}{% endif %}</td>
+              <td class="path">{{ p[12] | trim }}</td>
+              <td>{{ p[13] | trim }}</td>
+              <td>{{ p[14] | trim }}</td>
+            </tr>
+            {%- endfor -%}
+          </table></div>
+          </div></body></html>
+
+    - name: Build OEM HTML
+      ansible.builtin.set_fact:
+        _oem_html_text: |
+          <!DOCTYPE html>
+          <html><head><meta charset="UTF-8"><title>Java Team Report - OEM/OMS/Agent Team</title>
+          <style>
+          body{font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222;margin:0;padding:0 16px}
+          .h{background:#1b5e20;color:#fff;padding:18px 20px;border-radius:6px 6px 0 0}
+          .c{padding:18px 20px;border:1px solid #d9e2ec;border-top:0}
+          .s{background:#f5f7fa;border:1px solid #d9e2ec;padding:10px 12px;border-radius:6px;margin:10px 0 14px 0;font-size:12px}
+          .tw{overflow-x:auto;margin-top:8px;width:100%}
+          .tbl{width:100%;table-layout:auto;border-collapse:collapse;white-space:nowrap}
+          .tbl th{background:#37474f;color:#fff;padding:7px 10px;text-align:left;white-space:nowrap}
+          .tbl td{padding:6px 10px;border-bottom:1px solid #eceff1;vertical-align:top;white-space:nowrap}
+          .tbl td.wrap{white-space:normal;min-width:200px;max-width:340px;word-break:break-all}
+          .tbl td.path{font-family:Consolas,monospace;font-size:11px;white-space:nowrap;min-width:280px}
+          .b{display:inline-block;padding:2px 8px;border-radius:3px;color:#fff;font-size:11px;font-weight:700}
+          .red{background:#c62828}.yel{background:#f57c00}.grn{background:#2e7d32}.inf{background:#607d8b}
+          .mk{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;color:#fff;letter-spacing:.3px}
+          .mk-rm{background:#b71c1c}.mk-pt{background:#ef6c00}.mk-at{background:#2e7d32}.mk-lg{background:#6a1b9a}.mk-rv{background:#6d4c41}
+          </style></head><body>
+          <div class="h"><h2 style="margin:0">Java Distribution Report - OEM/OMS/Agent Team</h2>
+          <div style="margin-top:6px;font-size:12px">Generated: {{ _ts }} | Recipients: {{ _oem_team_to }}, {{ _my_group_to }}</div></div>
+          <div class="c">
+          {%- set rows = (_oem_rows.stdout | default('') | trim).split('\n') | select('search','\|') | list -%}
+          {%- set red_n = rows | select('search','\|RED\|') | list | length -%}
+          {%- set yel_n = rows | select('search','\|YELLOW\|') | list | length -%}
+          {%- set grn_n = rows | select('search','\|GREEN\|') | list | length -%}
+          {%- set info_n = rows | select('search','\|INFO\|') | list | length -%}
+          {%- set nt_n = rows | select('search','\|NO_TARGET\|') | list | length -%}
+          {%- set rpm_n = rows | select('search','\|dnf remove ') | list | length -%}
+          <div class="s"><b>Action Summary:</b> {{ rows | length }} install rows for OEM/OMS/Agent action. <span class="b red">RED {{ red_n }}</span> <span class="b yel">YELLOW {{ yel_n }}</span> <span class="b grn">GREEN {{ grn_n }}</span> <span class="b inf">INFO {{ info_n }}</span> &nbsp;|&nbsp; <b>Reference gaps:</b> {{ nt_n }} row(s) with <code>NO_TARGET</code>. Sorted by risk first, then hostname.</div>
+          <p>OEM baseline note: Jan-2026 certified baseline is <b>8u481</b>; 8u491 should be MOS-certified for your current quarter before enforcing as mandatory target.</p>
+          <p style="font-size:12px; color:#444; margin:8px 0 0 0;">OEM scope: cleanup only inside OEM/OMS/Agent home paths (for example old OPatch backup paths). Any RPM action (<code>dnf remove</code>) is OS-team owned.</p>
+          {% if rpm_n > 0 %}<p style="font-size:12px; color:#b71c1c; margin:6px 0 0 0;"><b>Ownership warning:</b> {{ rpm_n }} row(s) contain RPM remove commands and must be executed by OS team, not OEM/OMS team.</p>{% endif %}
+          <div class="tw"><table class="tbl">
+            <tr>
+              <th>Hostname</th><th>OS Type</th><th>OS Version</th><th>Context</th><th>JDK Type</th><th>Current Version</th><th>Target Version</th><th>Target Status</th><th>Risk</th><th style="min-width:260px;">Required Action</th><th style="min-width:300px;">JDK Path</th>
+            </tr>
+            {%- for line in rows -%}
+            {%- set p = line.split('|') -%}
+            {%- set rt = p[8] | trim -%}
+            {%- set act = p[9] | trim -%}
+            <tr>
+              <td><b>{{ p[0] | trim }}</b></td>
+              <td>{{ p[1] | trim }}</td>
+              <td>{{ p[2] | trim }}</td>
+              <td>{{ p[3] | trim }}</td>
+              <td>{{ p[4] | trim }}</td>
+              <td>{{ p[5] | trim }}</td>
+              <td>{{ p[6] | trim }}</td>
+              <td>{{ p[7] | trim }}</td>
+              <td>{% if rt=='RED' %}<span class="b red">RED</span>{% elif rt=='YELLOW' %}<span class="b yel">YELLOW</span>{% elif rt=='GREEN' %}<span class="b grn">GREEN</span>{% else %}<span class="b inf">{{ rt }}</span>{% endif %}</td>
+              <td class="wrap">{% if 'dnf remove ' in act %}[OS TEAM] {{ act }}{% else %}{{ act }}{% endif %}</td>
+              <td class="path">{{ p[12] | trim }}</td>
+            </tr>
+            {%- endfor -%}
+          </table></div>
+          </div></body></html>
+
+    - name: Build OS HTML
+      ansible.builtin.set_fact:
+        _os_html_text: |
+          <!DOCTYPE html>
+          <html><head><meta charset="UTF-8"><title>Java Team Report - OS Team (AIX/Linux)</title>
+          <style>
+          body{font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222;margin:0;padding:0 16px}
+          .h{background:#6a1b9a;color:#fff;padding:18px 20px;border-radius:6px 6px 0 0}
+          .c{padding:18px 20px;border:1px solid #d9e2ec;border-top:0}
+          .s{background:#f5f7fa;border:1px solid #d9e2ec;padding:10px 12px;border-radius:6px;margin:10px 0 14px 0;font-size:12px}
+          .tw{overflow-x:auto;margin-top:8px;width:100%}
+          .tbl{width:100%;table-layout:auto;border-collapse:collapse;white-space:nowrap}
+          .tbl th{background:#37474f;color:#fff;padding:7px 10px;text-align:left;white-space:nowrap}
+          .tbl td{padding:6px 10px;border-bottom:1px solid #eceff1;vertical-align:top;white-space:nowrap}
+          .tbl td.wrap{white-space:normal;min-width:200px;max-width:340px;word-break:break-all}
+          .tbl td.path{font-family:Consolas,monospace;font-size:11px;white-space:nowrap;min-width:280px}
+          .mk{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;color:#fff;letter-spacing:.3px}
+          .mk-rm{background:#b71c1c}.mk-pt{background:#ef6c00}.mk-at{background:#2e7d32}.mk-lg{background:#6a1b9a}.mk-rv{background:#6d4c41}
+          .b{display:inline-block;padding:2px 8px;border-radius:3px;color:#fff;font-size:11px;font-weight:700}
+          .red{background:#c62828}.yel{background:#f57c00}.grn{background:#2e7d32}.inf{background:#607d8b}
+          .mk{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;color:#fff;letter-spacing:.3px}
+          .mk-rm{background:#b71c1c}.mk-pt{background:#ef6c00}.mk-at{background:#2e7d32}.mk-lg{background:#6a1b9a}.mk-rv{background:#6d4c41}
+          </style></head><body>
+          <div class="h"><h2 style="margin:0">Java Distribution Report - OS Team (AIX/Linux)</h2>
+          <div style="margin-top:6px;font-size:12px">Generated: {{ _ts }} | Recipients: {{ _os_team_to }}, {{ _my_group_to }}</div></div>
+          <div class="c">
+          {%- set rows = (_os_rows.stdout | default('') | trim).split('\n') | select('search','\|') | list -%}
+          {%- set red_n = rows | select('search','\|RED\|') | list | length -%}
+          {%- set info_n = rows | select('search','\|INFO\|') | list | length -%}
+          {%- set grn_n = rows | select('search','\|AT_TARGET\|GREEN\|') | list | length -%}
+          {%- set yel_n = (rows | length) - red_n - info_n - grn_n -%}
+          {%- set nt_n = rows | select('search','\|NO_TARGET\|') | list | length -%}
+          {%- set rm_n = rows | select('search','\|dnf remove ') | list | length -%}
+          <div class="s"><b>Action Summary:</b> {{ rows | length }} install rows for OS action. <span class="b red">RED {{ red_n }}</span> <span class="b yel">YELLOW {{ yel_n }}</span> <span class="b grn">GREEN {{ grn_n }}</span> <span class="b inf">INFO {{ info_n }}</span> &nbsp;|&nbsp; <b>Reference gaps:</b> {{ nt_n }} row(s) with <code>NO_TARGET</code>. &nbsp;|&nbsp; <b>Remove candidates:</b> {{ rm_n }} row(s) where action starts with <code>dnf remove</code>. <b>Policy:</b> only <code>AT_TARGET</code> rows are shown as GREEN in this report. Grouped by OS work queue, then risk, then hostname.</div>
+          <p style="font-size:12px; color:#444; margin:8px 0 0 0;">For rows marked with <code>dnf remove</code>, verify dependency safety first with <code>rpm -q --whatrequires &lt;package&gt;</code>, then remove in the next OS maintenance window.</p>
+          <p style="font-size:12px; color:#444; margin:6px 0 0 0;">Cleanup note: old JDK folders and old OPatch backup folders that are not in use should be removed as part of OS cleanup after dependency/use checks.</p>
+          {%- set os_old_jdk_n = rows | select('search','\|1\\.5\\.|\|1\\.6\\.|\|1\\.7\\.') | list | length -%}
+          {%- set os_below_n = rows | select('search','\|BELOW_TARGET\|') | list | length -%}
+          {%- set os_at_target_n = rows | select('search','\|AT_TARGET\|') | list | length -%}
+          {%- set os_ns = namespace(dedupe_keys=[], dup_n=0) -%}
+          {%- for line in rows -%}
+          {%- set p = line.split('|') -%}
+          {%- set k = (p[0] | trim) ~ '|' ~ ((p[12] | trim) | regex_replace('/jre/bin/java$','') | regex_replace('/bin/java$','')) -%}
+          {%- if k in os_ns.dedupe_keys -%}
+          {%- set os_ns.dup_n = os_ns.dup_n + 1 -%}
+          {%- else -%}
+          {%- set _ = os_ns.dedupe_keys.append(k) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          <div class="s"><b>OS Work Queues:</b> Remove queue: <b>{{ rm_n }}</b> | Patch queue (<code>BELOW_TARGET</code>): <b>{{ os_below_n }}</b> | Legacy queue (<code>NO_TARGET</code>): <b>{{ nt_n }}</b> | At-target queue: <b>{{ os_at_target_n }}</b> | Duplicate row pairs (same host + base java path): <b>{{ os_ns.dup_n }}</b>.</div>
+          <div class="tw"><table class="tbl">
+            <tr>
+              <th>Hostname</th><th>OS</th><th>Context</th><th>JDK Type</th><th>Current Version</th><th>Target Version</th><th>Target Status</th><th>Risk</th><th>Marker</th><th style="min-width:260px;">Required Action</th><th style="min-width:300px;">JDK Path</th>
+            </tr>
+            {%- for line in rows -%}
+            {%- set p = line.split('|') -%}
+            {%- set rt = p[8] | trim -%}
+            {%- set ts = p[7] | trim -%}
+            {%- set eff_rt = ('GREEN' if (rt == 'GREEN' and ts == 'AT_TARGET') else ('YELLOW' if rt == 'GREEN' else rt)) -%}
+            {%- set act = p[9] | trim -%}
+            {%- if 'dnf remove ' in act -%}
+            {%- set mk = 'REMOVE' -%}{%- set mkc = 'mk-rm' -%}
+            {%- elif ts == 'AT_TARGET' -%}
+            {%- set mk = 'AT_TARGET' -%}{%- set mkc = 'mk-at' -%}
+            {%- elif ts == 'BELOW_TARGET' -%}
+            {%- set mk = 'PATCH' -%}{%- set mkc = 'mk-pt' -%}
+            {%- elif ts == 'NO_TARGET' -%}
+            {%- set mk = 'LEGACY' -%}{%- set mkc = 'mk-lg' -%}
+            {%- else -%}
+            {%- set mk = 'REVIEW' -%}{%- set mkc = 'mk-rv' -%}
+            {%- endif -%}
+            <tr>
+              <td><b>{{ p[0] | trim }}</b></td>
+              <td>{{ p[1] | trim }} {{ p[2] | trim }}</td>
+              <td>{{ p[3] | trim }}</td>
+              <td>{{ p[4] | trim }}</td>
+              <td>{{ p[5] | trim }}</td>
+              <td>{{ p[6] | trim }}</td>
+              <td>{{ p[7] | trim }}</td>
+              <td>{% if eff_rt=='RED' %}<span class="b red">RED</span>{% elif eff_rt=='YELLOW' %}<span class="b yel">YELLOW</span>{% elif eff_rt=='GREEN' %}<span class="b grn">GREEN</span>{% else %}<span class="b inf">{{ eff_rt }}</span>{% endif %}</td>
+              <td><span class="mk {{ mkc }}">{{ mk }}</span></td>
+              <td class="wrap">{{ p[9] | trim }}</td>
+              <td class="path">{{ p[12] | trim }}</td>
+            </tr>
+            {%- endfor -%}
+          </table></div>
+          </div></body></html>
+
+    - name: Write DBA HTML file
+      ansible.builtin.copy:
+        dest: "{{ _dba_html }}"
+        content: "{{ _dba_html_text }}"
+
+    - name: Write OEM HTML file
+      ansible.builtin.copy:
+        dest: "{{ _oem_html }}"
+        content: "{{ _oem_html_text }}"
+
+    - name: Write OS HTML file
+      ansible.builtin.copy:
+        dest: "{{ _os_html }}"
+        content: "{{ _os_html_text }}"
+
+    - name: Show generated report paths
+      ansible.builtin.debug:
+        msg:
+          - "DBA report: {{ _dba_html }}"
+          - "OEM report: {{ _oem_html }}"
+          - "OS report:  {{ _os_html }}"
+
+    - name: Send DBA team email
+      ansible.builtin.mail:
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port }}"
+        to: "{{ _dba_team_to }},{{ _my_group_to }}"
+        from: "{{ email_from }}"
+        subject: "[Java-Team][DBA] JDK distribution and actions"
+        subtype: html
+        body: "<p>Attached: DBA patch team Java report.</p><p>Source: V_JAVA_TEAM_DBA_PATCH</p><p>Note: many DBA rows are NO_TARGET migration items, for example move-to-19c cases with no JDK patch path. Please review these as Oracle Home action items, not OS removals.</p>"
+        attach:
+          - "{{ _dba_html }}"
+      when: _send_team_email | bool
+
+    - name: Send OEM team email
+      ansible.builtin.mail:
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port }}"
+        to: "{{ _oem_team_to }},{{ _my_group_to }}"
+        from: "{{ email_from }}"
+        subject: "[Java-Team][OEM] OMS/Agent JDK distribution and actions"
+        subtype: html
+        body: "<p>Attached: OEM/OMS/Agent team Java report.</p><p>Source: V_JAVA_TEAM_OEM</p>"
+        attach:
+          - "{{ _oem_html }}"
+      when: _send_team_email | bool
+
+    - name: Send OS team email
+      ansible.builtin.mail:
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port }}"
+        to: "{{ _os_team_to }},{{ _my_group_to }}"
+        from: "{{ email_from }}"
+        subject: "[Java-Team][OS] Linux/AIX JDK distribution and actions"
+        subtype: html
+        body: "<p>Attached: OS team Java report (Linux + AIX).</p><p>Source: V_JAVA_TEAM_OS</p>"
+        attach:
+          - "{{ _os_html }}"
+      when: _send_team_email | bool
